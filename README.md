@@ -16,7 +16,7 @@ MCP server for **stealth browser automation** via [Camoufox](https://github.com/
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **mcp-camoufox** | **65** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **65** | **Yes** | **Yes** | **Yes** |
 
 ## Quick Start
 
