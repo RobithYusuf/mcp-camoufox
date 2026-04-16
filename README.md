@@ -122,6 +122,88 @@ Add to `~/.windsurf/mcp.json`:
 ```
 </details>
 
+<details>
+<summary><b>Factory (Droid)</b></summary>
+
+Add to `~/.factory/mcp.json` (global) or `.factory/mcp.json` (project):
+
+```json
+{
+  "mcpServers": {
+    "camoufox": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "mcp-camoufox@latest"],
+      "disabled": false
+    }
+  }
+}
+```
+
+Or via CLI:
+```bash
+droid mcp add camoufox "npx -y mcp-camoufox@latest"
+```
+</details>
+
+<details>
+<summary><b>OpenCode</b></summary>
+
+Add to `~/.config/opencode/opencode.json` (global) or `opencode.json` (project):
+
+```json
+{
+  "mcp": {
+    "camoufox": {
+      "type": "local",
+      "command": ["npx", "-y", "mcp-camoufox@latest"],
+      "enabled": true
+    }
+  }
+}
+```
+
+> Note: OpenCode uses `"type": "local"` (not `"stdio"`) and `command` as a single array.
+</details>
+
+<details>
+<summary><b>Trae (ByteDance)</b></summary>
+
+Add to `~/.trae/mcp.json` (global) or `.trae/mcp.json` (project):
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "camoufox",
+      "command": ["npx", "-y", "mcp-camoufox@latest"]
+    }
+  ]
+}
+```
+
+> Note: Trae uses an **array** format for `mcpServers`, not an object.
+</details>
+
+<details>
+<summary><b>Antigravity (Google)</b></summary>
+
+Add to `~/.gemini/antigravity/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "camoufox": {
+      "command": "npx",
+      "args": ["-y", "mcp-camoufox@latest"]
+    }
+  }
+}
+```
+
+Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw config.
+</details>
+
 ### Requirements
 
 | Requirement | Version | Check |
