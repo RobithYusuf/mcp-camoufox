@@ -1364,6 +1364,231 @@ server.tool("scrape_page", "Smart page scraper — auto-detect and extract main 
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 });
 
+// ── Tools: Compound (reduce round-trips) ───────────────────────────────────
+
+server.tool(
+  "wait_and_snapshot",
+  "Wait for selector/text then return snapshot. Combines wait_for + browser_snapshot in one call.",
+  {
+    selector: z.string().default("").describe("CSS selector to wait for"),
+    text: z.string().default("").describe("Text to wait for"),
+    state: z.enum(["visible", "hidden", "attached", "detached"]).default("visible"),
+    timeout: z.number().default(10000),
+  },
+  async ({ selector, text, state, timeout }) => {
+    const page = getPage();
+    if (selector) {
+      await page.locator(selector).first().waitFor({ state, timeout });
+    } else if (text) {
+      await page.getByText(text).first().waitFor({ state, timeout });
+    }
+    const elements = await page.evaluate(SNAPSHOT_JS) || [];
+    const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+    return { content: [{ type: "text", text: snap }] };
+  }
+);
+
+server.tool("back_and_snapshot", "Navigate back + return snapshot.", {}, async () => {
+  const page = getPage();
+  await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 });
+  await page.waitForTimeout(500);
+  const elements = await page.evaluate(SNAPSHOT_JS) || [];
+  const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+  return { content: [{ type: "text", text: snap }] };
+});
+
+server.tool("reload_and_snapshot", "Reload page + return snapshot.", {}, async () => {
+  const page = getPage();
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+  await page.waitForTimeout(500);
+  const elements = await page.evaluate(SNAPSHOT_JS) || [];
+  const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+  return { content: [{ type: "text", text: snap }] };
+});
+
+server.tool(
+  "click_and_snapshot",
+  "Click element by ref + wait + return snapshot. Perfect for buttons that trigger navigation/dialog.",
+  {
+    ref: z.string().describe("Element ref from browser_snapshot"),
+    wait_ms: z.number().default(1500).describe("Wait after click before snapshot"),
+  },
+  async ({ ref, wait_ms }) => {
+    const page = getPage();
+    const loc = page.locator(`[data-mcp-ref="${ref}"]`).first();
+    try {
+      await loc.click({ timeout: 5000 });
+    } catch {
+      await loc.evaluate((el: any) => el.click());
+    }
+    await page.waitForTimeout(wait_ms);
+    const elements = await page.evaluate(SNAPSHOT_JS) || [];
+    const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+    return { content: [{ type: "text", text: snap }] };
+  }
+);
+
+// ── Tools: Smart Selectors (no snapshot needed) ────────────────────────────
+
+server.tool(
+  "find_by_text",
+  "Find element by visible text — returns ref ID or null. Skip browser_snapshot if you know exact text.",
+  {
+    text: z.string().describe("Visible text to search for"),
+    exact: z.boolean().default(true),
+  },
+  async ({ text, exact }) => {
+    const page = getPage();
+    const loc = page.getByText(text, { exact }).first();
+    const count = await loc.count();
+    if (count === 0) {
+      return { content: [{ type: "text", text: `No element found with text "${text}"` }] };
+    }
+    // Tag with ref
+    const info = await loc.evaluate((el: any) => {
+      const ref = 'f' + Math.floor(Math.random() * 10000);
+      el.setAttribute('data-mcp-ref', ref);
+      return {
+        ref,
+        tag: el.tagName.toLowerCase(),
+        role: el.getAttribute('role') || '',
+        text: (el.innerText || el.value || '').trim().slice(0, 100),
+        href: el.href || '',
+      };
+    });
+    return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+  }
+);
+
+server.tool(
+  "find_by_label",
+  "Find input element by its label text (<label>). Returns ref.",
+  {
+    label: z.string().describe("Label text (e.g. 'Email', 'Password')"),
+  },
+  async ({ label }) => {
+    const page = getPage();
+    const loc = page.getByLabel(label).first();
+    const count = await loc.count();
+    if (count === 0) {
+      return { content: [{ type: "text", text: `No input found with label "${label}"` }] };
+    }
+    const info = await loc.evaluate((el: any) => {
+      const ref = 'l' + Math.floor(Math.random() * 10000);
+      el.setAttribute('data-mcp-ref', ref);
+      return {
+        ref,
+        tag: el.tagName.toLowerCase(),
+        type: el.type || '',
+        name: el.name || '',
+        placeholder: el.placeholder || '',
+        value: el.value || '',
+      };
+    });
+    return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+  }
+);
+
+server.tool(
+  "find_by_placeholder",
+  "Find input by placeholder text. Returns ref.",
+  {
+    placeholder: z.string(),
+  },
+  async ({ placeholder }) => {
+    const page = getPage();
+    const loc = page.getByPlaceholder(placeholder).first();
+    const count = await loc.count();
+    if (count === 0) {
+      return { content: [{ type: "text", text: `No input with placeholder "${placeholder}"` }] };
+    }
+    const info = await loc.evaluate((el: any) => {
+      const ref = 'p' + Math.floor(Math.random() * 10000);
+      el.setAttribute('data-mcp-ref', ref);
+      return {
+        ref, tag: el.tagName.toLowerCase(), type: el.type || '', placeholder: el.placeholder || '',
+      };
+    });
+    return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+  }
+);
+
+// ── Tools: Cookie Portability ──────────────────────────────────────────────
+
+server.tool(
+  "cookie_export",
+  "Export all cookies as JSON string. Use with cookie_import to transfer session.",
+  {
+    domain: z.string().default("").describe("Filter by domain (empty = all)"),
+  },
+  async ({ domain }) => {
+    if (!browserContext) throw new Error("Browser not running.");
+    let cookies = await browserContext.cookies();
+    if (domain) cookies = cookies.filter(c => c.domain.includes(domain));
+    return { content: [{ type: "text", text: JSON.stringify(cookies, null, 2) }] };
+  }
+);
+
+server.tool(
+  "cookie_import",
+  "Import cookies from JSON (from cookie_export). Restores session state.",
+  {
+    cookies_json: z.string().describe("JSON array of cookies"),
+  },
+  async ({ cookies_json }) => {
+    if (!browserContext) throw new Error("Browser not running.");
+    let cookies: any[];
+    try {
+      cookies = JSON.parse(cookies_json);
+      if (!Array.isArray(cookies)) throw new Error("not an array");
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Invalid cookies JSON: ${e.message}` }] };
+    }
+    await browserContext.addCookies(cookies);
+    return { content: [{ type: "text", text: `Imported ${cookies.length} cookies.` }] };
+  }
+);
+
+// ── Tools: Page Stats (debug/decision) ─────────────────────────────────────
+
+server.tool(
+  "page_stats",
+  "Page statistics: element count, size, load metrics. Use to decide extraction strategy.",
+  {},
+  async () => {
+    const page = getPage();
+    const stats = await page.evaluate(`(() => {
+      var all = document.querySelectorAll('*').length;
+      var interactive = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="link"]').length;
+      var images = document.querySelectorAll('img').length;
+      var forms = document.querySelectorAll('form').length;
+      var iframes = document.querySelectorAll('iframe').length;
+      var scripts = document.querySelectorAll('script').length;
+      var bodyTextLen = (document.body.innerText || '').length;
+      var htmlLen = document.documentElement.outerHTML.length;
+      var perf = window.performance && window.performance.timing ? {
+        domComplete: window.performance.timing.domComplete - window.performance.timing.navigationStart,
+        loadEnd: window.performance.timing.loadEventEnd - window.performance.timing.navigationStart,
+      } : null;
+      return {
+        url: location.href,
+        title: document.title,
+        total_elements: all,
+        interactive_elements: interactive,
+        images: images,
+        forms: forms,
+        iframes: iframes,
+        scripts: scripts,
+        body_text_length: bodyTextLen,
+        html_size: htmlLen,
+        performance_ms: perf,
+        recommendation: all > 3000 ? 'Use extract_structured or scrape_page (heavy page)' : 'browser_snapshot OK',
+      };
+    })()`);
+    return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
+  }
+);
+
 // ── Start Server ───────────────────────────────────────────────────────────
 
 async function main() {
