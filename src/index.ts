@@ -70,7 +70,7 @@ const SNAPSHOT_JS = `(() => {
       name: el.getAttribute('name') || '',
       placeholder: el.getAttribute('placeholder') || '',
       aria: el.getAttribute('aria-label') || '',
-      href: el.tagName === 'A' ? (el.href || '').slice(0, 120) : '',
+      href: el.tagName === 'A' ? (el.href || '').slice(0, 500) : '',
       checked: el.checked || false,
       disabled: el.disabled || false,
     };
@@ -992,6 +992,122 @@ server.tool("export_har", "Export network traffic as HAR file.", {
   const har = { log: { version: "1.2", entries } };
   writeFileSync(target, JSON.stringify(har, null, 2));
   return { content: [{ type: "text", text: `HAR exported: ${target} (${entries.length} entries)` }] };
+});
+
+// ── Tools: Scraping / Extraction ───────────────────────────────────────────
+
+server.tool("extract_structured", "Extract structured data from repeated elements (cards, rows, listings). Token-efficient — returns clean JSON.", {
+  container_selector: z.string().describe("CSS selector for each repeated item (e.g. 'article', '.job-card', 'tr')"),
+  fields: z.array(z.object({
+    name: z.string().describe("Field name in output"),
+    selector: z.string().describe("CSS selector within each item"),
+    attribute: z.string().default("").describe("Attribute to extract (empty = innerText)"),
+  })).describe("Fields to extract from each item"),
+  limit: z.number().default(50).describe("Max items to extract"),
+}, async ({ container_selector, fields, limit }) => {
+  const page = getPage();
+  const fieldsDef = JSON.stringify(fields);
+  const results = await page.evaluate(`(() => {
+    var containers = document.querySelectorAll("${container_selector.replace(/"/g, '\\"')}");
+    var fields = ${fieldsDef};
+    var out = [];
+    for (var i = 0; i < Math.min(containers.length, ${limit}); i++) {
+      var item = {};
+      for (var j = 0; j < fields.length; j++) {
+        var f = fields[j];
+        var el = containers[i].querySelector(f.selector);
+        if (el) {
+          item[f.name] = f.attribute ? (el.getAttribute(f.attribute) || '') : (el.innerText || '').trim();
+        } else {
+          item[f.name] = '';
+        }
+      }
+      out.push(item);
+    }
+    return { total: containers.length, extracted: out.length, items: out };
+  })()`);
+  return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
+});
+
+server.tool("extract_table", "Extract data from an HTML table as JSON array.", {
+  selector: z.string().default("table").describe("CSS selector for the table"),
+  limit: z.number().default(100).describe("Max rows"),
+}, async ({ selector, limit }) => {
+  const page = getPage();
+  const results = await page.evaluate(`(() => {
+    var table = document.querySelector("${selector.replace(/"/g, '\\"')}");
+    if (!table) return { error: 'Table not found' };
+    var headers = [];
+    var ths = table.querySelectorAll('thead th, thead td, tr:first-child th, tr:first-child td');
+    for (var i = 0; i < ths.length; i++) headers.push(ths[i].innerText.trim());
+    var rows = table.querySelectorAll('tbody tr, tr');
+    var out = [];
+    var start = headers.length > 0 ? 1 : 0;
+    for (var r = start; r < Math.min(rows.length, ${limit} + start); r++) {
+      var cells = rows[r].querySelectorAll('td, th');
+      var row = {};
+      for (var c = 0; c < cells.length; c++) {
+        var key = headers[c] || ('col_' + c);
+        var link = cells[c].querySelector('a');
+        row[key] = cells[c].innerText.trim();
+        if (link) row[key + '_url'] = link.href;
+      }
+      out.push(row);
+    }
+    return { headers: headers, total_rows: rows.length - start, extracted: out.length, rows: out };
+  })()`);
+  return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
+});
+
+server.tool("scrape_page", "Smart page scraper — auto-detect and extract main content, links, metadata. Token-efficient.", {
+  include_links: z.boolean().default(true),
+  include_meta: z.boolean().default(true),
+  max_text_length: z.number().default(3000),
+}, async ({ include_links, include_meta, max_text_length }) => {
+  const page = getPage();
+  const data = await page.evaluate(`(() => {
+    var result = {};
+    result.title = document.title;
+    result.url = location.href;
+
+    // Meta
+    if (${include_meta}) {
+      var metas = {};
+      var metaEls = document.querySelectorAll('meta[name], meta[property]');
+      for (var i = 0; i < metaEls.length; i++) {
+        var key = metaEls[i].getAttribute('name') || metaEls[i].getAttribute('property');
+        metas[key] = metaEls[i].getAttribute('content') || '';
+      }
+      result.meta = metas;
+    }
+
+    // Main content — try article/main first, fallback to body
+    var main = document.querySelector('article, main, [role="main"], .content, #content');
+    var textSource = main || document.body;
+    result.text = textSource.innerText.trim().slice(0, ${max_text_length});
+
+    // Links
+    if (${include_links}) {
+      var links = textSource.querySelectorAll('a[href]');
+      var linkList = [];
+      for (var j = 0; j < Math.min(links.length, 30); j++) {
+        var text = (links[j].innerText || '').trim().slice(0, 80);
+        if (text) linkList.push({ text: text, href: links[j].href });
+      }
+      result.links = linkList;
+    }
+
+    // Headings
+    var headings = [];
+    var hs = document.querySelectorAll('h1, h2, h3');
+    for (var k = 0; k < Math.min(hs.length, 15); k++) {
+      headings.push({ level: hs[k].tagName, text: hs[k].innerText.trim().slice(0, 100) });
+    }
+    result.headings = headings;
+
+    return result;
+  })()`);
+  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 });
 
 // ── Start Server ───────────────────────────────────────────────────────────
