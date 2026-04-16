@@ -46,6 +46,12 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 <details>
 <summary><b>Claude Code</b></summary>
 
+**Global** (available in all projects):
+```bash
+claude mcp add camoufox --scope user -- npx -y mcp-camoufox@latest
+```
+
+**Project only** (current project):
 ```bash
 claude mcp add camoufox -- npx -y mcp-camoufox@latest
 ```
@@ -54,7 +60,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Add to config file:
+**Global** — add to config file:
 - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 - **Linux:** `~/.config/Claude/claude_desktop_config.json`
@@ -69,21 +75,23 @@ Add to config file:
   }
 }
 ```
+
+> Claude Desktop is always global — no project-level config.
 </details>
 
 <details>
 <summary><b>Cursor</b></summary>
 
-Preferences > Features > MCP:
+**Global** — Preferences > Features > MCP, or `~/.cursor/mcp.json`:
+
+**Project** — `.cursor/mcp.json` in project root:
 
 ```json
 {
-  "mcp": {
-    "servers": {
-      "camoufox": {
-        "command": "npx",
-        "args": ["-y", "mcp-camoufox@latest"]
-      }
+  "mcpServers": {
+    "camoufox": {
+      "command": "npx",
+      "args": ["-y", "mcp-camoufox@latest"]
     }
   }
 }
@@ -93,7 +101,9 @@ Preferences > Features > MCP:
 <details>
 <summary><b>Windsurf</b></summary>
 
-Add to `~/.windsurf/mcp.json`:
+**Global** — `~/.windsurf/mcp.json`:
+
+**Project** — `.windsurf/mcp.json` in project root:
 
 ```json
 {
@@ -108,7 +118,11 @@ Add to `~/.windsurf/mcp.json`:
 </details>
 
 <details>
-<summary><b>VS Code (Continue / Cline)</b></summary>
+<summary><b>VS Code (Continue / Cline / Kilo Code)</b></summary>
+
+**Global** — VS Code settings or `~/.continue/config.json`:
+
+**Project** — `.vscode/mcp.json` in project root:
 
 ```json
 {
@@ -125,7 +139,9 @@ Add to `~/.windsurf/mcp.json`:
 <details>
 <summary><b>Factory (Droid)</b></summary>
 
-Add to `~/.factory/mcp.json` (global) or `.factory/mcp.json` (project):
+**Global** — `~/.factory/mcp.json`:
+
+**Project** — `.factory/mcp.json` in project root:
 
 ```json
 {
@@ -149,7 +165,9 @@ droid mcp add camoufox "npx -y mcp-camoufox@latest"
 <details>
 <summary><b>OpenCode</b></summary>
 
-Add to `~/.config/opencode/opencode.json` (global) or `opencode.json` (project):
+**Global** — `~/.config/opencode/opencode.json`:
+
+**Project** — `opencode.json` in project root:
 
 ```json
 {
@@ -169,7 +187,9 @@ Add to `~/.config/opencode/opencode.json` (global) or `opencode.json` (project):
 <details>
 <summary><b>Trae (ByteDance)</b></summary>
 
-Add to `~/.trae/mcp.json` (global) or `.trae/mcp.json` (project):
+**Global** — `~/.trae/mcp.json`:
+
+**Project** — `.trae/mcp.json` in project root:
 
 ```json
 {
@@ -188,7 +208,7 @@ Add to `~/.trae/mcp.json` (global) or `.trae/mcp.json` (project):
 <details>
 <summary><b>Antigravity (Google)</b></summary>
 
-Add to `~/.gemini/antigravity/mcp_config.json`:
+**Global** — `~/.gemini/antigravity/mcp_config.json`:
 
 ```json
 {
@@ -202,6 +222,8 @@ Add to `~/.gemini/antigravity/mcp_config.json`:
 ```
 
 Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw config.
+
+> Antigravity is global only — no project-level MCP config.
 </details>
 
 ### Requirements
