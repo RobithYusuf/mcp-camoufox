@@ -572,7 +572,8 @@ server.tool("scroll", "Scroll the page.", {
   else if (direction === "up") dy = -amount;
   else if (direction === "right") dx = amount;
   else if (direction === "left") dx = -amount;
-  await page.mouse.wheel(dx, dy);
+  // Use JS scroll — mouse.wheel doesn't work reliably in Firefox/Camoufox
+  await page.evaluate(`window.scrollBy(${dx}, ${dy})`);
   await page.waitForTimeout(300);
   return { content: [{ type: "text", text: `Scrolled ${direction} ${amount}px` }] };
 });
