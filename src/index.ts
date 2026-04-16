@@ -83,6 +83,7 @@ const SNAPSHOT_JS = `() => {
 }`;
 
 function formatSnapshot(elements: any[], url: string, title: string): string {
+  if (!elements || !Array.isArray(elements)) elements = [];
   const lines = [
     `Page: ${title}`,
     `URL: ${url}`,
@@ -133,7 +134,7 @@ server.tool(
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
         await page.waitForTimeout(1500);
       }
-      return { content: [{ type: "text", text: `Already running. Navigated to: ${page.url}` }] };
+      return { content: [{ type: "text", text: `Already running. Navigated to: ${page.url()}` }] };
     }
 
     ensureDirs();
@@ -168,7 +169,7 @@ server.tool(
       await page.waitForTimeout(1500);
     }
     const title = await page.title();
-    return { content: [{ type: "text", text: `Browser launched. URL: ${page.url}\nTitle: ${title}` }] };
+    return { content: [{ type: "text", text: `Browser launched. URL: ${page.url()}\nTitle: ${title}` }] };
   }
 );
 
@@ -202,26 +203,26 @@ server.tool(
     const page = getPage();
     await page.goto(url, { waitUntil: wait_until, timeout });
     await page.waitForTimeout(1000);
-    return { content: [{ type: "text", text: `Navigated to: ${page.url}\nTitle: ${await page.title()}` }] };
+    return { content: [{ type: "text", text: `Navigated to: ${page.url()}\nTitle: ${await page.title()}` }] };
   }
 );
 
 server.tool("go_back", "Navigate back in history.", {}, async () => {
   const page = getPage();
   await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 });
-  return { content: [{ type: "text", text: `Went back. URL: ${page.url}` }] };
+  return { content: [{ type: "text", text: `Went back. URL: ${page.url()}` }] };
 });
 
 server.tool("go_forward", "Navigate forward in history.", {}, async () => {
   const page = getPage();
   await page.goForward({ waitUntil: "domcontentloaded", timeout: 15000 });
-  return { content: [{ type: "text", text: `Went forward. URL: ${page.url}` }] };
+  return { content: [{ type: "text", text: `Went forward. URL: ${page.url()}` }] };
 });
 
 server.tool("reload", "Reload the current page.", {}, async () => {
   const page = getPage();
   await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
-  return { content: [{ type: "text", text: `Reloaded. URL: ${page.url}` }] };
+  return { content: [{ type: "text", text: `Reloaded. URL: ${page.url()}` }] };
 });
 
 // ── Tools: Snapshot & Screenshot ───────────────────────────────────────────
@@ -232,7 +233,7 @@ server.tool(
   {},
   async () => {
     const page = getPage();
-    const elements = await page.evaluate(SNAPSHOT_JS);
+    const elements = await page.evaluate(SNAPSHOT_JS) || [];
     const text = formatSnapshot(elements as any[], page.url(), await page.title());
     return { content: [{ type: "text", text }] };
   }
