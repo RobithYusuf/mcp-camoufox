@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/daijro/camoufox/main/assets/logo_sm.png" alt="Camoufox" width="120">
+<img src="https://i.imgur.com/enUBkXt.png" alt="Camoufox" width="280">
 
 # MCP Camoufox
 
