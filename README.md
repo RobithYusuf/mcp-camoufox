@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org)
 
-The most feature-rich stealth browser MCP server. **65 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **69 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -21,6 +21,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 - Take screenshots, export PDFs, capture network traffic
 - Work with multiple tabs, iframes, dialogs
 - Execute JavaScript, inspect elements, scroll pages
+- Scrape structured data (job listings, products) with auto-detected selectors
 - All while being **undetectable** by anti-bot systems
 
 ## Comparison
@@ -32,7 +33,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **65** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **69** | **Yes** | **Yes** | **Yes** |
 
 ## Setup
 
@@ -123,7 +124,7 @@ Add to `~/.windsurf/mcp.json`:
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 65 Tools
+## All 69 Tools
 
 ### Browser Lifecycle (2)
 
@@ -284,6 +285,15 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `console_start` / `console_get` | Capture and retrieve browser console messages |
 | `network_start` / `network_get` | Capture and retrieve network requests |
 
+### Scraping & Extraction (4)
+
+| Tool | Description |
+|------|-------------|
+| `detect_content_pattern` | Auto-detect repeated content (cards, listings) and suggest CSS selectors. **Run this before `extract_structured`.** |
+| `extract_structured` | Extract data from repeated elements as clean JSON. Auto-deduplicates, filters empties, `direct_text_only` prevents field mixing. |
+| `extract_table` | Extract HTML table as JSON array with auto-detected headers |
+| `scrape_page` | Smart scraper: auto-extract main content (strips nav/footer), links, meta, headings. Smart truncation at paragraph boundary. |
+
 ### Debug (3)
 
 | Tool | Description |
@@ -371,6 +381,30 @@ query_selector_all(selector=".product-card")
 ```
 list_frames()
 frame_evaluate(frame_index=1, expression="document.title")
+```
+
+### Scrape job listings (structured)
+
+```
+browser_launch(url="https://glints.com/id/opportunities/jobs/explore")
+detect_content_pattern()                      # auto-suggest selectors
+extract_structured(
+  container_selector=".job-card",             # from detect_content_pattern
+  fields=[
+    {name: "title", selector: "h3"},
+    {name: "company", selector: ".company-name"},
+    {name: "location", selector: ".location"},
+    {name: "url", selector: "a", attribute: "href"}
+  ]
+)
+```
+
+### Scrape page content (smart)
+
+```
+scrape_page(only_main_content=true, max_text_length=8000)
+# Returns: title, url, meta, text (truncated at paragraph boundary),
+#          links, headings, truncated flag, total_text_length
 ```
 
 ### Manage storage
