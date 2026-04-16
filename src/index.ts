@@ -44,24 +44,25 @@ function ensureDirs() {
   mkdirSync(SCREENSHOT_DIR, { recursive: true });
 }
 
-// DOM snapshot JS — returns interactive elements with ref IDs
-const SNAPSHOT_JS = `() => {
-  const sels = 'button, a, input:not([type="hidden"]), textarea, select, '
+// DOM snapshot JS — IIFE so page.evaluate runs it immediately
+const SNAPSHOT_JS = `(() => {
+  var sels = 'button, a, input:not([type="hidden"]), textarea, select, '
     + '[role="button"], [role="link"], [role="textbox"], [role="checkbox"], '
     + '[role="radio"], [role="tab"], [role="menuitem"], [contenteditable="true"], '
     + 'img[alt], h1, h2, h3, h4, h5, h6, label, [role="dialog"], [role="alert"], [role="status"]';
-  const els = document.querySelectorAll(sels);
-  const results = [];
-  let refId = 0;
-  els.forEach(el => {
-    const r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) return;
-    const cs = getComputedStyle(el);
-    if (cs.display === 'none' || cs.visibility === 'hidden') return;
-    const ref = 'e' + refId++;
+  var els = document.querySelectorAll(sels);
+  var results = [];
+  var refId = 0;
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    var r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    var cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    var ref = 'e' + refId++;
     el.setAttribute('data-mcp-ref', ref);
-    const entry = {
-      ref,
+    var entry = {
+      ref: ref,
       tag: el.tagName.toLowerCase(),
       role: el.getAttribute('role') || '',
       text: (el.innerText || el.value || '').trim().slice(0, 100),
@@ -73,14 +74,16 @@ const SNAPSHOT_JS = `() => {
       checked: el.checked || false,
       disabled: el.disabled || false,
     };
-    const clean = {};
-    for (const [k, v] of Object.entries(entry)) {
+    var clean = {};
+    var keys = Object.keys(entry);
+    for (var j = 0; j < keys.length; j++) {
+      var k = keys[j], v = entry[k];
       if (v !== '' && v !== false && v !== undefined) clean[k] = v;
     }
     results.push(clean);
-  });
+  }
   return results;
-}`;
+})()`;
 
 function formatSnapshot(elements: any[], url: string, title: string): string {
   if (!elements || !Array.isArray(elements)) elements = [];
