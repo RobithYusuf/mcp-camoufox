@@ -628,6 +628,372 @@ server.tool("save_pdf", "Save page as PDF.", {
   return { content: [{ type: "text", text: `PDF saved: ${target}` }] };
 });
 
+// ── Tools: Batch Operations ────────────────────────────────────────────────
+
+server.tool("batch_actions", "Execute multiple actions in one call. Each action: {type, ref?, value?, text?, key?, url?}.", {
+  actions: z.array(z.object({
+    type: z.enum(["click", "fill", "type", "press", "select", "check", "uncheck", "wait"]),
+    ref: z.string().optional(),
+    value: z.string().optional(),
+    text: z.string().optional(),
+    key: z.string().optional(),
+    timeout: z.number().optional(),
+  })).describe("List of actions to execute sequentially"),
+}, async ({ actions }) => {
+  const page = getPage();
+  const results: string[] = [];
+  for (const action of actions) {
+    try {
+      if (action.type === "click" && action.ref) {
+        const loc = page.locator(`[data-mcp-ref="${action.ref}"]`).first();
+        try { await loc.click({ timeout: 5000 }); } catch { await loc.evaluate((el: any) => el.click()); }
+        results.push(`click ${action.ref}: OK`);
+      } else if (action.type === "fill" && action.ref && action.value !== undefined) {
+        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().fill(action.value, { timeout: 5000 });
+        results.push(`fill ${action.ref}: OK`);
+      } else if (action.type === "type" && action.text) {
+        await page.keyboard.type(action.text, { delay: 50 });
+        results.push(`type: OK`);
+      } else if (action.type === "press" && action.key) {
+        await page.keyboard.press(action.key);
+        results.push(`press ${action.key}: OK`);
+      } else if (action.type === "select" && action.ref && action.value) {
+        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().selectOption(action.value, { timeout: 5000 });
+        results.push(`select ${action.ref}: OK`);
+      } else if (action.type === "check" && action.ref) {
+        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().check({ timeout: 5000 });
+        results.push(`check ${action.ref}: OK`);
+      } else if (action.type === "uncheck" && action.ref) {
+        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().uncheck({ timeout: 5000 });
+        results.push(`uncheck ${action.ref}: OK`);
+      } else if (action.type === "wait") {
+        await page.waitForTimeout(action.timeout || 1000);
+        results.push(`wait ${action.timeout || 1000}ms: OK`);
+      }
+      await page.waitForTimeout(300);
+    } catch (e: any) {
+      results.push(`${action.type} ${action.ref || ""}: FAIL — ${e.message?.slice(0, 60)}`);
+    }
+  }
+  return { content: [{ type: "text", text: `Batch (${actions.length} actions):\n${results.map(r => "  " + r).join("\n")}` }] };
+});
+
+server.tool("fill_form", "Fill multiple form fields and optionally submit.", {
+  fields: z.array(z.object({
+    ref: z.string().describe("Element ref from snapshot"),
+    value: z.string().describe("Value to fill"),
+  })),
+  submit_ref: z.string().optional().describe("Ref of submit button to click after filling"),
+}, async ({ fields, submit_ref }) => {
+  const page = getPage();
+  for (const f of fields) {
+    await page.locator(`[data-mcp-ref="${f.ref}"]`).first().fill(f.value, { timeout: 5000 });
+  }
+  if (submit_ref) {
+    const btn = page.locator(`[data-mcp-ref="${submit_ref}"]`).first();
+    try { await btn.click({ timeout: 5000 }); } catch { await btn.evaluate((el: any) => el.click()); }
+  }
+  await page.waitForTimeout(1000);
+  return { content: [{ type: "text", text: `Filled ${fields.length} fields${submit_ref ? " + submitted" : ""}. URL: ${page.url()}` }] };
+});
+
+server.tool("navigate_and_snapshot", "Navigate to URL then return snapshot — combined in one call.", {
+  url: z.string(),
+  wait_until: z.enum(["domcontentloaded", "load", "networkidle"]).default("domcontentloaded"),
+}, async ({ url, wait_until }) => {
+  const page = getPage();
+  await page.goto(url, { waitUntil: wait_until, timeout: 30000 });
+  await page.waitForTimeout(1500);
+  const elements = await page.evaluate(SNAPSHOT_JS) || [];
+  const text = formatSnapshot(elements as any[], page.url(), await page.title());
+  return { content: [{ type: "text", text }] };
+});
+
+// ── Tools: Element Inspection ──────────────────────────────────────────────
+
+server.tool("inspect_element", "Get detailed info about an element (tag, attributes, bounding box, styles).", {
+  ref: z.string(),
+}, async ({ ref }) => {
+  const page = getPage();
+  const info = await page.locator(`[data-mcp-ref="${ref}"]`).first().evaluate((el: any) => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    const attrs: Record<string, string> = {};
+    for (const a of el.attributes) attrs[a.name] = a.value;
+    return {
+      tag: el.tagName.toLowerCase(), id: el.id, className: el.className,
+      text: (el.innerText || "").slice(0, 200), value: el.value || "",
+      attrs, rect: { x: r.x, y: r.y, width: r.width, height: r.height },
+      visible: cs.display !== "none" && cs.visibility !== "hidden",
+      fontSize: cs.fontSize, color: cs.color, bg: cs.backgroundColor,
+    };
+  });
+  return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+});
+
+server.tool("get_attribute", "Get a specific attribute value from an element.", {
+  ref: z.string(), attribute: z.string(),
+}, async ({ ref, attribute }) => {
+  const page = getPage();
+  const val = await page.locator(`[data-mcp-ref="${ref}"]`).first().getAttribute(attribute);
+  return { content: [{ type: "text", text: `${attribute}=${val}` }] };
+});
+
+server.tool("query_selector_all", "Query elements by CSS selector, return text/attributes of all matches.", {
+  selector: z.string(),
+  attribute: z.string().default("").describe("Attribute to extract (empty = innerText)"),
+  limit: z.number().default(20),
+}, async ({ selector, attribute, limit }) => {
+  const page = getPage();
+  const results = await page.evaluate(`(() => {
+    var els = document.querySelectorAll("${selector.replace(/"/g, '\\"')}");
+    var out = [];
+    for (var i = 0; i < Math.min(els.length, ${limit}); i++) {
+      out.push({
+        i: i,
+        text: (els[i].innerText || '').trim().slice(0, 100),
+        attr: "${attribute}" ? els[i].getAttribute("${attribute}") || '' : '',
+        tag: els[i].tagName.toLowerCase()
+      });
+    }
+    return { total: els.length, items: out };
+  })()`);
+  return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
+});
+
+server.tool("get_links", "Get all links on the page with URL and text.", {
+  filter: z.string().default("").describe("Filter links by URL pattern (empty = all)"),
+}, async ({ filter }) => {
+  const page = getPage();
+  const links = await page.evaluate(`(() => {
+    var links = document.querySelectorAll('a[href]');
+    var out = [];
+    for (var i = 0; i < links.length; i++) {
+      var href = links[i].href || '';
+      var text = (links[i].innerText || '').trim().slice(0, 80);
+      if (!text && !href) continue;
+      if ("${filter}" && href.indexOf("${filter}") === -1) continue;
+      out.push({ text: text, href: href.slice(0, 150) });
+    }
+    return out;
+  })()`);
+  const arr = links as any[];
+  const lines = arr.slice(0, 50).map((l: any) => `  ${l.text || "(no text)"} → ${l.href}`);
+  return { content: [{ type: "text", text: `Links (${arr.length}):\n${lines.join("\n")}` }] };
+});
+
+// ── Tools: Storage ─────────────────────────────────────────────────────────
+
+server.tool("localstorage_get", "Get all localStorage data or a specific key.", {
+  key: z.string().default("").describe("Key to get (empty = all)"),
+}, async ({ key }) => {
+  const page = getPage();
+  if (key) {
+    const val = await page.evaluate(`localStorage.getItem("${key.replace(/"/g, '\\"')}")`);
+    return { content: [{ type: "text", text: `${key}=${val}` }] };
+  }
+  const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); o[k] = localStorage.getItem(k); } return o; })()`);
+  return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
+});
+
+server.tool("localstorage_set", "Set a localStorage item.", {
+  key: z.string(), value: z.string(),
+}, async ({ key, value }) => {
+  const page = getPage();
+  await page.evaluate(`localStorage.setItem("${key.replace(/"/g, '\\"')}", "${value.replace(/"/g, '\\"')}")`);
+  return { content: [{ type: "text", text: `localStorage set: ${key}` }] };
+});
+
+server.tool("localstorage_clear", "Clear all localStorage.", {}, async () => {
+  const page = getPage();
+  await page.evaluate(`localStorage.clear()`);
+  return { content: [{ type: "text", text: "localStorage cleared." }] };
+});
+
+server.tool("sessionstorage_get", "Get all sessionStorage data or a specific key.", {
+  key: z.string().default(""),
+}, async ({ key }) => {
+  const page = getPage();
+  if (key) {
+    const val = await page.evaluate(`sessionStorage.getItem("${key.replace(/"/g, '\\"')}")`);
+    return { content: [{ type: "text", text: `${key}=${val}` }] };
+  }
+  const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < sessionStorage.length; i++) { var k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; })()`);
+  return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
+});
+
+server.tool("sessionstorage_set", "Set a sessionStorage item.", {
+  key: z.string(), value: z.string(),
+}, async ({ key, value }) => {
+  const page = getPage();
+  await page.evaluate(`sessionStorage.setItem("${key.replace(/"/g, '\\"')}", "${value.replace(/"/g, '\\"')}")`);
+  return { content: [{ type: "text", text: `sessionStorage set: ${key}` }] };
+});
+
+// ── Tools: Mouse XY ────────────────────────────────────────────────────────
+
+server.tool("mouse_click_xy", "Click at exact x,y coordinates on the page.", {
+  x: z.number(), y: z.number(),
+  button: z.enum(["left", "right", "middle"]).default("left"),
+}, async ({ x, y, button }) => {
+  const page = getPage();
+  await page.mouse.click(x, y, { button });
+  await page.waitForTimeout(500);
+  return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button}` }] };
+});
+
+server.tool("mouse_move", "Move mouse to exact x,y coordinates.", {
+  x: z.number(), y: z.number(),
+}, async ({ x, y }) => {
+  const page = getPage();
+  await page.mouse.move(x, y);
+  return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y})` }] };
+});
+
+server.tool("drag_and_drop", "Drag from one element to another.", {
+  source_ref: z.string().describe("Ref of element to drag"),
+  target_ref: z.string().describe("Ref of drop target"),
+}, async ({ source_ref, target_ref }) => {
+  const page = getPage();
+  const src = page.locator(`[data-mcp-ref="${source_ref}"]`).first();
+  const tgt = page.locator(`[data-mcp-ref="${target_ref}"]`).first();
+  await src.dragTo(tgt, { timeout: 5000 });
+  return { content: [{ type: "text", text: `Dragged ${source_ref} → ${target_ref}` }] };
+});
+
+// ── Tools: Frames/Iframes ──────────────────────────────────────────────────
+
+server.tool("list_frames", "List all frames/iframes in the page.", {}, async () => {
+  const page = getPage();
+  const frames = page.frames();
+  const lines = frames.map((f, i) => `  [${i}] ${f.name() || "(unnamed)"} — ${f.url().slice(0, 100)}`);
+  return { content: [{ type: "text", text: `Frames (${frames.length}):\n${lines.join("\n")}` }] };
+});
+
+server.tool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe.", {
+  frame_name: z.string().default("").describe("Frame name (empty = by index)"),
+  frame_index: z.number().default(0).describe("Frame index from list_frames"),
+  expression: z.string(),
+}, async ({ frame_name, frame_index, expression }) => {
+  const page = getPage();
+  const frame = frame_name
+    ? page.frames().find(f => f.name() === frame_name)
+    : page.frames()[frame_index];
+  if (!frame) return { content: [{ type: "text", text: "Frame not found." }] };
+  const result = await frame.evaluate(expression);
+  return { content: [{ type: "text", text: typeof result === "object" ? JSON.stringify(result, null, 2) : String(result) }] };
+});
+
+// ── Tools: Wait (extended) ─────────────────────────────────────────────────
+
+server.tool("wait_for_url", "Wait for URL to match a pattern.", {
+  pattern: z.string().describe("URL substring or regex pattern"),
+  timeout: z.number().default(15000),
+}, async ({ pattern, timeout }) => {
+  const page = getPage();
+  await page.waitForURL(pattern.startsWith("/") ? new RegExp(pattern.slice(1, -1)) : `**/*${pattern}*`, { timeout });
+  return { content: [{ type: "text", text: `URL matched pattern '${pattern}'. Current: ${page.url()}` }] };
+});
+
+server.tool("wait_for_response", "Wait for a network response matching a URL pattern.", {
+  url_pattern: z.string().describe("URL substring to match"),
+  timeout: z.number().default(15000),
+}, async ({ url_pattern, timeout }) => {
+  const page = getPage();
+  const resp = await page.waitForResponse(r => r.url().includes(url_pattern), { timeout });
+  return { content: [{ type: "text", text: `Response: ${resp.status()} ${resp.url().slice(0, 120)}` }] };
+});
+
+// ── Tools: Viewport ────────────────────────────────────────────────────────
+
+server.tool("get_viewport_size", "Get current viewport dimensions.", {}, async () => {
+  const page = getPage();
+  const size = page.viewportSize();
+  return { content: [{ type: "text", text: `Viewport: ${size?.width || "?"}x${size?.height || "?"}` }] };
+});
+
+server.tool("set_viewport_size", "Set viewport width and height.", {
+  width: z.number(), height: z.number(),
+}, async ({ width, height }) => {
+  const page = getPage();
+  await page.setViewportSize({ width, height });
+  return { content: [{ type: "text", text: `Viewport set to ${width}x${height}` }] };
+});
+
+// ── Tools: Accessibility ───────────────────────────────────────────────────
+
+server.tool("accessibility_snapshot", "Get accessibility tree snapshot — compact view of page structure for LLM understanding.", {}, async () => {
+  const page = getPage();
+  const snap = await page.evaluate(`(() => {
+    function walk(el, depth) {
+      if (depth > 4) return null;
+      var role = el.getAttribute ? (el.getAttribute('role') || el.tagName.toLowerCase()) : '';
+      var name = el.getAttribute ? (el.getAttribute('aria-label') || el.innerText || '').trim().slice(0, 60) : '';
+      var node = { role: role, name: name };
+      if (el.children && el.children.length > 0 && depth < 3) {
+        node.children = [];
+        for (var i = 0; i < Math.min(el.children.length, 20); i++) {
+          var child = walk(el.children[i], depth + 1);
+          if (child && child.name) node.children.push(child);
+        }
+        if (node.children.length === 0) delete node.children;
+      }
+      return node;
+    }
+    return walk(document.body, 0);
+  })()`);
+  const text = JSON.stringify(snap, null, 2);
+  if (text.length > 8000) return { content: [{ type: "text", text: text.slice(0, 8000) + "\n... (truncated)" }] };
+  return { content: [{ type: "text", text }] };
+});
+
+// ── Tools: Debug & Health ──────────────────────────────────────────────────
+
+server.tool("server_status", "Health check — verify server, browser status, active tabs.", {}, async () => {
+  return { content: [{ type: "text", text: JSON.stringify({
+    browser_up: browserUp,
+    active_tabs: pages.length,
+    active_page: activePage,
+    current_url: browserUp && pages.length > 0 ? pages[activePage]?.url() : null,
+    profile_dir: PROFILE_DIR,
+    screenshot_dir: SCREENSHOT_DIR,
+  }, null, 2) }] };
+});
+
+server.tool("get_page_errors", "Get JavaScript errors from the page.", {}, async () => {
+  const page = getPage();
+  const errors = await page.evaluate(`(() => {
+    var errs = window.__mcp_errors || [];
+    return errs.slice(-20);
+  })()`);
+  return { content: [{ type: "text", text: JSON.stringify(errors, null, 2) }] };
+});
+
+server.tool("inject_init_script", "Inject a script that runs before every page load.", {
+  script: z.string().describe("JavaScript code to inject"),
+}, async ({ script }) => {
+  if (!browserContext) throw new Error("Browser not running.");
+  await browserContext.addInitScript(script);
+  return { content: [{ type: "text", text: "Init script injected. Will run on every new page/navigation." }] };
+});
+
+// ── Tools: Export ──────────────────────────────────────────────────────────
+
+server.tool("export_har", "Export network traffic as HAR file.", {
+  path: z.string().default(""),
+}, async ({ path: harPath }) => {
+  const page = getPage();
+  const target = harPath || join(SCREENSHOT_DIR, "network.har");
+  // Collect network entries
+  const entries = networkRequests.slice(-100).map(r => ({
+    request: { method: r.method, url: r.url },
+    response: { status: r.status },
+  }));
+  const har = { log: { version: "1.2", entries } };
+  writeFileSync(target, JSON.stringify(har, null, 2));
+  return { content: [{ type: "text", text: `HAR exported: ${target} (${entries.length} entries)` }] };
+});
+
 // ── Start Server ───────────────────────────────────────────────────────────
 
 async function main() {
