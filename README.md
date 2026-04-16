@@ -1,9 +1,15 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/daijro/camoufox/main/assets/logo_sm.png" alt="Camoufox" width="120">
+
 # MCP Camoufox
 
 [![npm version](https://img.shields.io/npm/v/mcp-camoufox.svg)](https://www.npmjs.com/package/mcp-camoufox)
 [![npm downloads](https://img.shields.io/npm/dm/mcp-camoufox.svg)](https://www.npmjs.com/package/mcp-camoufox)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org)
+
+</div>
 
 The most feature-rich stealth browser MCP server. **69 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
