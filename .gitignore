@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.png
+*.pdf
+.DS_Store
+CLAUDE.md
+AGENTS.md
