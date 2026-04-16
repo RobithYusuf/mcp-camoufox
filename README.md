@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **69 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **79 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -39,7 +39,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **69** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **79** | **Yes** | **Yes** | **Yes** |
 
 ## Setup
 
@@ -234,7 +234,7 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 69 Tools
+## All 79 Tools
 
 ### Browser Lifecycle (2)
 
@@ -395,6 +395,30 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `console_start` / `console_get` | Capture and retrieve browser console messages |
 | `network_start` / `network_get` | Capture and retrieve network requests |
 
+### Compound (reduce round-trips) (4)
+
+| Tool | Description |
+|------|-------------|
+| `wait_and_snapshot` | Wait for selector/text + return snapshot in one call |
+| `back_and_snapshot` | Navigate back + return snapshot |
+| `reload_and_snapshot` | Reload page + return snapshot |
+| `click_and_snapshot` | Click + wait + return snapshot. Perfect for buttons that trigger navigation. |
+
+### Smart Selectors (skip snapshot) (3)
+
+| Tool | Description |
+|------|-------------|
+| `find_by_text` | Find element by visible text, returns ref. Skip `browser_snapshot` when you know exact text. |
+| `find_by_label` | Find input by label text, returns ref. |
+| `find_by_placeholder` | Find input by placeholder, returns ref. |
+
+### Session Portability (2)
+
+| Tool | Description |
+|------|-------------|
+| `cookie_export` | Export all cookies as JSON (for transfer) |
+| `cookie_import` | Import cookies from JSON (restore session) |
+
 ### Scraping & Extraction (4)
 
 | Tool | Description |
@@ -404,13 +428,14 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `extract_table` | Extract HTML table as JSON array with auto-detected headers |
 | `scrape_page` | Smart scraper: auto-extract main content (strips nav/footer), links, meta, headings. Smart truncation at paragraph boundary. |
 
-### Debug (3)
+### Debug (4)
 
 | Tool | Description |
 |------|-------------|
 | `server_status` | Health check: browser status, tabs, URL |
 | `get_page_errors` | JS errors from page |
 | `export_har` | Export network traffic as HAR file |
+| `page_stats` | Element count, page size, load metrics + extraction strategy recommendation |
 
 ## Examples
 
