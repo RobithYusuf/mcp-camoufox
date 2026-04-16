@@ -1,6 +1,6 @@
 {
   "name": "mcp-camoufox",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "description": "MCP server for stealth browser automation via Camoufox — 39 tools, Chrome DevTools MCP-level power with anti-bot stealth",
   "type": "module",
   "main": "dist/index.js",
@@ -16,8 +16,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
-    "prepublishOnly": "npm run build",
-    "postinstall": "npx camoufox-js fetch || echo '[mcp-camoufox] Browser will download on first launch.'"
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",

@@ -145,26 +145,58 @@ server.tool(
     const h = height > 0 ? height : 800;
 
     // Auto-download Camoufox binary if not installed
-    try {
+    // camoufox-js does NOT auto-download — we handle it here
+    await (async () => {
       const { execSync } = await import("child_process");
       const { existsSync, readdirSync } = await import("fs");
       const { join: pathJoin } = await import("path");
-      // Check common cache locations
-      const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-      const cacheLocations = [
-        pathJoin(homeDir, ".cache", "camoufox"),
-        pathJoin(homeDir, "Library", "Caches", "camoufox"),
-        pathJoin(homeDir, "AppData", "Local", "camoufox"),
-      ];
-      const isInstalled = cacheLocations.some(dir => existsSync(dir) && readdirSync(dir).length > 2);
-      if (!isInstalled) {
-        console.error("[mcp-camoufox] Camoufox browser not found. Auto-downloading (~500MB, one-time)...");
-        execSync("npx camoufox-js fetch", { stdio: "inherit", timeout: 600000 });
-        console.error("[mcp-camoufox] Download complete.");
+      const os = await import("os");
+
+      // Detect cache dir per platform (same logic as camoufox-js pkgman.ts)
+      const homeDir = os.homedir();
+      const platform = os.platform();
+      let cacheDir: string;
+      if (platform === "darwin") {
+        cacheDir = pathJoin(homeDir, "Library", "Caches", "camoufox");
+      } else if (platform === "win32") {
+        cacheDir = pathJoin(process.env.LOCALAPPDATA || pathJoin(homeDir, "AppData", "Local"), "camoufox");
+      } else {
+        cacheDir = pathJoin(process.env.XDG_CACHE_HOME || pathJoin(homeDir, ".cache"), "camoufox");
       }
-    } catch (e: any) {
-      console.error(`[mcp-camoufox] Auto-download check: ${e.message?.slice(0, 100)}`);
-    }
+
+      // Check if binary exists (look for version.json inside cache dir)
+      const versionFile = pathJoin(cacheDir, "version.json");
+      const isInstalled = existsSync(versionFile);
+
+      if (!isInstalled) {
+        console.error("");
+        console.error("=".repeat(60));
+        console.error("[mcp-camoufox] First-time setup: downloading Camoufox browser");
+        console.error("[mcp-camoufox] This is ~500MB and only happens once.");
+        console.error("[mcp-camoufox] Please wait 2-5 minutes...");
+        console.error("=".repeat(60));
+        console.error("");
+        try {
+          // Use npx to run camoufox-js CLI fetch command
+          const cmd = platform === "win32" ? "npx.cmd" : "npx";
+          execSync(`${cmd} camoufox-js fetch`, {
+            stdio: "inherit",
+            timeout: 900000, // 15 min max
+            env: { ...process.env, npm_config_yes: "true" },
+          });
+          console.error("");
+          console.error("[mcp-camoufox] Download complete! Browser ready.");
+          console.error("");
+        } catch (fetchErr: any) {
+          console.error(`[mcp-camoufox] Auto-download failed: ${fetchErr.message?.slice(0, 200)}`);
+          console.error("[mcp-camoufox] Try manually: npx camoufox-js fetch");
+          throw new Error(
+            "Camoufox browser binary not found. Auto-download failed. " +
+            "Please run manually: npx camoufox-js fetch"
+          );
+        }
+      }
+    })();
 
     const ctx = await Camoufox({
       headless,
