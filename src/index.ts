@@ -144,6 +144,28 @@ server.tool(
     const w = width > 0 ? width : 1280;
     const h = height > 0 ? height : 800;
 
+    // Auto-download Camoufox binary if not installed
+    try {
+      const { execSync } = await import("child_process");
+      const { existsSync, readdirSync } = await import("fs");
+      const { join: pathJoin } = await import("path");
+      // Check common cache locations
+      const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+      const cacheLocations = [
+        pathJoin(homeDir, ".cache", "camoufox"),
+        pathJoin(homeDir, "Library", "Caches", "camoufox"),
+        pathJoin(homeDir, "AppData", "Local", "camoufox"),
+      ];
+      const isInstalled = cacheLocations.some(dir => existsSync(dir) && readdirSync(dir).length > 2);
+      if (!isInstalled) {
+        console.error("[mcp-camoufox] Camoufox browser not found. Auto-downloading (~500MB, one-time)...");
+        execSync("npx camoufox-js fetch", { stdio: "inherit", timeout: 600000 });
+        console.error("[mcp-camoufox] Download complete.");
+      }
+    } catch (e: any) {
+      console.error(`[mcp-camoufox] Auto-download check: ${e.message?.slice(0, 100)}`);
+    }
+
     const ctx = await Camoufox({
       headless,
       humanize,
