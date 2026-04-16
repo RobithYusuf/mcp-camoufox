@@ -996,35 +996,201 @@ server.tool("export_har", "Export network traffic as HAR file.", {
 
 // ── Tools: Scraping / Extraction ───────────────────────────────────────────
 
-server.tool("extract_structured", "Extract structured data from repeated elements (cards, rows, listings). Token-efficient — returns clean JSON.", {
-  container_selector: z.string().describe("CSS selector for each repeated item (e.g. 'article', '.job-card', 'tr')"),
+server.tool("detect_content_pattern", "Auto-detect repeated content patterns (cards, listings, rows) and suggest CSS selectors. Run this BEFORE extract_structured to find the right selectors.", {
+  min_items: z.number().default(3).describe("Minimum repeated items to detect as pattern"),
+}, async ({ min_items }) => {
+  const page = getPage();
+  const patterns = await page.evaluate(`(() => {
+    // Count children with same tag+class per parent
+    var candidates = [];
+    var parents = document.querySelectorAll('main, [role="main"], section, div, ul, ol, tbody');
+    for (var p = 0; p < parents.length; p++) {
+      var parent = parents[p];
+      var childMap = {};
+      for (var c = 0; c < parent.children.length; c++) {
+        var child = parent.children[c];
+        var key = child.tagName;
+        if (child.className) key += '.' + child.className.split(' ').filter(function(c){return c.length>0}).slice(0,2).join('.');
+        if (!childMap[key]) childMap[key] = { count: 0, tag: child.tagName.toLowerCase(), cls: child.className, sample: '' };
+        childMap[key].count++;
+        if (!childMap[key].sample) childMap[key].sample = (child.innerText || '').trim().slice(0, 150);
+      }
+      var keys = Object.keys(childMap);
+      for (var k = 0; k < keys.length; k++) {
+        if (childMap[keys[k]].count >= ${min_items}) {
+          var info = childMap[keys[k]];
+          // Build selector
+          var sel = info.tag;
+          if (info.cls) {
+            var classes = info.cls.split(' ').filter(function(c){return c.length > 0 && c.length < 40}).slice(0,2);
+            if (classes.length > 0) sel = info.tag + '.' + classes.join('.');
+          }
+          // Find child elements for field suggestions
+          var firstItem = parent.querySelector(sel);
+          var fieldHints = [];
+          if (firstItem) {
+            var links = firstItem.querySelectorAll('a[href]');
+            if (links.length > 0) fieldHints.push({ name: 'url', selector: 'a', attribute: 'href', sample: links[0].href.slice(0, 100) });
+            var headings = firstItem.querySelectorAll('h1,h2,h3,h4,h5,h6');
+            if (headings.length > 0) fieldHints.push({ name: 'title', selector: headings[0].tagName.toLowerCase(), attribute: '', sample: headings[0].innerText.trim().slice(0, 60) });
+            var imgs = firstItem.querySelectorAll('img[src]');
+            if (imgs.length > 0) fieldHints.push({ name: 'image', selector: 'img', attribute: 'src', sample: imgs[0].src.slice(0, 80) });
+            // Find text-heavy spans/divs
+            var texts = firstItem.querySelectorAll('span, p, div');
+            var textItems = [];
+            for (var t = 0; t < texts.length; t++) {
+              var txt = texts[t].innerText.trim();
+              if (txt.length > 5 && txt.length < 100 && texts[t].children.length === 0) {
+                var tSel = texts[t].tagName.toLowerCase();
+                if (texts[t].className) tSel += '.' + texts[t].className.split(' ').filter(function(c){return c.length>0&&c.length<40}).slice(0,1).join('.');
+                textItems.push({ selector: tSel, sample: txt.slice(0, 60) });
+              }
+            }
+            for (var ti = 0; ti < Math.min(textItems.length, 3); ti++) {
+              fieldHints.push({ name: 'field_' + ti, selector: textItems[ti].selector, attribute: '', sample: textItems[ti].sample });
+            }
+          }
+          candidates.push({
+            selector: sel,
+            count: info.count,
+            sample_text: info.sample.slice(0, 100),
+            suggested_fields: fieldHints
+          });
+        }
+      }
+    }
+    // Sort by count desc, deduplicate by selector
+    candidates.sort(function(a,b){ return b.count - a.count; });
+    var seen = {};
+    var unique = [];
+    for (var u = 0; u < candidates.length; u++) {
+      if (!seen[candidates[u].selector]) {
+        seen[candidates[u].selector] = true;
+        unique.push(candidates[u]);
+      }
+    }
+    return unique.slice(0, 10);
+  })()`);
+  const arr = patterns as any[];
+  if (arr.length === 0) {
+    return { content: [{ type: "text", text: "No repeated content patterns detected. Try scrolling down to load more content." }] };
+  }
+  let text = `Detected ${arr.length} content pattern(s):\n\n`;
+  for (const p of arr) {
+    text += `--- ${p.count} items: ${p.selector} ---\n`;
+    text += `Sample: "${p.sample_text}"\n`;
+    if (p.suggested_fields?.length) {
+      text += `Suggested extract_structured call:\n`;
+      text += `  container_selector: "${p.selector}"\n`;
+      text += `  fields:\n`;
+      for (const f of p.suggested_fields) {
+        text += `    - {name: "${f.name}", selector: "${f.selector}"${f.attribute ? `, attribute: "${f.attribute}"` : ''}} → "${f.sample}"\n`;
+      }
+    }
+    text += `\n`;
+  }
+  return { content: [{ type: "text", text }] };
+});
+
+server.tool("extract_structured", "Extract structured data from repeated elements (cards, rows, listings). Auto-deduplicates, filters empty items, extracts direct text only. Use detect_content_pattern first to find correct selectors.", {
+  container_selector: z.string().describe("CSS selector for each repeated item. Use detect_content_pattern to find this."),
   fields: z.array(z.object({
     name: z.string().describe("Field name in output"),
     selector: z.string().describe("CSS selector within each item"),
-    attribute: z.string().default("").describe("Attribute to extract (empty = innerText)"),
+    attribute: z.string().default("").describe("Attribute to extract (empty = direct text only)"),
   })).describe("Fields to extract from each item"),
   limit: z.number().default(50).describe("Max items to extract"),
-}, async ({ container_selector, fields, limit }) => {
+  deduplicate_by: z.string().default("").describe("Field name to deduplicate by (empty = auto)"),
+  direct_text_only: z.boolean().default(true).describe("Extract only direct text of matched element, not children text (prevents field mixing)"),
+}, async ({ container_selector, fields, limit, deduplicate_by, direct_text_only }) => {
   const page = getPage();
   const fieldsDef = JSON.stringify(fields);
   const results = await page.evaluate(`(() => {
-    var containers = document.querySelectorAll("${container_selector.replace(/"/g, '\\"')}");
+    // Helper: get direct text only (no children text) to prevent field mixing
+    function directText(el) {
+      var text = '';
+      for (var n = 0; n < el.childNodes.length; n++) {
+        if (el.childNodes[n].nodeType === 3) text += el.childNodes[n].textContent;
+      }
+      text = text.trim();
+      // If direct text empty, fall back to first line of innerText
+      if (!text) {
+        var lines = (el.innerText || '').trim().split('\\n');
+        text = lines[0] || '';
+      }
+      return text.trim();
+    }
+
+    // Get ALL matching containers, then filter to only top-level (not nested)
+    var allContainers = document.querySelectorAll("${container_selector.replace(/"/g, '\\"')}");
+    var containers = [];
+    for (var c = 0; c < allContainers.length; c++) {
+      var isNested = false;
+      var parent = allContainers[c].parentElement;
+      while (parent) {
+        if (parent.matches && parent.matches("${container_selector.replace(/"/g, '\\"')}")) {
+          isNested = true;
+          break;
+        }
+        parent = parent.parentElement;
+      }
+      if (!isNested) containers.push(allContainers[c]);
+    }
+
     var fields = ${fieldsDef};
+    var directOnly = ${direct_text_only};
     var out = [];
-    for (var i = 0; i < Math.min(containers.length, ${limit}); i++) {
+    var seenKeys = {};
+    var dedup = "${deduplicate_by}";
+
+    for (var i = 0; i < Math.min(containers.length, ${limit * 2}); i++) {
       var item = {};
+      var nonEmptyCount = 0;
+
       for (var j = 0; j < fields.length; j++) {
         var f = fields[j];
         var el = containers[i].querySelector(f.selector);
         if (el) {
-          item[f.name] = f.attribute ? (el.getAttribute(f.attribute) || '') : (el.innerText || '').trim();
+          var val;
+          if (f.attribute) {
+            val = el.getAttribute(f.attribute) || '';
+          } else if (directOnly) {
+            val = directText(el);
+          } else {
+            val = (el.innerText || '').trim();
+          }
+          item[f.name] = val;
+          if (val) nonEmptyCount++;
         } else {
           item[f.name] = '';
         }
       }
+
+      // P0: Skip items where all fields are empty
+      if (nonEmptyCount === 0) continue;
+
+      // P0: Deduplicate
+      var dedupKey = '';
+      if (dedup && item[dedup]) {
+        dedupKey = item[dedup];
+      } else {
+        for (var d = 0; d < fields.length; d++) {
+          if (item[fields[d].name]) { dedupKey = item[fields[d].name]; break; }
+        }
+      }
+      if (dedupKey && seenKeys[dedupKey]) continue;
+      if (dedupKey) seenKeys[dedupKey] = true;
+
       out.push(item);
+      if (out.length >= ${limit}) break;
     }
-    return { total: containers.length, extracted: out.length, items: out };
+
+    return {
+      total_on_page: allContainers.length,
+      top_level: containers.length,
+      unique_extracted: out.length,
+      items: out
+    };
   })()`);
   return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 });
@@ -1059,11 +1225,12 @@ server.tool("extract_table", "Extract data from an HTML table as JSON array.", {
   return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 });
 
-server.tool("scrape_page", "Smart page scraper — auto-detect and extract main content, links, metadata. Token-efficient.", {
+server.tool("scrape_page", "Smart page scraper — auto-detect and extract main content, links, metadata. Strips nav/footer noise.", {
   include_links: z.boolean().default(true),
   include_meta: z.boolean().default(true),
-  max_text_length: z.number().default(3000),
-}, async ({ include_links, include_meta, max_text_length }) => {
+  max_text_length: z.number().default(8000).describe("Max text chars (truncates at paragraph boundary)"),
+  only_main_content: z.boolean().default(true).describe("Strip nav, header, footer, sidebar — extract only main content area"),
+}, async ({ include_links, include_meta, max_text_length, only_main_content }) => {
   const page = getPage();
   const data = await page.evaluate(`(() => {
     var result = {};
@@ -1081,16 +1248,48 @@ server.tool("scrape_page", "Smart page scraper — auto-detect and extract main 
       result.meta = metas;
     }
 
-    // Main content — try article/main first, fallback to body
-    var main = document.querySelector('article, main, [role="main"], .content, #content');
-    var textSource = main || document.body;
-    result.text = textSource.innerText.trim().slice(0, ${max_text_length});
+    // Find main content area
+    var textSource;
+    if (${only_main_content}) {
+      textSource = document.querySelector('main, [role="main"], #main-content, .main-content, #content, .content');
+      // Exclude nav/footer/sidebar from the source
+      if (textSource) {
+        var clone = textSource.cloneNode(true);
+        var noise = clone.querySelectorAll('nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], .sidebar, .nav, .footer, .header');
+        for (var n = 0; n < noise.length; n++) noise[n].remove();
+        var fullText = clone.innerText.trim();
+      } else {
+        textSource = document.body;
+        var fullText = textSource.innerText.trim();
+      }
+    } else {
+      textSource = document.body;
+      var fullText = textSource.innerText.trim();
+    }
 
-    // Links
+    // Smart truncation: cut at paragraph/newline boundary, not mid-word
+    var totalLen = fullText.length;
+    if (fullText.length > ${max_text_length}) {
+      var cutText = fullText.slice(0, ${max_text_length});
+      var lastNewline = cutText.lastIndexOf('\\n');
+      if (lastNewline > ${max_text_length} * 0.8) {
+        cutText = cutText.slice(0, lastNewline);
+      }
+      result.text = cutText;
+      result.truncated = true;
+      result.total_text_length = totalLen;
+    } else {
+      result.text = fullText;
+      result.truncated = false;
+      result.total_text_length = totalLen;
+    }
+
+    // Links from main content area
     if (${include_links}) {
-      var links = textSource.querySelectorAll('a[href]');
+      var linkSource = textSource || document.body;
+      var links = linkSource.querySelectorAll('a[href]');
       var linkList = [];
-      for (var j = 0; j < Math.min(links.length, 30); j++) {
+      for (var j = 0; j < Math.min(links.length, 50); j++) {
         var text = (links[j].innerText || '').trim().slice(0, 80);
         if (text) linkList.push({ text: text, href: links[j].href });
       }
@@ -1098,9 +1297,10 @@ server.tool("scrape_page", "Smart page scraper — auto-detect and extract main 
     }
 
     // Headings
+    var headingSource = textSource || document.body;
     var headings = [];
-    var hs = document.querySelectorAll('h1, h2, h3');
-    for (var k = 0; k < Math.min(hs.length, 15); k++) {
+    var hs = headingSource.querySelectorAll('h1, h2, h3');
+    for (var k = 0; k < Math.min(hs.length, 20); k++) {
       headings.push({ level: hs[k].tagName, text: hs[k].innerText.trim().slice(0, 100) });
     }
     result.headings = headings;
