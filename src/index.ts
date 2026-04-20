@@ -865,22 +865,85 @@ server.tool("sessionstorage_set", "Set a sessionStorage item.", {
 
 // ── Tools: Mouse XY ────────────────────────────────────────────────────────
 
-server.tool("mouse_click_xy", "Click at exact x,y coordinates on the page.", {
+server.tool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpolated pre-movement (human-like).", {
   x: z.number(), y: z.number(),
   button: z.enum(["left", "right", "middle"]).default("left"),
-}, async ({ x, y, button }) => {
+  steps: z.number().default(0).describe("Interpolation steps for pre-click movement (0=instant, 15-30=human-like)"),
+}, async ({ x, y, button, steps }) => {
   const page = getPage();
+  if (steps > 0) {
+    await page.mouse.move(x, y, { steps });
+    await page.waitForTimeout(80 + Math.random() * 60);
+  }
   await page.mouse.click(x, y, { button });
   await page.waitForTimeout(500);
-  return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button}` }] };
+  return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button} steps=${steps}` }] };
 });
 
-server.tool("mouse_move", "Move mouse to exact x,y coordinates.", {
+server.tool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-like).", {
   x: z.number(), y: z.number(),
-}, async ({ x, y }) => {
+  steps: z.number().default(0).describe("Interpolation steps (0=instant jump, 15-30=smooth)"),
+}, async ({ x, y, steps }) => {
   const page = getPage();
-  await page.mouse.move(x, y);
-  return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y})` }] };
+  await page.mouse.move(x, y, steps > 0 ? { steps } : undefined);
+  return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y}) steps=${steps}` }] };
+});
+
+server.tool("click_turnstile", "Auto-find and click Cloudflare Turnstile checkbox with humanized approach. Works on Interactive Turnstile widgets (visible iframe). Managed Challenge interstitials (hidden widget) not supported — use sister project mcp-stealth-chrome for those.", {
+  offset_x: z.number().default(30).describe("Pixels from widget left edge (calibrated for CF checkbox)"),
+  offset_y: z.number().optional().describe("Vertical offset from widget top (default = height/2)"),
+  wait_render_ms: z.number().default(1500).describe("Wait before detection to let widget render"),
+}, async ({ offset_x, offset_y, wait_render_ms }) => {
+  const page = getPage();
+  await page.waitForTimeout(wait_render_ms);
+
+  // Widget detection — 6 selectors ordered by specificity (port from mcp-stealth-chrome)
+  const coords = await page.evaluate(() => {
+    const sels = [
+      'iframe[src*="challenges.cloudflare.com"]',
+      'iframe[src*="turnstile"]',
+      '[data-testid*="challenge-widget"]',
+      '[data-testid*="turnstile"]',
+      '[data-sitekey]',
+      '.cf-turnstile',
+    ];
+    for (const sel of sels) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 50 || r.height < 20) continue;
+      return {
+        found: sel,
+        left: Math.round(r.left),
+        top: Math.round(r.top),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+      };
+    }
+    return null;
+  });
+
+  if (!coords) {
+    return { content: [{ type: "text", text: "Turnstile widget not found — selector miss. Likely a Managed Challenge interstitial (use mcp-stealth-chrome) or widget hasn't rendered yet (try wait_render_ms=5000)." }] };
+  }
+
+  const targetX = coords.left + offset_x;
+  const targetY = coords.top + (offset_y ?? Math.floor(coords.height / 2));
+
+  // Humanized 3-step approach (Camoufox humanize layer wraps each move)
+  await page.mouse.move(targetX + 180, targetY - 80, { steps: 20 });
+  await page.waitForTimeout(250 + Math.random() * 150);
+  await page.mouse.move(targetX + 40, targetY - 20, { steps: 12 });
+  await page.waitForTimeout(150 + Math.random() * 100);
+  await page.mouse.move(targetX, targetY, { steps: 8 });
+  await page.waitForTimeout(80 + Math.random() * 60);
+
+  // Human-like click: down → tiny delay → up
+  await page.mouse.down();
+  await page.waitForTimeout(40 + Math.random() * 30);
+  await page.mouse.up();
+
+  return { content: [{ type: "text", text: `clicked Turnstile at (${targetX},${targetY}) — widget found via ${coords.found} (${coords.width}x${coords.height})` }] };
 });
 
 server.tool("drag_and_drop", "Drag from one element to another.", {

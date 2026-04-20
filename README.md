@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **79 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **80 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -39,21 +39,23 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **79** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **80** | **Yes** | **Yes** | **Yes** |
 
 ## Proven on Real Sites
 
 | Site | Challenge | Result |
 |------|-----------|--------|
-| `2captcha.com/demo/cloudflare-turnstile` | Cloudflare Turnstile widget | ✅ **"Success!"** via humanized mouse click ([proof](docs/images/turnstile.jpg)) |
+| `2captcha.com/demo/cloudflare-turnstile` | Cloudflare Turnstile widget | ✅ **"Success!"** via `click_turnstile()` tool ([proof](docs/images/turnstile.jpg)) |
 | `bot.sannysoft.com` | Firefox fingerprint tests | ✅ All green ([proof](docs/images/sannysoft.jpg)) |
 | `browserscan.net/bot-detection` | WebDriver/UA/CDP/Navigator | ✅ All categories "Normal" ([proof](docs/images/browserscan.jpg)) |
 
-### 🎯 Cloudflare Turnstile → Success via Humanized Click
+### 🎯 Cloudflare Turnstile → Success via `click_turnstile()`
 
 <img src="docs/images/turnstile.jpg" alt="Cloudflare Turnstile success" width="500">
 
-Camoufox's **humanize mode** + mouse move/click at the widget position passes Cloudflare Turnstile without CAPTCHA solver API. Just `page.mouse.click(x, y)` on the widget — no external service required.
+`click_turnstile()` auto-detects the widget via 6 selector fallback (`iframe[src*=challenges.cloudflare.com]`, `[data-sitekey]`, `.cf-turnstile`, …), computes checkbox position (offset_x=30 from widget left), and clicks with a 3-step Bezier-like approach — combined with Camoufox's native `humanize` + `disable_coop` for cross-origin iframe click.
+
+**Scope:** works on **Interactive Turnstile** (visible iframe widget). **Managed Challenge** interstitials ("Just a moment...") render the widget in shadow DOM — not supported here; use sister project [mcp-stealth-chrome](https://github.com/RobithYusuf/mcp-stealth-chrome) (Chrome+CDP) for those. Real-world bypass success also depends on IP reputation and browser fingerprint — code alone doesn't guarantee it.
 
 ### 🧪 bot.sannysoft.com → Firefox Fingerprint Pass
 
@@ -260,7 +262,7 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 79 Tools
+## All 80 Tools
 
 ### Browser Lifecycle (2)
 
@@ -309,12 +311,13 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `type_text` | Type char by char. Options: `delay`. For OTP, masked inputs, date pickers. |
 | `press_key` | Key or combo: `Enter`, `Escape`, `Tab`, `Control+a`, `Meta+c` |
 
-### Mouse XY (3)
+### Mouse XY (4)
 
 | Tool | Description |
 |------|-------------|
-| `mouse_click_xy` | Click at exact coordinates |
-| `mouse_move` | Move cursor to coordinates |
+| `mouse_click_xy` | Click at exact coordinates. Optional `steps` (0=instant, 15-30=human-like pre-movement) |
+| `mouse_move` | Move cursor to coordinates. Optional `steps` for interpolated path |
+| `click_turnstile` | Auto-find + humanized click on Cloudflare Turnstile widget. Params: `offset_x` (default 30), `offset_y`, `wait_render_ms`. Works on Interactive Turnstile (visible iframe widget). Not for Managed Challenge interstitials. |
 | `drag_and_drop` | Drag between two elements |
 
 ### Wait (4)
