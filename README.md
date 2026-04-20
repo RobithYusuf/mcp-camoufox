@@ -45,8 +45,15 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 
 | Site | Challenge | Result |
 |------|-----------|--------|
+| `2captcha.com/demo/cloudflare-turnstile` | Cloudflare Turnstile widget | ✅ **"Success!"** via humanized mouse click ([proof](docs/images/turnstile.jpg)) |
 | `bot.sannysoft.com` | Firefox fingerprint tests | ✅ All green ([proof](docs/images/sannysoft.jpg)) |
 | `browserscan.net/bot-detection` | WebDriver/UA/CDP/Navigator | ✅ All categories "Normal" ([proof](docs/images/browserscan.jpg)) |
+
+### 🎯 Cloudflare Turnstile → Success via Humanized Click
+
+<img src="docs/images/turnstile.jpg" alt="Cloudflare Turnstile success" width="500">
+
+Camoufox's **humanize mode** + mouse move/click at the widget position passes Cloudflare Turnstile without CAPTCHA solver API. Just `page.mouse.click(x, y)` on the widget — no external service required.
 
 ### 🧪 bot.sannysoft.com → Firefox Fingerprint Pass
 

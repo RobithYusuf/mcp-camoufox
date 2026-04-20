@@ -17,23 +17,20 @@ const SITES = [
     name: "turnstile",
     url: "https://2captcha.com/demo/cloudflare-turnstile",
     waitSel: "body",
-    waitMs: 3000,
+    waitMs: 8000,
     after: async (page) => {
-      const frame = page.frames().find(f => f.url().includes("challenges.cloudflare.com"));
-      if (frame) {
-        try { await frame.locator("input[type=checkbox]").click({ timeout: 8000 }); } catch {}
-      }
-      await page.waitForTimeout(6000);
-    },
-  },
-  {
-    name: "nowsecure",
-    url: "https://nowsecure.nl/",
-    waitSel: "body",
-    waitMs: 3000,
-    after: async (page) => {
-      try { await page.waitForSelector("h1", { timeout: 15000 }); } catch {}
-      await page.waitForTimeout(5000);
+      // Camoufox widget is accessible via .cf-turnstile div (no iframe in DOM).
+      // Click at widget checkbox position (30px from left, vertical center).
+      const widget = await page.$(".cf-turnstile, [data-sitekey]");
+      if (!widget) return;
+      const b = await widget.boundingBox();
+      const cx = b.x + 30, cy = b.y + b.height / 2;
+      await page.mouse.move(cx - 100, cy - 60, { steps: 12 });
+      await page.waitForTimeout(300);
+      await page.mouse.move(cx, cy, { steps: 8 });
+      await page.waitForTimeout(150);
+      await page.mouse.click(cx, cy);
+      await page.waitForTimeout(10000);
     },
   },
 ];
