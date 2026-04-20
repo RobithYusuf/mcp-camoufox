@@ -41,6 +41,25 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | Playwright CLI | 60+ | No | Yes | Yes |
 | **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **79** | **Yes** | **Yes** | **Yes** |
 
+## Proven on Real Sites
+
+| Site | Challenge | Result |
+|------|-----------|--------|
+| `bot.sannysoft.com` | Firefox fingerprint tests | ✅ All green ([proof](docs/images/sannysoft.jpg)) |
+| `browserscan.net/bot-detection` | WebDriver/UA/CDP/Navigator | ✅ All categories "Normal" ([proof](docs/images/browserscan.jpg)) |
+
+### 🧪 bot.sannysoft.com → Firefox Fingerprint Pass
+
+<img src="docs/images/sannysoft.jpg" alt="sannysoft Firefox pass" width="500">
+
+User Agent reports `Firefox/135.0`, WebDriver missing, WebDriver Advanced passed, Permissions prompt, Plugins length 5 passed, Languages `en-US,en`, WebGL Intel HD Graphics — all green. ("Chrome: missing" is expected — Camoufox spoofs Firefox, not Chrome.)
+
+### 🔍 browserscan.net/bot-detection → All Categories Normal
+
+<img src="docs/images/browserscan.jpg" alt="browserscan normal" width="500">
+
+WebDriver, User-Agent, CDP, Navigator — every detection category returns **"Normal"**. Camoufox's C++-level Firefox patches leave zero automation signals.
+
 ## Setup
 
 <details>
