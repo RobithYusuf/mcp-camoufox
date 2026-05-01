@@ -889,10 +889,10 @@ server.tool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-l
   return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y}) steps=${steps}` }] };
 });
 
-server.tool("click_turnstile", "Auto-find and click Cloudflare Turnstile checkbox with humanized approach. Works on Interactive Turnstile widgets (visible iframe). Managed Challenge interstitials (hidden widget) not supported — use sister project mcp-stealth-chrome for those.", {
+server.tool("click_turnstile", "Auto-find and click Cloudflare Turnstile checkbox. Port of mcp-stealth-chrome's proven pattern — single pre-drift + direct click, leaning on Camoufox's built-in humanize + disable_coop for cross-origin iframe support. Works on Interactive Turnstile widgets (visible iframe). Managed Challenge interstitials not supported — use mcp-stealth-chrome for those.", {
   offset_x: z.number().default(30).describe("Pixels from widget left edge (calibrated for CF checkbox)"),
   offset_y: z.number().optional().describe("Vertical offset from widget top (default = height/2)"),
-  wait_render_ms: z.number().default(1500).describe("Wait before detection to let widget render"),
+  wait_render_ms: z.number().default(500).describe("Wait before detection to let widget render"),
 }, async ({ offset_x, offset_y, wait_render_ms }) => {
   const page = getPage();
   await page.waitForTimeout(wait_render_ms);
@@ -924,24 +924,18 @@ server.tool("click_turnstile", "Auto-find and click Cloudflare Turnstile checkbo
   });
 
   if (!coords) {
-    return { content: [{ type: "text", text: "Turnstile widget not found — selector miss. Likely a Managed Challenge interstitial (use mcp-stealth-chrome) or widget hasn't rendered yet (try wait_render_ms=5000)." }] };
+    return { content: [{ type: "text", text: "Turnstile widget not found — selector miss. Likely a Managed Challenge interstitial (use mcp-stealth-chrome) or widget hasn't rendered yet (try wait_render_ms=3000)." }] };
   }
 
   const targetX = coords.left + offset_x;
   const targetY = coords.top + (offset_y ?? Math.floor(coords.height / 2));
 
-  // Humanized 3-step approach (Camoufox humanize layer wraps each move)
-  await page.mouse.move(targetX + 180, targetY - 80, { steps: 20 });
-  await page.waitForTimeout(250 + Math.random() * 150);
-  await page.mouse.move(targetX + 40, targetY - 20, { steps: 12 });
-  await page.waitForTimeout(150 + Math.random() * 100);
-  await page.mouse.move(targetX, targetY, { steps: 8 });
-  await page.waitForTimeout(80 + Math.random() * 60);
-
-  // Human-like click: down → tiny delay → up
-  await page.mouse.down();
-  await page.waitForTimeout(40 + Math.random() * 30);
-  await page.mouse.up();
+  // Single pre-drift then direct click (matches stealth-chrome's pattern).
+  // Camoufox's humanize layer handles path curvature + timing automatically,
+  // so extra Bezier hops would be redundant and slow (~3s extra).
+  await page.mouse.move(targetX + 180, targetY - 80, { steps: 15 });
+  await page.waitForTimeout(150);
+  await page.mouse.click(targetX, targetY);
 
   return { content: [{ type: "text", text: `clicked Turnstile at (${targetX},${targetY}) — widget found via ${coords.found} (${coords.width}x${coords.height})` }] };
 });
@@ -1630,6 +1624,315 @@ server.tool(
     return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
   }
 );
+
+// ── Tools: Storage State (Session Reuse) ───────────────────────────────────
+
+server.tool("storage_state_save", "Save cookies + localStorage to a JSON file. Reload via storage_state_load on a fresh browser to skip login/CF entirely.", {
+  path: z.string().describe("Output file path (e.g. ~/.camoufox-mcp/sessions/site.json)"),
+}, async ({ path }) => {
+  const page = getPage();
+  const ctx = page.context();
+  const cookies = await ctx.cookies();
+  const origins = await page.evaluate(`(() => {
+    var data = { local: {}, session: {} };
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i); data.local[k] = localStorage.getItem(k);
+    }
+    for (var j = 0; j < sessionStorage.length; j++) {
+      var k = sessionStorage.key(j); data.session[k] = sessionStorage.getItem(k);
+    }
+    return { url: location.href, origin: location.origin, ...data };
+  })()`);
+  const target = path.replace("~", process.env.HOME || "");
+  const dir = target.substring(0, target.lastIndexOf("/"));
+  if (dir) mkdirSync(dir, { recursive: true });
+  writeFileSync(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
+  return { content: [{ type: "text", text: `Saved storage state: ${target} (${cookies.length} cookies, ${Object.keys((origins as any).local || {}).length} localStorage, ${Object.keys((origins as any).session || {}).length} sessionStorage)` }] };
+});
+
+server.tool("storage_state_load", "Load cookies + localStorage from a JSON file (created by storage_state_save). Bypass CF/login if session is fresh.", {
+  path: z.string().describe("Path to storage state JSON file"),
+  navigate_to: z.string().optional().describe("URL to navigate to after loading (recommended — localStorage requires same-origin)"),
+}, async ({ path, navigate_to }) => {
+  const page = getPage();
+  const ctx = page.context();
+  const target = path.replace("~", process.env.HOME || "");
+  const data = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
+  if (data.cookies && data.cookies.length) await ctx.addCookies(data.cookies);
+  let lsCount = 0, ssCount = 0;
+  if (navigate_to) {
+    await page.goto(navigate_to, { waitUntil: "domcontentloaded" });
+    const origin = data.origins?.[0] || {};
+    if (origin.local || origin.session) {
+      await page.evaluate(`((data) => {
+        if (data.local) Object.entries(data.local).forEach(([k, v]) => { try { localStorage.setItem(k, v); } catch {} });
+        if (data.session) Object.entries(data.session).forEach(([k, v]) => { try { sessionStorage.setItem(k, v); } catch {} });
+      })(${JSON.stringify(origin)})`);
+      lsCount = Object.keys(origin.local || {}).length;
+      ssCount = Object.keys(origin.session || {}).length;
+    }
+  }
+  return { content: [{ type: "text", text: `Loaded storage state: ${data.cookies?.length || 0} cookies${navigate_to ? `, ${lsCount} localStorage, ${ssCount} sessionStorage (after navigate)` : " (call navigate to apply localStorage)"}` }] };
+});
+
+server.tool("auth_capture", "Save current session as named auth state (e.g. logged-in user). Convenience wrapper: storage_state_save to ~/.camoufox-mcp/sessions/<name>.json", {
+  name: z.string().describe("Session name (e.g. 'github-bob', 'shopify-mystore')"),
+}, async ({ name }) => {
+  const page = getPage();
+  const ctx = page.context();
+  const cookies = await ctx.cookies();
+  const origins = await page.evaluate(`(() => {
+    var data = { local: {}, session: {} };
+    for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); data.local[k] = localStorage.getItem(k); }
+    for (var j = 0; j < sessionStorage.length; j++) { var k = sessionStorage.key(j); data.session[k] = sessionStorage.getItem(k); }
+    return { url: location.href, origin: location.origin, ...data };
+  })()`);
+  const dir = `${process.env.HOME}/.camoufox-mcp/sessions`;
+  mkdirSync(dir, { recursive: true });
+  const target = `${dir}/${name}.json`;
+  writeFileSync(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
+  return { content: [{ type: "text", text: `auth_capture saved: ${target}` }] };
+});
+
+// ── Tools: Cookie Bulk ─────────────────────────────────────────────────────
+
+server.tool("cookie_export", "Export all cookies to a JSON file (Playwright format).", {
+  path: z.string().describe("Output JSON file path"),
+}, async ({ path }) => {
+  const page = getPage();
+  const cookies = await page.context().cookies();
+  const target = path.replace("~", process.env.HOME || "");
+  const dir = target.substring(0, target.lastIndexOf("/"));
+  if (dir) mkdirSync(dir, { recursive: true });
+  writeFileSync(target, JSON.stringify(cookies, null, 2));
+  return { content: [{ type: "text", text: `Exported ${cookies.length} cookies to ${target}` }] };
+});
+
+server.tool("cookie_import", "Import cookies from a JSON file (Playwright format).", {
+  path: z.string().describe("Input JSON file path"),
+}, async ({ path }) => {
+  const page = getPage();
+  const target = path.replace("~", process.env.HOME || "");
+  const cookies = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
+  await page.context().addCookies(cookies);
+  return { content: [{ type: "text", text: `Imported ${cookies.length} cookies from ${target}` }] };
+});
+
+// ── Tools: Humanize ────────────────────────────────────────────────────────
+
+server.tool("humanize_click", "Click element with humanized mouse approach (3-step Bezier-like curve before click). Use for anti-bot pages.", {
+  ref: z.string().optional().describe("Element ref from snapshot"),
+  selector: z.string().optional().describe("CSS selector"),
+}, async ({ ref, selector }) => {
+  const page = getPage();
+  const sel = ref ? `[data-mcp-ref="${ref}"]` : selector;
+  if (!sel) return { content: [{ type: "text", text: "Error: ref or selector required" }] };
+  const box = await page.locator(sel).first().boundingBox();
+  if (!box) return { content: [{ type: "text", text: "Error: element has no bounding box" }] };
+  const tx = box.x + box.width / 2 + (Math.random() * 8 - 4);
+  const ty = box.y + box.height / 2 + (Math.random() * 6 - 3);
+  await page.mouse.move(tx + 200, ty - 100, { steps: 20 });
+  await page.waitForTimeout(180 + Math.random() * 120);
+  await page.mouse.move(tx + 60, ty - 25, { steps: 12 });
+  await page.waitForTimeout(120 + Math.random() * 80);
+  await page.mouse.move(tx, ty, { steps: 8 });
+  await page.waitForTimeout(70 + Math.random() * 50);
+  await page.mouse.click(tx, ty);
+  return { content: [{ type: "text", text: `humanize_click at (${Math.round(tx)},${Math.round(ty)})` }] };
+});
+
+server.tool("humanize_type", "Type text with Gaussian-distributed delays between keystrokes (mean ~80ms, sigma ~30ms). Mimics human typing rhythm.", {
+  ref: z.string().optional(),
+  selector: z.string().optional(),
+  text: z.string().describe("Text to type"),
+  mean_delay_ms: z.number().default(80),
+}, async ({ ref, selector, text, mean_delay_ms }) => {
+  const page = getPage();
+  const sel = ref ? `[data-mcp-ref="${ref}"]` : selector;
+  if (sel) await page.locator(sel).first().focus();
+  for (const ch of text) {
+    await page.keyboard.type(ch);
+    // Gaussian-ish delay (Box-Muller)
+    const u1 = Math.max(0.0001, Math.random()), u2 = Math.random();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const delay = Math.max(20, mean_delay_ms + z * (mean_delay_ms * 0.4));
+    await page.waitForTimeout(delay);
+  }
+  return { content: [{ type: "text", text: `humanize_type typed ${text.length} chars` }] };
+});
+
+server.tool("mouse_drift", "Random mouse movements over a duration — builds up mouse history before action (CF/DataDome behavior analysis).", {
+  duration_ms: z.number().default(2000).describe("Total drift duration"),
+  points: z.number().default(5).describe("Number of random destinations"),
+}, async ({ duration_ms, points }) => {
+  const page = getPage();
+  const vp = page.viewportSize() || { width: 1280, height: 800 };
+  const interval = duration_ms / points;
+  for (let i = 0; i < points; i++) {
+    const x = Math.floor(Math.random() * (vp.width - 100)) + 50;
+    const y = Math.floor(Math.random() * (vp.height - 100)) + 50;
+    await page.mouse.move(x, y, { steps: 12 });
+    await page.waitForTimeout(interval * (0.7 + Math.random() * 0.6));
+  }
+  return { content: [{ type: "text", text: `mouse_drift: ${points} points over ${duration_ms}ms` }] };
+});
+
+server.tool("mouse_record", "Start recording mouse positions (call mouse_replay later). Returns recorder handle.", {
+  duration_ms: z.number().default(5000),
+  sample_rate_hz: z.number().default(30),
+}, async ({ duration_ms, sample_rate_hz }) => {
+  const page = getPage();
+  const handle = `rec-${Date.now()}`;
+  await page.evaluate(`(() => {
+    window.__mcp_mouse_rec = { points: [], start: Date.now() };
+    var h = (e) => window.__mcp_mouse_rec.points.push({ x: e.clientX, y: e.clientY, t: Date.now() - window.__mcp_mouse_rec.start });
+    window.__mcp_mouse_rec_handler = h;
+    document.addEventListener('mousemove', h, { passive: true });
+    setTimeout(() => document.removeEventListener('mousemove', window.__mcp_mouse_rec_handler), ${duration_ms});
+  })()`);
+  return { content: [{ type: "text", text: `mouse_record started: ${handle} (${duration_ms}ms, ~${sample_rate_hz}Hz). Move mouse manually then call mouse_replay.` }] };
+});
+
+server.tool("mouse_replay", "Replay last recorded mouse path with original timing.", {
+  speed: z.number().default(1.0).describe("Replay speed multiplier (1.0=original, 2.0=2x faster)"),
+}, async ({ speed }) => {
+  const page = getPage();
+  const points = await page.evaluate(`(window.__mcp_mouse_rec?.points || [])`) as any[];
+  if (!points.length) return { content: [{ type: "text", text: "No recording found — call mouse_record first" }] };
+  let lastT = 0;
+  for (const p of points) {
+    const wait = (p.t - lastT) / speed;
+    if (wait > 5) await page.waitForTimeout(wait);
+    await page.mouse.move(p.x, p.y);
+    lastT = p.t;
+  }
+  return { content: [{ type: "text", text: `mouse_replay: ${points.length} points` }] };
+});
+
+// ── Tools: Session Warmup & Anti-Bot Detection ─────────────────────────────
+
+server.tool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to build browsing history before targeting protected site. Helps with CF/DataDome IP scoring.", {
+  duration_ms: z.number().default(10000).describe("Total warmup time"),
+  sites: z.array(z.string()).optional().describe("URLs to visit (default: google.com, wikipedia.org)"),
+}, async ({ duration_ms, sites }) => {
+  const page = getPage();
+  const urls = sites && sites.length ? sites : [
+    "https://www.google.com", "https://en.wikipedia.org/wiki/Special:Random",
+  ];
+  const per = Math.floor(duration_ms / urls.length);
+  for (const url of urls) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+      await page.waitForTimeout(per * 0.4);
+      // Random scroll
+      await page.mouse.wheel(0, 200 + Math.random() * 400).catch(() => {});
+      await page.waitForTimeout(per * 0.3);
+    } catch {}
+  }
+  return { content: [{ type: "text", text: `session_warmup: visited ${urls.length} sites over ${duration_ms}ms` }] };
+});
+
+server.tool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva).", {}, async () => {
+  const page = getPage();
+  const result = await page.evaluate(`(() => {
+    var html = document.documentElement.outerHTML.slice(0, 50000);
+    var hits = [];
+    if (/challenges\\.cloudflare|__cf_chl|cf-turnstile|turnstile/i.test(html) || /cloudflare/i.test(document.title)) hits.push("Cloudflare");
+    if (/datadome|dd-captcha|js\\.datadome\\.co/i.test(html)) hits.push("DataDome");
+    if (/akamai|akam\\.net|_bm\\.|bot-detector\\.akamai/i.test(html)) hits.push("Akamai");
+    if (/perimeterx|px-captcha|_pxhd/i.test(html)) hits.push("PerimeterX");
+    if (/imperva|incapsula/i.test(html)) hits.push("Imperva");
+    if (/recaptcha|g-recaptcha|grecaptcha/i.test(html)) hits.push("reCAPTCHA");
+    if (/hcaptcha/i.test(html)) hits.push("hCaptcha");
+    return { vendors: hits, title: document.title, url: location.href };
+  })()`) as any;
+  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+});
+
+// ── Tools: Assertions ──────────────────────────────────────────────────────
+
+server.tool("assert_element_visible", "Assert element exists and is visible. Returns success/fail (no throw).", {
+  selector: z.string(),
+}, async ({ selector }) => {
+  const page = getPage();
+  try {
+    const el = page.locator(selector).first();
+    const visible = await el.isVisible({ timeout: 3000 });
+    return { content: [{ type: "text", text: visible ? `PASS: ${selector} visible` : `FAIL: ${selector} not visible` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `FAIL: ${selector} not found (${e.message?.slice(0, 80)})` }] };
+  }
+});
+
+server.tool("assert_text_present", "Assert text is present anywhere on page (case-sensitive substring).", {
+  text: z.string(),
+}, async ({ text }) => {
+  const page = getPage();
+  const body = await page.evaluate(`document.body.innerText`) as string;
+  const found = body.includes(text);
+  return { content: [{ type: "text", text: found ? `PASS: '${text}' present` : `FAIL: '${text}' not found in body` }] };
+});
+
+server.tool("assert_url_matches", "Assert current URL matches pattern (substring or regex).", {
+  pattern: z.string(),
+  regex: z.boolean().default(false),
+}, async ({ pattern, regex }) => {
+  const page = getPage();
+  const url = page.url();
+  const match = regex ? new RegExp(pattern).test(url) : url.includes(pattern);
+  return { content: [{ type: "text", text: match ? `PASS: URL '${url}' matches '${pattern}'` : `FAIL: URL '${url}' does not match '${pattern}'` }] };
+});
+
+// ── Tools: Convenience / Workflow ──────────────────────────────────────────
+
+server.tool("click_and_wait", "Click element then wait for navigation or selector. Atomic — fewer roundtrips than separate click + wait_for.", {
+  ref: z.string().optional(),
+  selector: z.string().optional(),
+  wait_for_url: z.string().optional().describe("URL substring to wait for after click"),
+  wait_for_selector: z.string().optional().describe("Selector to wait for after click"),
+  timeout_ms: z.number().default(15000),
+}, async ({ ref, selector, wait_for_url, wait_for_selector, timeout_ms }) => {
+  const page = getPage();
+  const sel = ref ? `[data-mcp-ref="${ref}"]` : selector;
+  if (!sel) return { content: [{ type: "text", text: "Error: ref or selector required" }] };
+  const beforeUrl = page.url();
+  await Promise.all([
+    page.locator(sel).first().click({ timeout: timeout_ms }),
+    wait_for_url ? page.waitForURL((u) => u.toString().includes(wait_for_url), { timeout: timeout_ms }).catch(() => {}) :
+    wait_for_selector ? page.waitForSelector(wait_for_selector, { timeout: timeout_ms }).catch(() => {}) :
+    page.waitForLoadState("domcontentloaded", { timeout: timeout_ms }).catch(() => {}),
+  ]);
+  return { content: [{ type: "text", text: `click_and_wait: ${beforeUrl} → ${page.url()}` }] };
+});
+
+server.tool("wait_for_network_idle", "Wait until network is idle for N ms (no in-flight requests). Better than fixed timeouts for SPAs.", {
+  idle_ms: z.number().default(500).describe("Idle threshold (Playwright default)"),
+  timeout_ms: z.number().default(30000),
+}, async ({ idle_ms, timeout_ms }) => {
+  const page = getPage();
+  await page.waitForLoadState("networkidle", { timeout: timeout_ms });
+  return { content: [{ type: "text", text: `network idle reached (>=${idle_ms}ms)` }] };
+});
+
+server.tool("describe_page", "Compact LLM-friendly page summary (title, heading, key buttons, forms). Cheaper than browser_snapshot for agent context.", {}, async () => {
+  const page = getPage();
+  const summary = await page.evaluate(`(() => {
+    var title = document.title;
+    var url = location.href;
+    var h1 = document.querySelector('h1')?.innerText?.slice(0,100) || '';
+    var h2s = Array.from(document.querySelectorAll('h2')).slice(0,5).map(h => h.innerText.slice(0,60));
+    var buttons = Array.from(document.querySelectorAll('button, [role=button], input[type=submit]')).slice(0,10)
+      .map(b => (b.innerText || b.value || '').trim().slice(0,40)).filter(t => t);
+    var links = Array.from(document.querySelectorAll('a[href]')).slice(0,8)
+      .map(a => ({ text: a.innerText.trim().slice(0,40), href: a.href.slice(0,80) })).filter(l => l.text);
+    var forms = Array.from(document.querySelectorAll('form')).map(f => ({
+      action: f.action?.slice(0,60),
+      fields: Array.from(f.querySelectorAll('input, textarea, select')).slice(0,8).map(i => i.name || i.id || i.type),
+    }));
+    return { title, url, h1, h2s, buttons, links, forms };
+  })()`);
+  return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+});
 
 // ── Start Server ───────────────────────────────────────────────────────────
 

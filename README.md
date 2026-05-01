@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **80 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **96 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -39,7 +39,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **80** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **96** | **Yes** | **Yes** | **Yes** |
 
 ## Proven on Real Sites
 
@@ -262,7 +262,7 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 80 Tools
+## All 96 Tools
 
 ### Browser Lifecycle (2)
 
@@ -441,12 +441,47 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `find_by_label` | Find input by label text, returns ref. |
 | `find_by_placeholder` | Find input by placeholder, returns ref. |
 
-### Session Portability (2)
+### Session Portability (5)
 
 | Tool | Description |
 |------|-------------|
 | `cookie_export` | Export all cookies as JSON (for transfer) |
 | `cookie_import` | Import cookies from JSON (restore session) |
+| `storage_state_save` | Save cookies + localStorage + sessionStorage to JSON file. Reload to skip login/CF. |
+| `storage_state_load` | Restore session from JSON (cookies + storage). Use `navigate_to` param to apply localStorage. |
+| `auth_capture` | Convenience: save current session to `~/.camoufox-mcp/sessions/<name>.json` |
+
+### Humanize / Anti-Bot (4)
+
+| Tool | Description |
+|------|-------------|
+| `humanize_click` | 3-step Bezier mouse approach + small jitter before click. Use for CF/DataDome pages. |
+| `humanize_type` | Gaussian-distributed keystroke delays (mean 80ms, sigma 30ms). Mimics human rhythm. |
+| `mouse_drift` | Random mouse movements over duration — builds mouse history before action. |
+| `mouse_record` / `mouse_replay` | Capture human mouse path then replay (anti-bot gold). |
+
+### Session Warmup & Detection (2)
+
+| Tool | Description |
+|------|-------------|
+| `session_warmup` | Visit Google/Wikipedia (random) before targeting protected site. Helps IP scoring. |
+| `detect_anti_bot` | Heuristic detection of CF/DataDome/Akamai/PerimeterX/Imperva/reCAPTCHA/hCaptcha. |
+
+### Assertions (3)
+
+| Tool | Description |
+|------|-------------|
+| `assert_element_visible` | PASS/FAIL — element exists and is visible |
+| `assert_text_present` | PASS/FAIL — text substring on page |
+| `assert_url_matches` | PASS/FAIL — URL matches pattern (substring or regex) |
+
+### Workflow Helpers (3)
+
+| Tool | Description |
+|------|-------------|
+| `click_and_wait` | Click + wait for navigation/selector atomically (fewer roundtrips) |
+| `wait_for_network_idle` | Wait until no in-flight requests for N ms (better than fixed timeouts for SPAs) |
+| `describe_page` | Compact LLM-friendly summary (title, h1, buttons, links, forms) — cheaper than `browser_snapshot` |
 
 ### Scraping & Extraction (4)
 

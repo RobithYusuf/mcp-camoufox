@@ -6,3 +6,7 @@ dist/
 CLAUDE.md
 AGENTS.md
 PLAN-CHROMIUM-STEALTH.md
+
+# npm token (never commit)
+.npm-token
+*.token
