@@ -142,8 +142,13 @@ async function ensureCamoufoxBinary() {
   console.error("[mcp-camoufox] Please wait 2-5 minutes...");
   console.error("=".repeat(60) + "\n");
   const cmd = platform === "win32" ? "npx.cmd" : "npx";
+  // CRITICAL: redirect child stdout → parent stderr.
+  // stdio:'inherit' would pollute MCP JSON-RPC stdout channel with download
+  // progress text, causing client parse errors like:
+  //   "invalid character 'C' looking for beginning of value"
+  // (issue #1: 'C' = first byte of "Camoufox..." progress message).
   execSync(`${cmd} camoufox-js fetch`, {
-    stdio: "inherit", timeout: 900000,
+    stdio: ["ignore", 2, 2], timeout: 900000,
     env: { ...process.env, npm_config_yes: "true" },
   });
   console.error("\n[mcp-camoufox] Download complete.\n");
@@ -1696,7 +1701,7 @@ server.tool("auth_capture", "Save current session as named auth state (e.g. logg
 
 // ── Tools: Cookie Bulk ─────────────────────────────────────────────────────
 
-server.tool("cookie_export", "Export all cookies to a JSON file (Playwright format).", {
+server.tool("cookie_export_file", "Export all cookies to a JSON file (Playwright format).", {
   path: z.string().describe("Output JSON file path"),
 }, async ({ path }) => {
   const page = getPage();
@@ -1708,7 +1713,7 @@ server.tool("cookie_export", "Export all cookies to a JSON file (Playwright form
   return { content: [{ type: "text", text: `Exported ${cookies.length} cookies to ${target}` }] };
 });
 
-server.tool("cookie_import", "Import cookies from a JSON file (Playwright format).", {
+server.tool("cookie_import_file", "Import cookies from a JSON file (Playwright format).", {
   path: z.string().describe("Input JSON file path"),
 }, async ({ path }) => {
   const page = getPage();
