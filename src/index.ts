@@ -18,13 +18,19 @@ import type { BrowserContext, Page, Dialog } from "playwright-core";
 
 // ── Global State ───────────────────────────────────────────────────────────
 
-const PROFILE_DIR = `${process.env.HOME || process.env.USERPROFILE}/.camoufox-mcp/profile`;
-const SCREENSHOT_DIR = `${process.env.HOME || process.env.USERPROFILE}/.camoufox-mcp/screenshots`;
+const HOME_DIR = process.env.HOME || process.env.USERPROFILE || "";
+const PROFILE_DIR = `${HOME_DIR}/.camoufox-mcp/profile`;
+const PROFILE_PARENT = `${HOME_DIR}/.camoufox-mcp`;
+const SCREENSHOT_DIR = `${HOME_DIR}/.camoufox-mcp/screenshots`;
 
 let browserContext: BrowserContext | null = null;
 let pages: Page[] = [];
 let activePage = 0;
 let browserUp = false;
+// Tracks the profile dir used by the current launch — temp dir if fresh_profile=true,
+// PROFILE_DIR otherwise. Cleaned on close when temp.
+let activeProfileDir: string | null = null;
+let activeProfileIsTemp = false;
 
 function getPage(): Page {
   if (!browserUp || pages.length === 0) {
@@ -156,7 +162,10 @@ async function ensureCamoufoxBinary() {
 
 server.tool(
   "browser_launch",
-  "Launch Camoufox stealth browser and navigate to URL. Browser persists between calls. Call this first.",
+  "Launch Camoufox stealth browser and navigate to URL. Browser persists between calls. " +
+    "By default cookies/localStorage persist in ~/.camoufox-mcp/profile. " +
+    "Set fresh_profile=true to start with a clean temp profile (auto-cleaned on browser_close) — " +
+    "useful when switching between accounts on the same domain.",
   {
     url: z.string().default("about:blank").describe("URL to navigate to"),
     headless: z.boolean().default(true).describe("Run without visible window"),
@@ -165,8 +174,13 @@ server.tool(
     locale: z.string().default("en-US").describe("Browser locale"),
     width: z.number().default(0).describe("Window width (0 = default 1280)"),
     height: z.number().default(0).describe("Window height (0 = default 800)"),
+    fresh_profile: z.boolean().default(false).describe(
+      "Start with a clean temp profile (no carry-over cookies/cache). " +
+      "Temp dir is removed when browser_close is called. " +
+      "Use when switching between accounts on the same domain to avoid login session collisions."
+    ),
   },
-  async ({ url, headless, humanize, geoip, locale, width, height }) => {
+  async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile }) => {
     if (browserUp && browserContext) {
       const page = getPage();
       if (url && url !== "about:blank") {
@@ -180,6 +194,17 @@ server.tool(
     const w = width > 0 ? width : 1280;
     const h = height > 0 ? height : 800;
 
+    // Pick profile dir: fresh temp dir or shared persistent
+    let profileDir = PROFILE_DIR;
+    let isTemp = false;
+    if (fresh_profile) {
+      const ts = Date.now();
+      const rand = Math.random().toString(36).slice(2, 8);
+      profileDir = `${PROFILE_PARENT}/profile-fresh-${ts}-${rand}`;
+      mkdirSync(profileDir, { recursive: true });
+      isTemp = true;
+    }
+
     await ensureCamoufoxBinary();
 
     const ctx = await Camoufox({
@@ -187,7 +212,7 @@ server.tool(
       humanize,
       geoip,
       locale,
-      user_data_dir: PROFILE_DIR,
+      user_data_dir: profileDir,
       disable_coop: true,
       window: [w, h] as [number, number],
       i_know_what_im_doing: true,
@@ -199,6 +224,8 @@ server.tool(
     }) as BrowserContext;
 
     browserContext = ctx;
+    activeProfileDir = profileDir;
+    activeProfileIsTemp = isTemp;
     const existingPages = ctx.pages();
     const page = existingPages.length > 0 ? existingPages[0] : await ctx.newPage();
     pages = [page];
@@ -210,23 +237,69 @@ server.tool(
       await page.waitForTimeout(1500);
     }
     const title = await page.title();
-    return { content: [{ type: "text", text: `Browser launched. URL: ${page.url()}\nTitle: ${title}` }] };
+    const profileNote = isTemp ? " (fresh temp profile)" : "";
+    return { content: [{ type: "text", text: `Browser launched${profileNote}. URL: ${page.url()}\nTitle: ${title}` }] };
   }
 );
 
 server.tool(
   "browser_close",
-  "Close the browser. Cookies are preserved in profile.",
+  "Close the browser. Cookies are preserved in the persistent profile (~/.camoufox-mcp/profile). " +
+    "If the launch used fresh_profile=true, the temp profile is removed.",
   {},
   async () => {
     if (browserContext) {
       try { await browserContext.close(); } catch {}
     }
+    let note = "Profile saved.";
+    if (activeProfileIsTemp && activeProfileDir) {
+      try {
+        const { rmSync } = await import("fs");
+        rmSync(activeProfileDir, { recursive: true, force: true });
+        note = `Temp profile removed (${activeProfileDir}).`;
+      } catch (e: any) {
+        note = `Profile saved. Warning: failed to remove temp profile: ${e?.message || e}`;
+      }
+    }
     browserContext = null;
     pages = [];
     activePage = 0;
     browserUp = false;
-    return { content: [{ type: "text", text: "Browser closed. Profile saved." }] };
+    activeProfileDir = null;
+    activeProfileIsTemp = false;
+    return { content: [{ type: "text", text: `Browser closed. ${note}` }] };
+  }
+);
+
+server.tool(
+  "reset_profile",
+  "Delete the persistent profile (~/.camoufox-mcp/profile) entirely. " +
+    "Use to start fresh — cookies, localStorage, history all wiped. " +
+    "Browser must be closed first (call browser_close before this).",
+  {},
+  async () => {
+    if (browserUp) {
+      return {
+        content: [{
+          type: "text",
+          text: "Refused: browser is running. Call browser_close first, then reset_profile.",
+        }],
+        isError: true,
+      };
+    }
+    try {
+      const { rmSync, existsSync } = await import("fs");
+      if (existsSync(PROFILE_DIR)) {
+        rmSync(PROFILE_DIR, { recursive: true, force: true });
+        return { content: [{ type: "text", text: `Profile wiped: ${PROFILE_DIR}` }] };
+      }
+      return { content: [{ type: "text", text: "Profile dir did not exist — nothing to wipe." }] };
+    } catch (e: any) {
+      return {
+        content: [{ type: "text", text: `Failed to wipe profile: ${e?.message || e}` }],
+        isError: true,
+      };
+    }
   }
 );
 

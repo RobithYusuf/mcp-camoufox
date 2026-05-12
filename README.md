@@ -657,7 +657,14 @@ Browser profile stored at `~/.camoufox-mcp/profile/`. Cookies, localStorage, Ind
 | `~/.camoufox-mcp/profile/` | Browser profile (cookies, localStorage, cache) |
 | `~/.camoufox-mcp/screenshots/` | Screenshots, PDFs, HAR exports |
 
-Reset everything: `rm -rf ~/.camoufox-mcp/`
+Reset everything: `rm -rf ~/.camoufox-mcp/` — or call the `reset_profile` tool (browser must be closed first).
+
+### Switching between accounts on the same domain
+
+The default profile persists across `browser_close` calls, so the next login on the same domain inherits cookies + session — sometimes redirecting to the wrong account. Two options:
+
+- **`browser_launch(fresh_profile=true)`** — uses a temp profile dir that's removed on `browser_close`. Best for one-off logins.
+- **`reset_profile`** (browser must be closed) — wipes the shared profile entirely.
 
 ## Troubleshooting
 
@@ -671,6 +678,8 @@ Reset everything: `rm -rf ~/.camoufox-mcp/`
 | Huge snapshot output | Normal for big pages. Use `get_text` or `evaluate` instead. |
 | iframe not accessible | Use `list_frames` + `frame_evaluate` |
 | CAPTCHA appears | Cannot auto-solve. Use `headless=false` and solve manually. |
+| Login lands on wrong account | Profile carry-over. Use `fresh_profile=true` on launch or `reset_profile`. |
+| MCP server silently dies | If you ran `pkill -f camoufox`, you killed the MCP node process too (its argv contains "camoufox"). Target the binary specifically — e.g. `pkill -f "Camoufox.app/Contents/MacOS"` — or use `pkill -f camoufox-js`. |
 
 ## License
 
