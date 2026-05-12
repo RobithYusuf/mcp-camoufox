@@ -513,6 +513,68 @@ server.tool("wait_for_navigation", "Wait for page load to complete.", {
   return { content: [{ type: "text", text: `Navigation complete. URL: ${page.url()}` }] };
 });
 
+server.tool(
+  "wait_for_any_of",
+  "Race multiple wait conditions — returns the first that matches, so the agent can branch immediately without sequential probes. " +
+    "Each condition is {kind: 'selector'|'text'|'url_contains'|'title_contains', value: string}. " +
+    "Returns the index + kind + value of the winning condition (or 'timeout' if none matched). " +
+    "Ideal for post-login flows where the next page could be any of several (e.g. 'Stay signed in?', 'Skip for now', or the inbox directly).",
+  {
+    conditions: z.array(z.object({
+      kind: z.enum(["selector", "text", "url_contains", "title_contains"]),
+      value: z.string(),
+    })).describe("Conditions to race. First match wins."),
+    timeout: z.number().default(15000).describe("Max wait in ms"),
+  },
+  async ({ conditions, timeout }) => {
+    if (!conditions || conditions.length === 0) {
+      return {
+        content: [{ type: "text", text: "Error: conditions array is empty" }],
+        isError: true,
+      };
+    }
+    const page = getPage();
+    const deadline = Date.now() + timeout;
+
+    // Poll-based race — works for url/title (no native waitFor for those across all kinds)
+    // and for selector/text uses Playwright's waitFor with short slices so we can return early
+    // when a different condition wins.
+    const pollMs = 250;
+    while (Date.now() < deadline) {
+      // Check all conditions in parallel via a single page.evaluate where possible
+      const url = page.url();
+      const title = await page.title().catch(() => "");
+      for (let i = 0; i < conditions.length; i++) {
+        const c = conditions[i];
+        try {
+          if (c.kind === "url_contains" && url.includes(c.value)) {
+            return { content: [{ type: "text", text: `matched index=${i} kind=url_contains value="${c.value}" url=${url}` }] };
+          }
+          if (c.kind === "title_contains" && title.toLowerCase().includes(c.value.toLowerCase())) {
+            return { content: [{ type: "text", text: `matched index=${i} kind=title_contains value="${c.value}" title="${title}"` }] };
+          }
+          if (c.kind === "selector") {
+            const visible = await page.locator(c.value).first().isVisible().catch(() => false);
+            if (visible) {
+              return { content: [{ type: "text", text: `matched index=${i} kind=selector value="${c.value}"` }] };
+            }
+          }
+          if (c.kind === "text") {
+            const visible = await page.getByText(c.value).first().isVisible().catch(() => false);
+            if (visible) {
+              return { content: [{ type: "text", text: `matched index=${i} kind=text value="${c.value}"` }] };
+            }
+          }
+        } catch {}
+      }
+      await page.waitForTimeout(pollMs);
+    }
+    return {
+      content: [{ type: "text", text: `timeout: no condition matched within ${timeout}ms. Current URL: ${page.url()}` }],
+    };
+  }
+);
+
 // ── Tools: JavaScript ──────────────────────────────────────────────────────
 
 server.tool("evaluate", "Execute JavaScript in page context.", {
@@ -1992,9 +2054,16 @@ server.tool("wait_for_network_idle", "Wait until network is idle for N ms (no in
   return { content: [{ type: "text", text: `network idle reached (>=${idle_ms}ms)` }] };
 });
 
-server.tool("describe_page", "Compact LLM-friendly page summary (title, heading, key buttons, forms). Cheaper than browser_snapshot for agent context.", {}, async () => {
-  const page = getPage();
-  const summary = await page.evaluate(`(() => {
+server.tool(
+  "describe_page",
+  "Compact LLM-friendly page summary (title, heading, key buttons, forms). Cheaper than browser_snapshot for agent context. " +
+    "Also returns `intent` — a classified hint of what kind of page this is " +
+    "(login_email, login_password, otp_input, captcha, stay_signed_in, protect_account, error_page, " +
+    "consent, two_factor, account_disabled, content, unknown) — so the agent can branch with one read.",
+  {},
+  async () => {
+    const page = getPage();
+    const summary: any = await page.evaluate(`(() => {
     var title = document.title;
     var url = location.href;
     var h1 = document.querySelector('h1')?.innerText?.slice(0,100) || '';
@@ -2007,10 +2076,61 @@ server.tool("describe_page", "Compact LLM-friendly page summary (title, heading,
       action: f.action?.slice(0,60),
       fields: Array.from(f.querySelectorAll('input, textarea, select')).slice(0,8).map(i => i.name || i.id || i.type),
     }));
-    return { title, url, h1, h2s, buttons, links, forms };
+    var body = (document.body?.innerText || '').slice(0, 1500);
+    var inputs = Array.from(document.querySelectorAll('input')).map(i => ({
+      type: i.type, name: i.name || '', id: i.id || '',
+      placeholder: i.placeholder || '', autocomplete: i.autocomplete || '',
+    }));
+    return { title, url, h1, h2s, buttons, links, forms, _body_sample: body, _inputs: inputs };
   })()`);
-  return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
-});
+
+    // ── Intent classification (server-side hint) ─────────────────────────────
+    const body = String(summary._body_sample || "");
+    const title = String(summary.title || "");
+    const h1 = String(summary.h1 || "");
+    const url = String(summary.url || "");
+    const inputs: Array<{type:string;name:string;id:string;placeholder:string;autocomplete:string}> = summary._inputs || [];
+    const buttons: string[] = summary.buttons || [];
+    const all = (title + " | " + h1 + " | " + body).toLowerCase();
+    const btnText = buttons.join(" | ").toLowerCase();
+
+    const hasInput = (pred: (i: any) => boolean) => inputs.some(pred);
+
+    let intent: string = "unknown";
+    // Error / disabled — check first since they may have form-like structure
+    if (/account_deactivated|account is disabled|account suspended|account has been disabled/i.test(all)) {
+      intent = "account_disabled";
+    } else if (/oops, an error occurred|something went wrong|error_code:/i.test(all) && /try again/i.test(btnText + " " + all)) {
+      intent = "error_page";
+    } else if (/captcha|i'm not a robot|verify you are human|cloudflare|turnstile|hcaptcha|recaptcha/i.test(all)) {
+      intent = "captcha";
+    } else if (/stay signed in|keep me signed in|skip having to sign in/i.test(all)) {
+      intent = "stay_signed_in";
+    } else if (/let's protect your account|protect your account|skip for now|add security info/i.test(all)) {
+      intent = "protect_account";
+    } else if (/check your phone|enter the verification code we just sent|two-factor|2fa|authenticator/i.test(all)) {
+      intent = "two_factor";
+    } else if (/verification code|enter the code|one-time code|otp|temporary verification/i.test(all)
+               && (hasInput(i => /otp|code|verification/i.test(i.name + i.id + i.placeholder + i.autocomplete))
+                   || hasInput(i => i.type === "text" || i.type === "tel" || i.type === "number"))) {
+      intent = "otp_input";
+    } else if (hasInput(i => i.type === "password" || /password|passwd/i.test(i.name + i.id + i.autocomplete))) {
+      intent = "login_password";
+    } else if (hasInput(i => i.type === "email" || /email|username|login|loginfmt/i.test(i.name + i.id + i.placeholder + i.autocomplete))) {
+      intent = "login_email";
+    } else if (/authorize|allow access|grant.*access|consent/i.test(all) && /authorize|allow|continue/i.test(btnText)) {
+      intent = "consent";
+    } else if (inputs.length === 0 && buttons.length === 0 && body.length > 200) {
+      intent = "content";
+    }
+
+    summary.intent = intent;
+    // Strip internal helpers to keep response small
+    delete summary._body_sample;
+    delete summary._inputs;
+    return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+  }
+);
 
 // ── Start Server ───────────────────────────────────────────────────────────
 
