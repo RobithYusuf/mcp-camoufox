@@ -44,10 +44,47 @@ function getPage(): Page {
 
 import { mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
+import { createHmac } from "crypto";
 
 function ensureDirs() {
   mkdirSync(PROFILE_DIR, { recursive: true });
   mkdirSync(SCREENSHOT_DIR, { recursive: true });
+}
+
+// Base32 decode (RFC 4648) — for TOTP secrets used by login_classic
+function base32Decode(s: string): Buffer {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const clean = s.replace(/=+$/, "").replace(/\s/g, "").toUpperCase();
+  let bits = 0, value = 0;
+  const out: number[] = [];
+  for (const ch of clean) {
+    const idx = alphabet.indexOf(ch);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  return Buffer.from(out);
+}
+
+// RFC 6238 TOTP (SHA1, 30s step, 6 digits) — no external dep
+function totpFromSecret(secret: string, step = 30, digits = 6): string {
+  const key = base32Decode(secret);
+  let counter = Math.floor(Date.now() / 1000 / step);
+  const buf = Buffer.alloc(8);
+  for (let i = 7; i >= 0; i--) { buf[i] = counter & 0xff; counter = Math.floor(counter / 256); }
+  const hmac = createHmac("sha1", key).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const code = ((hmac[offset] & 0x7f) << 24) | ((hmac[offset + 1] & 0xff) << 16)
+    | ((hmac[offset + 2] & 0xff) << 8) | (hmac[offset + 3] & 0xff);
+  return (code % 10 ** digits).toString().padStart(digits, "0");
+}
+
+// Click a locator, falling back to a JS .click() when an overlay blocks the
+// real pointer event (same pattern every click tool in this file uses).
+async function clickWithFallback(loc: any): Promise<void> {
+  try { await loc.click({ timeout: 5000 }); }
+  catch { await loc.evaluate((el: any) => el.click()); }
 }
 
 // DOM snapshot JS — IIFE so page.evaluate runs it immediately
@@ -91,16 +128,39 @@ const SNAPSHOT_JS = `(() => {
   return results;
 })()`;
 
-function formatSnapshot(elements: any[], url: string, title: string): string {
+function formatSnapshot(
+  elements: any[],
+  url: string,
+  title: string,
+  opts?: { roles?: string[]; offset?: number; limit?: number },
+): string {
   if (!elements || !Array.isArray(elements)) elements = [];
+  const total = elements.length;
+  const roles = (opts?.roles || []).map(r => r.toLowerCase());
+  let filtered = elements;
+  if (roles.length) {
+    filtered = filtered.filter(el =>
+      roles.includes((el.tag || "").toLowerCase()) ||
+      roles.includes((el.role || "").toLowerCase()) ||
+      roles.includes((el.type || "").toLowerCase()));
+  }
+  const matched = filtered.length;
+  const offset = Math.max(0, opts?.offset || 0);
+  const limit = opts?.limit && opts.limit > 0 ? opts.limit : 0;
+  if (offset) filtered = filtered.slice(offset);
+  if (limit) filtered = filtered.slice(0, limit);
+
+  const counts = roles.length
+    ? `showing ${filtered.length} of ${matched} matched (${total} total)`
+    : (offset || limit) ? `showing ${filtered.length} of ${total}` : `${total}`;
   const lines = [
     `Page: ${title}`,
     `URL: ${url}`,
     "",
-    `Interactive elements (${elements.length}):`,
+    `Interactive elements (${counts}${offset ? `, offset ${offset}` : ""}):`,
     "",
   ];
-  for (const el of elements) {
+  for (const el of filtered) {
     const parts = [`[${el.tag || "?"}]`];
     if (el.role) parts.push(`role=${el.role}`);
     if (el.type) parts.push(`type=${el.type}`);
@@ -111,6 +171,10 @@ function formatSnapshot(elements: any[], url: string, title: string): string {
     if (el.checked) parts.push("checked");
     if (el.disabled) parts.push("disabled");
     lines.push(`  ref=${el.ref}  ${parts.join(" ")}`);
+  }
+  const shownEnd = offset + filtered.length;
+  if (matched > shownEnd) {
+    lines.push("", `… ${matched - shownEnd} more — call browser_snapshot with offset=${shownEnd}`);
   }
   return lines.join("\n");
 }
@@ -343,12 +407,18 @@ server.tool("reload", "Reload the current page.", {}, async () => {
 
 server.tool(
   "browser_snapshot",
-  "Get visible interactive elements with ref IDs. Use refs with click/fill. Always call after navigation.",
-  {},
-  async () => {
+  "Get visible interactive elements with ref IDs. Use refs with click/fill. Always call after navigation. " +
+    'On large pages (Outlook, dashboards) the response can be truncated — narrow with roles=["button","textbox"] ' +
+    "or paginate with offset/limit. Refs stay stable regardless of filters (every visible element is still numbered).",
+  {
+    roles: z.array(z.string()).default([]).describe('Only show elements matching these tags/roles/types, e.g. ["button","link","textbox","tab"]. Empty = all.'),
+    offset: z.number().default(0).describe("Skip the first N matched elements (pagination)."),
+    limit: z.number().default(0).describe("Max elements to return (0 = no cap)."),
+  },
+  async ({ roles, offset, limit }) => {
     const page = getPage();
     const elements = await page.evaluate(SNAPSHOT_JS) || [];
-    const text = formatSnapshot(elements as any[], page.url(), await page.title());
+    const text = formatSnapshot(elements as any[], page.url(), await page.title(), { roles, offset, limit });
     return { content: [{ type: "text", text }] };
   }
 );
@@ -641,21 +711,38 @@ server.tool("tab_new", "Open new tab.", {
   return { content: [{ type: "text", text: `New tab [${activePage}]. URL: ${page.url()}` }] };
 });
 
-server.tool("tab_select", "Switch to tab by index.", {
-  index: z.number(),
-}, async ({ index }) => {
-  if (index < 0 || index >= pages.length) {
-    return { content: [{ type: "text", text: `Invalid index ${index}. Have ${pages.length} tabs.` }] };
+server.tool("tab_select", "Switch to a tab by index, or by url_contains (first tab whose URL contains the substring).", {
+  index: z.number().default(-1).describe("Tab index. Ignored if url_contains is set."),
+  url_contains: z.string().default("").describe("Select the first tab whose URL contains this substring."),
+}, async ({ index, url_contains }) => {
+  if (!pages.length) return { content: [{ type: "text", text: "No tabs open." }] };
+  let idx = index;
+  if (url_contains) {
+    idx = pages.findIndex(p => { try { return p.url().includes(url_contains); } catch { return false; } });
+    if (idx < 0) {
+      const list = pages.map((p, i) => { let u = "?"; try { u = p.url(); } catch {} return `[${i}] ${u}`; }).join("\n  ");
+      return { content: [{ type: "text", text: `No tab URL contains "${url_contains}". Open tabs:\n  ${list}` }] };
+    }
   }
-  activePage = index;
-  try { await pages[index].bringToFront(); } catch {}
-  return { content: [{ type: "text", text: `Switched to tab [${index}]. URL: ${pages[index].url()}` }] };
+  if (idx < 0 || idx >= pages.length) {
+    return { content: [{ type: "text", text: `Invalid index ${idx}. Have ${pages.length} tabs. Pass index or url_contains.` }] };
+  }
+  activePage = idx;
+  try { await pages[idx].bringToFront(); } catch {}
+  return { content: [{ type: "text", text: `Switched to tab [${idx}]. URL: ${pages[idx].url()}` }] };
 });
 
-server.tool("tab_close", "Close a tab (-1 = active).", {
+server.tool("tab_close", "Close a tab by index (-1 = active), or by url_contains.", {
   index: z.number().default(-1),
-}, async ({ index }) => {
-  const idx = index === -1 ? activePage : index;
+  url_contains: z.string().default("").describe("Close the first tab whose URL contains this substring (overrides index)."),
+}, async ({ index, url_contains }) => {
+  let idx: number;
+  if (url_contains) {
+    idx = pages.findIndex(p => { try { return p.url().includes(url_contains); } catch { return false; } });
+    if (idx < 0) return { content: [{ type: "text", text: `No tab URL contains "${url_contains}".` }] };
+  } else {
+    idx = index === -1 ? activePage : index;
+  }
   if (idx < 0 || idx >= pages.length) {
     return { content: [{ type: "text", text: `Invalid index.` }] };
   }
@@ -754,7 +841,24 @@ server.tool("scroll", "Scroll the page.", {
 // ── Tools: Console & Network ───────────────────────────────────────────────
 
 const consoleMessages: { type: string; text: string }[] = [];
-const networkRequests: { method: string; status: number; url: string }[] = [];
+
+interface NetEntry {
+  id: number;
+  method: string;
+  status: number;
+  url: string;                       // full URL (truncated only in list view)
+  resourceType: string;
+  reqHeaders?: Record<string, string>;
+  reqBody?: string;
+  resHeaders?: Record<string, string>;
+  resBody?: string;
+  resBodyTruncated?: boolean;
+  mimeType?: string;
+}
+const networkRequests: NetEntry[] = [];
+let networkCaptureBodies = false;
+let networkSeq = 0;
+let networkHandler: ((res: any) => void) | null = null;
 
 server.tool("console_start", "Start capturing console messages.", {}, async () => {
   const page = getPage();
@@ -771,24 +875,106 @@ server.tool("console_get", "Get captured console messages.", {}, async () => {
   return { content: [{ type: "text", text: `Console (${consoleMessages.length}):\n${lines.join("\n")}` }] };
 });
 
-server.tool("network_start", "Start capturing network requests.", {}, async () => {
-  const page = getPage();
-  networkRequests.length = 0;
-  page.on("response", (res) => {
-    networkRequests.push({
-      method: res.request().method(),
-      status: res.status(),
-      url: res.url().slice(0, 120),
-    });
+server.tool("network_start",
+  "Start capturing network requests. With capture_bodies=true also records request/response " +
+  "headers + text bodies (json/text/xml/form only, capped at body_limit bytes) so you can inspect " +
+  "API payloads via network_get_detail — no need to pivot to evaluate()+fetch().",
+  {
+    capture_bodies: z.boolean().default(false).describe("Also capture request/response headers and text bodies."),
+    body_limit: z.number().default(50000).describe("Max bytes kept per request/response body."),
+  },
+  async ({ capture_bodies, body_limit }) => {
+    const page = getPage();
+    networkRequests.length = 0;
+    networkSeq = 0;
+    networkCaptureBodies = capture_bodies;
+    // Detach a prior handler so repeated network_start calls don't stack listeners.
+    if (networkHandler) { try { page.off("response", networkHandler); } catch {} }
+    networkHandler = (res: any) => {
+      // Fire-and-forget: body reads are async and must not block the event loop.
+      (async () => {
+        try {
+          const req = res.request();
+          const entry: NetEntry = {
+            id: networkSeq++,
+            method: req.method(),
+            status: res.status(),
+            url: res.url(),
+            resourceType: typeof req.resourceType === "function" ? req.resourceType() : "",
+          };
+          if (networkCaptureBodies) {
+            try { entry.reqHeaders = await req.allHeaders(); } catch {}
+            try { const pd = req.postData(); if (pd) entry.reqBody = pd.slice(0, body_limit); } catch {}
+            try { entry.resHeaders = await res.allHeaders(); } catch {}
+            const ct = (entry.resHeaders?.["content-type"] || "").toLowerCase();
+            entry.mimeType = ct;
+            // Only decode text-ish payloads — skip images/fonts/binary blobs.
+            if (ct === "" || /json|text|javascript|xml|html|urlencoded|graphql/.test(ct)) {
+              try {
+                const buf = await res.body();
+                if (buf) {
+                  const txt = buf.toString("utf8");
+                  entry.resBody = txt.slice(0, body_limit);
+                  if (txt.length > body_limit) entry.resBodyTruncated = true;
+                }
+              } catch {}
+            }
+          }
+          networkRequests.push(entry);
+          if (networkRequests.length > 500) networkRequests.shift();
+        } catch {}
+      })();
+    };
+    page.on("response", networkHandler);
+    return { content: [{ type: "text", text: `Network capture started${capture_bodies ? ` (bodies ON, limit ${body_limit}B)` : ""}.` }] };
   });
-  return { content: [{ type: "text", text: "Network capture started." }] };
-});
 
-server.tool("network_get", "Get captured network requests.", {}, async () => {
-  if (!networkRequests.length) return { content: [{ type: "text", text: "No requests." }] };
-  const lines = networkRequests.slice(-50).map(r => `  ${r.method} ${r.status} ${r.url}`);
-  return { content: [{ type: "text", text: `Network (${networkRequests.length}):\n${lines.join("\n")}` }] };
-});
+server.tool("network_get",
+  "List captured network requests (newest first-capped). Each row shows an #id usable with network_get_detail.",
+  {
+    filter: z.string().default("").describe("Only show requests whose URL contains this substring."),
+    limit: z.number().default(50).describe("Max rows to return."),
+  },
+  async ({ filter, limit }) => {
+    let rows = networkRequests;
+    if (filter) rows = rows.filter(r => r.url.includes(filter));
+    if (!rows.length) return { content: [{ type: "text", text: filter ? `No requests match "${filter}".` : "No requests." }] };
+    const slice = rows.slice(-limit);
+    const lines = slice.map(r => `  #${r.id} ${r.method} ${r.status} ${r.url.slice(0, 120)}`);
+    const hint = networkCaptureBodies
+      ? "\n(bodies captured — network_get_detail(id) for full request/response)"
+      : "\n(headers/bodies NOT captured — restart with network_start capture_bodies=true)";
+    return { content: [{ type: "text", text: `Network (${rows.length}${filter ? " matched" : ""}):\n${lines.join("\n")}${hint}` }] };
+  });
+
+server.tool("network_get_detail",
+  "Full request + response detail (headers and text body) for one captured request. " +
+  "Requires network_start(capture_bodies=true) BEFORE the request fired. " +
+  "Identify the request by id (from network_get) or by url substring.",
+  {
+    id: z.number().default(-1).describe("Request #id from network_get. -1 = match by url instead."),
+    url: z.string().default("").describe("When id=-1, match the newest request whose URL contains this substring."),
+  },
+  async ({ id, url }) => {
+    let entry: NetEntry | undefined;
+    if (id >= 0) entry = networkRequests.find(r => r.id === id);
+    else if (url) { const m = networkRequests.filter(r => r.url.includes(url)); entry = m[m.length - 1]; }
+    if (!entry) return { content: [{ type: "text", text: "No matching request. Run network_get to list ids." }] };
+    if (!networkCaptureBodies && !entry.reqHeaders && !entry.resBody) {
+      return { content: [{ type: "text", text: `Request #${entry.id} found, but bodies weren't captured. Run network_start(capture_bodies=true), replay the action, then retry.` }] };
+    }
+    const fmtH = (h?: Record<string, string>) => h ? Object.entries(h).map(([k, v]) => `    ${k}: ${v}`).join("\n") : "    (none)";
+    const out = [
+      `#${entry.id} ${entry.method} ${entry.status}  ${entry.url}`,
+      `resourceType: ${entry.resourceType || "?"}  mime: ${entry.mimeType || "?"}`,
+      "", "── Request headers ──", fmtH(entry.reqHeaders),
+      ...(entry.reqBody ? ["", "── Request body ──", entry.reqBody] : []),
+      "", "── Response headers ──", fmtH(entry.resHeaders),
+      "", "── Response body ──",
+      entry.resBody ? (entry.resBody + (entry.resBodyTruncated ? "\n…(truncated)" : "")) : "(empty / binary / not captured)",
+    ];
+    return { content: [{ type: "text", text: out.join("\n") }] };
+  });
 
 // ── Tools: PDF ─────────────────────────────────────────────────────────────
 
@@ -869,6 +1055,84 @@ server.tool("fill_form", "Fill multiple form fields and optionally submit.", {
   await page.waitForTimeout(1000);
   return { content: [{ type: "text", text: `Filled ${fields.length} fields${submit_ref ? " + submitted" : ""}. URL: ${page.url()}` }] };
 });
+
+server.tool("login_classic",
+  "Composite login for classic email→password forms (Google, Microsoft, generic SSO). " +
+  "Auto-detects the email field, clicks Next/Continue on multi-step forms, fills the password, submits, " +
+  "and optionally enters a TOTP 2FA code. Collapses the usual 5–8 fill/click/snapshot calls into one. " +
+  "Heuristic — if a form is unusual, fall back to individual fill/click tools. Returns the step log + a fresh snapshot.",
+  {
+    email: z.string().describe("Email / username to fill."),
+    password: z.string().describe("Password to fill."),
+    totp_secret: z.string().default("").describe("Base32 TOTP secret — a 6-digit code is generated if a 2FA field appears."),
+    totp_code: z.string().default("").describe("Pre-computed 6-digit 2FA code (overrides totp_secret)."),
+    submit_after_email: z.boolean().default(true).describe("Click Next/Continue after the email (Google/Microsoft multi-step)."),
+    step_timeout_ms: z.number().default(8000).describe("Max wait for each step's field to appear."),
+  },
+  async ({ email, password, totp_secret, totp_code, submit_after_email, step_timeout_ms }) => {
+    const page = getPage();
+    const log: string[] = [];
+    const EMAIL_SEL = 'input[type="email"], input[name="loginfmt"], input#identifierId, input[autocomplete="username"], input[name*="email" i], input[name*="user" i], input[id*="email" i], input[id*="user" i]';
+    const PW_SEL = 'input[type="password"], input[name="passwd"], input[name="Passwd"], input[autocomplete="current-password"]';
+    const NEXT_SEL = 'button[type="submit"], input[type="submit"], #idSIButton9, button:has-text("Next"), button:has-text("Continue"), button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Berikutnya"), button:has-text("Lanjut"), button:has-text("Masuk")';
+    const TOTP_SEL = 'input[name="otc"], input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="code" i], input[inputmode="numeric"]';
+
+    const finish = async (note: string) => {
+      const elements = await page.evaluate(SNAPSHOT_JS) || [];
+      const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+      return { content: [{ type: "text" as const, text: `login_classic: ${note}\nsteps: ${log.join(" → ") || "(none)"}\n\n${snap}` }] };
+    };
+
+    // 1. Email field
+    try {
+      const ef = page.locator(EMAIL_SEL).first();
+      await ef.waitFor({ state: "visible", timeout: step_timeout_ms });
+      await ef.fill(email);
+      log.push("email filled");
+    } catch { return finish("FAILED — email field not found"); }
+
+    // 2. Next/Continue (multi-step forms)
+    if (submit_after_email) {
+      try {
+        const nb = page.locator(NEXT_SEL).first();
+        if (await nb.count() && await nb.isVisible()) { await clickWithFallback(nb); log.push("clicked Next"); }
+      } catch {}
+      await page.waitForTimeout(1200);
+    }
+
+    // 3. Password field
+    try {
+      const pf = page.locator(PW_SEL).first();
+      await pf.waitFor({ state: "visible", timeout: step_timeout_ms });
+      await pf.fill(password);
+      log.push("password filled");
+    } catch { return finish("FAILED — password field not found after email step"); }
+
+    // 4. Submit password
+    try {
+      const sb = page.locator(NEXT_SEL).first();
+      if (await sb.count() && await sb.isVisible()) { await clickWithFallback(sb); log.push("submitted"); }
+      else { await page.keyboard.press("Enter"); log.push("submitted (Enter)"); }
+    } catch { try { await page.keyboard.press("Enter"); } catch {} }
+    await page.waitForTimeout(1500);
+
+    // 5. TOTP / 2FA (optional)
+    const code = totp_code || (totp_secret ? totpFromSecret(totp_secret) : "");
+    if (code) {
+      try {
+        const tf = page.locator(TOTP_SEL).first();
+        await tf.waitFor({ state: "visible", timeout: 4000 });
+        await tf.fill(code);
+        log.push(`2FA code filled (${code})`);
+        const sb = page.locator(NEXT_SEL).first();
+        if (await sb.count() && await sb.isVisible()) await clickWithFallback(sb);
+        else await page.keyboard.press("Enter");
+        await page.waitForTimeout(1500);
+      } catch { log.push("2FA field not shown — skipped"); }
+    }
+
+    return finish("done");
+  });
 
 server.tool("navigate_and_snapshot", "Navigate to URL then return snapshot — combined in one call.", {
   url: z.string(),

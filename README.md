@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **96 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **102 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -39,7 +39,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **96** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **102** | **Yes** | **Yes** | **Yes** |
 
 ## Proven on Real Sites
 
@@ -262,7 +262,7 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 96 Tools
+## All 102 Tools
 
 ### Browser Lifecycle (2)
 
@@ -284,7 +284,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 
 | Tool | Description |
 |------|-------------|
-| `browser_snapshot` | Get interactive elements with ref IDs. **Call after every navigation.** |
+| `browser_snapshot` | Get interactive elements with ref IDs. **Call after every navigation.** On large pages narrow with `roles=["button","textbox"]` or paginate with `offset`/`limit` — refs stay stable. |
 | `screenshot` | Capture viewport or full page. Options: `name`, `full_page` |
 | `get_text` | Text from page or selector (max 5000 chars) |
 | `get_html` | HTML from page or selector (max 10000 chars) |
@@ -335,8 +335,8 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 |------|-------------|
 | `tab_list` | List all tabs |
 | `tab_new` | Open new tab |
-| `tab_select` | Switch tab |
-| `tab_close` | Close tab |
+| `tab_select` | Switch tab by `index` or `url_contains` (first tab whose URL matches) |
+| `tab_close` | Close tab by `index` (-1 = active) or `url_contains` |
 
 ### Cookies (3)
 
@@ -384,12 +384,13 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `list_frames` | List all frames/iframes |
 | `frame_evaluate` | Run JS inside a frame |
 
-### Batch Operations (3)
+### Batch Operations (4)
 
 | Tool | Description |
 |------|-------------|
 | `batch_actions` | Multiple actions in one call (click, fill, type, press, wait) |
 | `fill_form` | Fill multiple fields + optional submit |
+| `login_classic` | Composite login for email→password forms (Google/Microsoft/generic). Auto email→Next→password→submit, optional TOTP 2FA (`totp_secret` or `totp_code`). Collapses 5–8 calls into one. |
 | `navigate_and_snapshot` | Navigate + snapshot in one call |
 
 ### Viewport (2)
@@ -417,12 +418,13 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 |------|-------------|
 | `accessibility_snapshot` | Accessibility tree for LLM understanding |
 
-### Console & Network (4)
+### Console & Network (5)
 
 | Tool | Description |
 |------|-------------|
 | `console_start` / `console_get` | Capture and retrieve browser console messages |
-| `network_start` / `network_get` | Capture and retrieve network requests |
+| `network_start` / `network_get` | Capture network requests. `network_start(capture_bodies=true)` also records request/response headers + text bodies. `network_get(filter=...)` narrows by URL substring; each row shows an `#id`. |
+| `network_get_detail` | Full request + response (headers + text body) for one captured request by `#id` or `url` substring. Needs `capture_bodies=true`. Replaces the `evaluate()`+`fetch()` workaround for inspecting API payloads. |
 
 ### Compound (reduce round-trips) (4)
 
