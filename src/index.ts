@@ -42,9 +42,12 @@ function getPage(): Page {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-import { mkdirSync, writeFileSync } from "fs";
+import { mkdirSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { createHmac } from "crypto";
+
+// Shared default timeout for element actions (click/fill/check/etc.).
+const ACTION_TIMEOUT = 5000;
 
 function ensureDirs() {
   mkdirSync(PROFILE_DIR, { recursive: true });
@@ -83,8 +86,39 @@ function totpFromSecret(secret: string, step = 30, digits = 6): string {
 // Click a locator, falling back to a JS .click() when an overlay blocks the
 // real pointer event (same pattern every click tool in this file uses).
 async function clickWithFallback(loc: any): Promise<void> {
-  try { await loc.click({ timeout: 5000 }); }
+  try { await loc.click({ timeout: ACTION_TIMEOUT }); }
   catch { await loc.evaluate((el: any) => el.click()); }
+}
+
+// Locator for a snapshot ref (data-mcp-ref). Centralizes the selector so the
+// ref scheme lives in exactly one place.
+function refLocator(page: Page, ref: string) {
+  return page.locator(`[data-mcp-ref="${ref}"]`).first();
+}
+
+// Track a page in the global pages[] list and auto-remove it on close.
+// Used for the initial page, tab_new, AND pages opened by the site itself
+// (window.open / target=_blank) via the browserContext "page" event — without
+// this, popup/OAuth windows are invisible to every tool. Idempotent.
+// If console/network capture is active, the new page inherits the handlers so
+// capture follows the user across tabs and popups.
+function trackPage(p: Page): void {
+  if (pages.includes(p)) return;
+  pages.push(p);
+  if (consoleHandler) p.on("console", consoleHandler);
+  if (networkHandler) p.on("response", networkHandler);
+  p.once("close", () => {
+    const i = pages.indexOf(p);
+    if (i < 0) return;
+    // Preserve which page is active by IDENTITY, not index — removing a
+    // lower-indexed page (e.g. a popup that closed itself) must not silently
+    // shift activePage onto a different tab.
+    const activeObj = pages[activePage];
+    pages.splice(i, 1);
+    const reFound = pages.indexOf(activeObj);
+    activePage = reFound >= 0 ? reFound : Math.min(activePage, pages.length - 1);
+    if (activePage < 0) activePage = 0;
+  });
 }
 
 // DOM snapshot JS — IIFE so page.evaluate runs it immediately
@@ -179,6 +213,16 @@ function formatSnapshot(
   return lines.join("\n");
 }
 
+// Run the DOM snapshot and format it — the evaluate(SNAPSHOT_JS)+formatSnapshot
+// pair used by browser_snapshot and every *_and_snapshot compound tool.
+async function snapshotPage(
+  page: Page,
+  opts?: { roles?: string[]; offset?: number; limit?: number },
+): Promise<string> {
+  const elements = (await page.evaluate(SNAPSHOT_JS)) || [];
+  return formatSnapshot(elements as any[], page.url(), await page.title(), opts);
+}
+
 // ── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new McpServer({
@@ -271,30 +315,43 @@ server.tool(
 
     await ensureCamoufoxBinary();
 
-    const ctx = await Camoufox({
-      headless,
-      humanize,
-      geoip,
-      locale,
-      user_data_dir: profileDir,
-      disable_coop: true,
-      window: [w, h] as [number, number],
-      i_know_what_im_doing: true,
-      firefox_user_prefs: {
-        "permissions.default.desktop-notification": 2,
-        "dom.webnotifications.enabled": false,
-        "browser.translations.automaticallyPopup": false,
-      },
-    }) as BrowserContext;
+    let ctx: BrowserContext;
+    try {
+      ctx = await Camoufox({
+        headless,
+        humanize,
+        geoip,
+        locale,
+        user_data_dir: profileDir,
+        disable_coop: true,
+        window: [w, h] as [number, number],
+        i_know_what_im_doing: true,
+        firefox_user_prefs: {
+          "permissions.default.desktop-notification": 2,
+          "dom.webnotifications.enabled": false,
+          "browser.translations.automaticallyPopup": false,
+        },
+      }) as BrowserContext;
+    } catch (e) {
+      // Don't leak the freshly-created temp profile dir if launch failed.
+      if (isTemp) { try { rmSync(profileDir, { recursive: true, force: true }); } catch {} }
+      throw e;
+    }
 
     browserContext = ctx;
     activeProfileDir = profileDir;
     activeProfileIsTemp = isTemp;
-    const existingPages = ctx.pages();
-    const page = existingPages.length > 0 ? existingPages[0] : await ctx.newPage();
-    pages = [page];
+    pages = [];
     activePage = 0;
     browserUp = true;
+    // Track pages the site opens itself (window.open / target=_blank), not just
+    // tabs we create — otherwise popup/OAuth windows are invisible to all tools.
+    ctx.on("page", (p) => trackPage(p));
+    const existingPages = ctx.pages();
+    const page = existingPages.length > 0 ? existingPages[0] : await ctx.newPage();
+    trackPage(page);
+    activePage = pages.indexOf(page);
+    if (activePage < 0) activePage = 0;
 
     if (url && url !== "about:blank") {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -318,7 +375,6 @@ server.tool(
     let note = "Profile saved.";
     if (activeProfileIsTemp && activeProfileDir) {
       try {
-        const { rmSync } = await import("fs");
         rmSync(activeProfileDir, { recursive: true, force: true });
         note = `Temp profile removed (${activeProfileDir}).`;
       } catch (e: any) {
@@ -331,6 +387,14 @@ server.tool(
     browserUp = false;
     activeProfileDir = null;
     activeProfileIsTemp = false;
+    // Reset capture state so a later launch doesn't read stale cross-session
+    // data and the handlers don't pin closed page objects.
+    consoleMessages.length = 0;
+    networkRequests.length = 0;
+    networkSeq = 0;
+    networkCaptureBodies = false;
+    networkHandler = null;
+    consoleHandler = null;
     return { content: [{ type: "text", text: `Browser closed. ${note}` }] };
   }
 );
@@ -417,8 +481,7 @@ server.tool(
   },
   async ({ roles, offset, limit }) => {
     const page = getPage();
-    const elements = await page.evaluate(SNAPSHOT_JS) || [];
-    const text = formatSnapshot(elements as any[], page.url(), await page.title(), { roles, offset, limit });
+    const text = await snapshotPage(page, { roles, offset, limit });
     return { content: [{ type: "text", text }] };
   }
 );
@@ -450,10 +513,10 @@ server.tool(
   },
   async ({ ref, button, dblclick }) => {
     const page = getPage();
-    const loc = page.locator(`[data-mcp-ref="${ref}"]`).first();
+    const loc = refLocator(page, ref);
     try {
-      if (dblclick) await loc.dblclick({ button, timeout: 5000 });
-      else await loc.click({ button, timeout: 5000 });
+      if (dblclick) await loc.dblclick({ button, timeout: ACTION_TIMEOUT });
+      else await loc.click({ button, timeout: ACTION_TIMEOUT });
     } catch {
       await loc.evaluate((el: any) => el.click());
     }
@@ -472,8 +535,10 @@ server.tool(
   async ({ text, exact }) => {
     const page = getPage();
     const loc = page.getByText(text, { exact }).first();
-    try { await loc.click({ timeout: 5000 }); }
-    catch { await loc.evaluate((el: any) => el.click()); }
+    if (await loc.count() === 0) {
+      return { content: [{ type: "text", text: `No element matched text='${text}' (exact=${exact}). Current URL: ${page.url()}. Try exact=false, browser_snapshot, or click_role.` }], isError: true };
+    }
+    await clickWithFallback(loc);
     await page.waitForTimeout(1000);
     return { content: [{ type: "text", text: `Clicked text='${text}'. URL: ${page.url()}` }] };
   }
@@ -491,8 +556,10 @@ server.tool(
     const loc = ariaName
       ? page.getByRole(role as any, { name: ariaName, exact: true }).first()
       : page.getByRole(role as any).first();
-    try { await loc.click({ timeout: 5000 }); }
-    catch { await loc.evaluate((el: any) => el.click()); }
+    if (await loc.count() === 0) {
+      return { content: [{ type: "text", text: `No element matched role=${role} name='${ariaName}'. Current URL: ${page.url()}. Try browser_snapshot or click_text.` }], isError: true };
+    }
+    await clickWithFallback(loc);
     await page.waitForTimeout(1000);
     return { content: [{ type: "text", text: `Clicked role=${role} name='${ariaName}'. URL: ${page.url()}` }] };
   }
@@ -502,7 +569,7 @@ server.tool("hover", "Hover over element by ref ID.", {
   ref: z.string(),
 }, async ({ ref }) => {
   const page = getPage();
-  await page.locator(`[data-mcp-ref="${ref}"]`).first().hover({ timeout: 5000 });
+  await refLocator(page, ref).hover({ timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Hovered ref=${ref}` }] };
 });
 
@@ -511,7 +578,7 @@ server.tool("fill", "Fill input/textarea by ref ID. Clears existing content.", {
   value: z.string().describe("Text to fill"),
 }, async ({ ref, value }) => {
   const page = getPage();
-  await page.locator(`[data-mcp-ref="${ref}"]`).first().fill(value, { timeout: 5000 });
+  await refLocator(page, ref).fill(value, { timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Filled ref=${ref} with '${value.slice(0, 50)}'` }] };
 });
 
@@ -519,19 +586,19 @@ server.tool("select_option", "Select option from <select> dropdown.", {
   ref: z.string(), value: z.string(),
 }, async ({ ref, value }) => {
   const page = getPage();
-  await page.locator(`[data-mcp-ref="${ref}"]`).first().selectOption(value, { timeout: 5000 });
+  await refLocator(page, ref).selectOption(value, { timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Selected '${value}' in ref=${ref}` }] };
 });
 
 server.tool("check", "Check checkbox or radio button.", { ref: z.string() }, async ({ ref }) => {
   const page = getPage();
-  await page.locator(`[data-mcp-ref="${ref}"]`).first().check({ timeout: 5000 });
+  await refLocator(page, ref).check({ timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Checked ref=${ref}` }] };
 });
 
 server.tool("uncheck", "Uncheck a checkbox.", { ref: z.string() }, async ({ ref }) => {
   const page = getPage();
-  await page.locator(`[data-mcp-ref="${ref}"]`).first().uncheck({ timeout: 5000 });
+  await refLocator(page, ref).uncheck({ timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Unchecked ref=${ref}` }] };
 });
 
@@ -667,7 +734,7 @@ server.tool("get_text", "Get visible text from page or element.", {
   selector: z.string().default("body"),
 }, async ({ selector }) => {
   const page = getPage();
-  let text = await page.locator(selector).first().innerText({ timeout: 5000 });
+  let text = await page.locator(selector).first().innerText({ timeout: ACTION_TIMEOUT });
   if (text.length > 5000) text = text.slice(0, 5000) + `\n... (truncated, ${text.length} chars)`;
   return { content: [{ type: "text", text }] };
 });
@@ -680,7 +747,7 @@ server.tool("get_html", "Get HTML content from page or element.", {
   const loc = page.locator(selector).first();
   let html = outer
     ? await loc.evaluate((el: any) => el.outerHTML)
-    : await loc.innerHTML({ timeout: 5000 });
+    : await loc.innerHTML({ timeout: ACTION_TIMEOUT });
   if (html.length > 10000) html = html.slice(0, 10000) + `\n<!-- truncated -->`;
   return { content: [{ type: "text", text: html }] };
 });
@@ -701,13 +768,15 @@ server.tool("tab_list", "List all open tabs.", {}, async () => {
 server.tool("tab_new", "Open new tab.", {
   url: z.string().default("about:blank"),
 }, async ({ url }) => {
-  if (!browserContext) throw new Error("Browser not running.");
+  if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
   const page = await browserContext.newPage();
   if (url && url !== "about:blank") {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
   }
-  pages.push(page);
-  activePage = pages.length - 1;
+  // newPage() also fires the context "page" event → trackPage may already have
+  // added it; trackPage is idempotent, so this just guarantees it's present.
+  trackPage(page);
+  activePage = pages.indexOf(page);
   return { content: [{ type: "text", text: `New tab [${activePage}]. URL: ${page.url()}` }] };
 });
 
@@ -761,7 +830,7 @@ server.tool("tab_close", "Close a tab by index (-1 = active), or by url_contains
 server.tool("cookie_list", "List cookies.", {
   domain: z.string().default(""),
 }, async ({ domain }) => {
-  if (!browserContext) throw new Error("Browser not running.");
+  if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
   let cookies = await browserContext.cookies();
   if (domain) cookies = cookies.filter(c => c.domain.includes(domain));
   const lines = cookies.slice(0, 50).map(c => `  ${c.name}=${String(c.value).slice(0, 40)}  domain=${c.domain}`);
@@ -771,15 +840,15 @@ server.tool("cookie_list", "List cookies.", {
 server.tool("cookie_set", "Set a cookie.", {
   name: z.string(), value: z.string(), domain: z.string(), path: z.string().default("/"),
 }, async ({ name, value, domain, path }) => {
-  if (!browserContext) throw new Error("Browser not running.");
-  await browserContext.addCookies([{ name, value, domain, path, url: undefined as any }]);
+  if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
+  await browserContext.addCookies([{ name, value, domain, path }]);
   return { content: [{ type: "text", text: `Cookie set: ${name}=${value.slice(0, 40)} domain=${domain}` }] };
 });
 
 server.tool("cookie_delete", "Delete cookies. Both empty = clear all.", {
   name: z.string().default(""), domain: z.string().default(""),
 }, async ({ name, domain }) => {
-  if (!browserContext) throw new Error("Browser not running.");
+  if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
   if (!name && !domain) {
     await browserContext.clearCookies();
     return { content: [{ type: "text", text: "All cookies cleared." }] };
@@ -816,7 +885,7 @@ server.tool("upload_file", "Upload file to file input.", {
   ref: z.string(), file_path: z.string(),
 }, async ({ ref, file_path }) => {
   const page = getPage();
-  await page.locator(`[data-mcp-ref="${ref}"]`).first().setInputFiles(file_path, { timeout: 5000 });
+  await refLocator(page, ref).setInputFiles(file_path, { timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Uploaded ${file_path} to ref=${ref}` }] };
 });
 
@@ -859,14 +928,21 @@ const networkRequests: NetEntry[] = [];
 let networkCaptureBodies = false;
 let networkSeq = 0;
 let networkHandler: ((res: any) => void) | null = null;
+let consoleHandler: ((msg: any) => void) | null = null;
 
-server.tool("console_start", "Start capturing console messages.", {}, async () => {
-  const page = getPage();
+server.tool("console_start", "Start capturing console messages from all tabs.", {}, async () => {
+  if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
   consoleMessages.length = 0;
-  page.on("console", (msg) => {
+  // Detach any prior handler from every page first so repeated console_start
+  // calls don't stack listeners (and don't capture each message N times).
+  if (consoleHandler) for (const p of pages) { try { p.off("console", consoleHandler); } catch {} }
+  consoleHandler = (msg: any) => {
     consoleMessages.push({ type: msg.type(), text: msg.text().slice(0, 200) });
-  });
-  return { content: [{ type: "text", text: "Console capture started." }] };
+  };
+  // Attach to every current page; trackPage() attaches it to future tabs/popups,
+  // so capture follows the user across tab switches instead of dying on tab 0.
+  for (const p of pages) p.on("console", consoleHandler);
+  return { content: [{ type: "text", text: `Console capture started (all ${pages.length} tab(s)).` }] };
 });
 
 server.tool("console_get", "Get captured console messages.", {}, async () => {
@@ -884,12 +960,13 @@ server.tool("network_start",
     body_limit: z.number().default(50000).describe("Max bytes kept per request/response body."),
   },
   async ({ capture_bodies, body_limit }) => {
-    const page = getPage();
+    if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
     networkRequests.length = 0;
     networkSeq = 0;
     networkCaptureBodies = capture_bodies;
-    // Detach a prior handler so repeated network_start calls don't stack listeners.
-    if (networkHandler) { try { page.off("response", networkHandler); } catch {} }
+    // Detach a prior handler from every page so repeated network_start calls
+    // don't stack listeners or orphan the handler on a since-switched tab.
+    if (networkHandler) for (const p of pages) { try { p.off("response", networkHandler); } catch {} }
     networkHandler = (res: any) => {
       // Fire-and-forget: body reads are async and must not block the event loop.
       (async () => {
@@ -925,8 +1002,9 @@ server.tool("network_start",
         } catch {}
       })();
     };
-    page.on("response", networkHandler);
-    return { content: [{ type: "text", text: `Network capture started${capture_bodies ? ` (bodies ON, limit ${body_limit}B)` : ""}.` }] };
+    // Attach to every current page; trackPage() handles future tabs/popups.
+    for (const p of pages) p.on("response", networkHandler);
+    return { content: [{ type: "text", text: `Network capture started${capture_bodies ? ` (bodies ON, limit ${body_limit}B)` : ""} on ${pages.length} tab(s).` }] };
   });
 
 server.tool("network_get",
@@ -1004,11 +1082,11 @@ server.tool("batch_actions", "Execute multiple actions in one call. Each action:
   for (const action of actions) {
     try {
       if (action.type === "click" && action.ref) {
-        const loc = page.locator(`[data-mcp-ref="${action.ref}"]`).first();
-        try { await loc.click({ timeout: 5000 }); } catch { await loc.evaluate((el: any) => el.click()); }
+        const loc = refLocator(page, action.ref);
+        await clickWithFallback(loc);
         results.push(`click ${action.ref}: OK`);
       } else if (action.type === "fill" && action.ref && action.value !== undefined) {
-        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().fill(action.value, { timeout: 5000 });
+        await refLocator(page, action.ref).fill(action.value, { timeout: ACTION_TIMEOUT });
         results.push(`fill ${action.ref}: OK`);
       } else if (action.type === "type" && action.text) {
         await page.keyboard.type(action.text, { delay: 50 });
@@ -1017,13 +1095,13 @@ server.tool("batch_actions", "Execute multiple actions in one call. Each action:
         await page.keyboard.press(action.key);
         results.push(`press ${action.key}: OK`);
       } else if (action.type === "select" && action.ref && action.value) {
-        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().selectOption(action.value, { timeout: 5000 });
+        await refLocator(page, action.ref).selectOption(action.value, { timeout: ACTION_TIMEOUT });
         results.push(`select ${action.ref}: OK`);
       } else if (action.type === "check" && action.ref) {
-        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().check({ timeout: 5000 });
+        await refLocator(page, action.ref).check({ timeout: ACTION_TIMEOUT });
         results.push(`check ${action.ref}: OK`);
       } else if (action.type === "uncheck" && action.ref) {
-        await page.locator(`[data-mcp-ref="${action.ref}"]`).first().uncheck({ timeout: 5000 });
+        await refLocator(page, action.ref).uncheck({ timeout: ACTION_TIMEOUT });
         results.push(`uncheck ${action.ref}: OK`);
       } else if (action.type === "wait") {
         await page.waitForTimeout(action.timeout || 1000);
@@ -1046,11 +1124,11 @@ server.tool("fill_form", "Fill multiple form fields and optionally submit.", {
 }, async ({ fields, submit_ref }) => {
   const page = getPage();
   for (const f of fields) {
-    await page.locator(`[data-mcp-ref="${f.ref}"]`).first().fill(f.value, { timeout: 5000 });
+    await refLocator(page, f.ref).fill(f.value, { timeout: ACTION_TIMEOUT });
   }
   if (submit_ref) {
-    const btn = page.locator(`[data-mcp-ref="${submit_ref}"]`).first();
-    try { await btn.click({ timeout: 5000 }); } catch { await btn.evaluate((el: any) => el.click()); }
+    const btn = refLocator(page, submit_ref);
+    await clickWithFallback(btn);
   }
   await page.waitForTimeout(1000);
   return { content: [{ type: "text", text: `Filled ${fields.length} fields${submit_ref ? " + submitted" : ""}. URL: ${page.url()}` }] };
@@ -1078,8 +1156,7 @@ server.tool("login_classic",
     const TOTP_SEL = 'input[name="otc"], input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="code" i], input[inputmode="numeric"]';
 
     const finish = async (note: string) => {
-      const elements = await page.evaluate(SNAPSHOT_JS) || [];
-      const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+      const snap = await snapshotPage(page);
       return { content: [{ type: "text" as const, text: `login_classic: ${note}\nsteps: ${log.join(" → ") || "(none)"}\n\n${snap}` }] };
     };
 
@@ -1141,8 +1218,7 @@ server.tool("navigate_and_snapshot", "Navigate to URL then return snapshot — c
   const page = getPage();
   await page.goto(url, { waitUntil: wait_until, timeout: 30000 });
   await page.waitForTimeout(1500);
-  const elements = await page.evaluate(SNAPSHOT_JS) || [];
-  const text = formatSnapshot(elements as any[], page.url(), await page.title());
+  const text = await snapshotPage(page);
   return { content: [{ type: "text", text }] };
 });
 
@@ -1152,7 +1228,7 @@ server.tool("inspect_element", "Get detailed info about an element (tag, attribu
   ref: z.string(),
 }, async ({ ref }) => {
   const page = getPage();
-  const info = await page.locator(`[data-mcp-ref="${ref}"]`).first().evaluate((el: any) => {
+  const info = await refLocator(page, ref).evaluate((el: any) => {
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
     const attrs: Record<string, string> = {};
@@ -1172,7 +1248,7 @@ server.tool("get_attribute", "Get a specific attribute value from an element.", 
   ref: z.string(), attribute: z.string(),
 }, async ({ ref, attribute }) => {
   const page = getPage();
-  const val = await page.locator(`[data-mcp-ref="${ref}"]`).first().getAttribute(attribute);
+  const val = await refLocator(page, ref).getAttribute(attribute);
   return { content: [{ type: "text", text: `${attribute}=${val}` }] };
 });
 
@@ -1349,9 +1425,9 @@ server.tool("drag_and_drop", "Drag from one element to another.", {
   target_ref: z.string().describe("Ref of drop target"),
 }, async ({ source_ref, target_ref }) => {
   const page = getPage();
-  const src = page.locator(`[data-mcp-ref="${source_ref}"]`).first();
-  const tgt = page.locator(`[data-mcp-ref="${target_ref}"]`).first();
-  await src.dragTo(tgt, { timeout: 5000 });
+  const src = refLocator(page, source_ref);
+  const tgt = refLocator(page, target_ref);
+  await src.dragTo(tgt, { timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Dragged ${source_ref} → ${target_ref}` }] };
 });
 
@@ -1373,7 +1449,13 @@ server.tool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe
   const frame = frame_name
     ? page.frames().find(f => f.name() === frame_name)
     : page.frames()[frame_index];
-  if (!frame) return { content: [{ type: "text", text: "Frame not found." }] };
+  if (!frame) {
+    const avail = page.frames().map((f, i) => `  [${i}] ${f.name() || "(unnamed)"} ${f.url()}`).join("\n");
+    return {
+      content: [{ type: "text", text: `Frame not found (${frame_name ? `name="${frame_name}"` : `index=${frame_index}`}). Available frames:\n${avail}` }],
+      isError: true,
+    };
+  }
   const result = await frame.evaluate(expression);
   return { content: [{ type: "text", text: typeof result === "object" ? JSON.stringify(result, null, 2) : String(result) }] };
 });
@@ -1385,7 +1467,11 @@ server.tool("wait_for_url", "Wait for URL to match a pattern.", {
   timeout: z.number().default(15000),
 }, async ({ pattern, timeout }) => {
   const page = getPage();
-  await page.waitForURL(pattern.startsWith("/") ? new RegExp(pattern.slice(1, -1)) : `**/*${pattern}*`, { timeout });
+  // Treat as a regex ONLY when wrapped in /…/ (regex-literal form). A bare
+  // leading slash like "/mail" is a path substring, not a regex — slicing both
+  // ends off it used to silently drop the last char ("/mail" → "mai").
+  const isRegexLiteral = pattern.length > 1 && pattern.startsWith("/") && pattern.endsWith("/");
+  await page.waitForURL(isRegexLiteral ? new RegExp(pattern.slice(1, -1)) : `**/*${pattern}*`, { timeout });
   return { content: [{ type: "text", text: `URL matched pattern '${pattern}'. Current: ${page.url()}` }] };
 });
 
@@ -1466,7 +1552,7 @@ server.tool("get_page_errors", "Get JavaScript errors from the page.", {}, async
 server.tool("inject_init_script", "Inject a script that runs before every page load.", {
   script: z.string().describe("JavaScript code to inject"),
 }, async ({ script }) => {
-  if (!browserContext) throw new Error("Browser not running.");
+  if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
   await browserContext.addInitScript(script);
   return { content: [{ type: "text", text: "Init script injected. Will run on every new page/navigation." }] };
 });
@@ -1822,8 +1908,7 @@ server.tool(
     } else if (text) {
       await page.getByText(text).first().waitFor({ state, timeout });
     }
-    const elements = await page.evaluate(SNAPSHOT_JS) || [];
-    const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+    const snap = await snapshotPage(page);
     return { content: [{ type: "text", text: snap }] };
   }
 );
@@ -1832,8 +1917,7 @@ server.tool("back_and_snapshot", "Navigate back + return snapshot.", {}, async (
   const page = getPage();
   await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 });
   await page.waitForTimeout(500);
-  const elements = await page.evaluate(SNAPSHOT_JS) || [];
-  const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+  const snap = await snapshotPage(page);
   return { content: [{ type: "text", text: snap }] };
 });
 
@@ -1841,8 +1925,7 @@ server.tool("reload_and_snapshot", "Reload page + return snapshot.", {}, async (
   const page = getPage();
   await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
   await page.waitForTimeout(500);
-  const elements = await page.evaluate(SNAPSHOT_JS) || [];
-  const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+  const snap = await snapshotPage(page);
   return { content: [{ type: "text", text: snap }] };
 });
 
@@ -1855,15 +1938,14 @@ server.tool(
   },
   async ({ ref, wait_ms }) => {
     const page = getPage();
-    const loc = page.locator(`[data-mcp-ref="${ref}"]`).first();
+    const loc = refLocator(page, ref);
     try {
-      await loc.click({ timeout: 5000 });
+      await loc.click({ timeout: ACTION_TIMEOUT });
     } catch {
       await loc.evaluate((el: any) => el.click());
     }
     await page.waitForTimeout(wait_ms);
-    const elements = await page.evaluate(SNAPSHOT_JS) || [];
-    const snap = formatSnapshot(elements as any[], page.url(), await page.title());
+    const snap = await snapshotPage(page);
     return { content: [{ type: "text", text: snap }] };
   }
 );
@@ -1886,7 +1968,7 @@ server.tool(
     }
     // Tag with ref
     const info = await loc.evaluate((el: any) => {
-      const ref = 'f' + Math.floor(Math.random() * 10000);
+      const ref = 'f' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
       el.setAttribute('data-mcp-ref', ref);
       return {
         ref,
@@ -1914,7 +1996,7 @@ server.tool(
       return { content: [{ type: "text", text: `No input found with label "${label}"` }] };
     }
     const info = await loc.evaluate((el: any) => {
-      const ref = 'l' + Math.floor(Math.random() * 10000);
+      const ref = 'l' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
       el.setAttribute('data-mcp-ref', ref);
       return {
         ref,
@@ -1943,7 +2025,7 @@ server.tool(
       return { content: [{ type: "text", text: `No input with placeholder "${placeholder}"` }] };
     }
     const info = await loc.evaluate((el: any) => {
-      const ref = 'p' + Math.floor(Math.random() * 10000);
+      const ref = 'p' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
       el.setAttribute('data-mcp-ref', ref);
       return {
         ref, tag: el.tagName.toLowerCase(), type: el.type || '', placeholder: el.placeholder || '',
@@ -1962,7 +2044,7 @@ server.tool(
     domain: z.string().default("").describe("Filter by domain (empty = all)"),
   },
   async ({ domain }) => {
-    if (!browserContext) throw new Error("Browser not running.");
+    if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
     let cookies = await browserContext.cookies();
     if (domain) cookies = cookies.filter(c => c.domain.includes(domain));
     return { content: [{ type: "text", text: JSON.stringify(cookies, null, 2) }] };
@@ -1976,7 +2058,7 @@ server.tool(
     cookies_json: z.string().describe("JSON array of cookies"),
   },
   async ({ cookies_json }) => {
-    if (!browserContext) throw new Error("Browser not running.");
+    if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
     let cookies: any[];
     try {
       cookies = JSON.parse(cookies_json);
@@ -2061,7 +2143,12 @@ server.tool("storage_state_load", "Load cookies + localStorage from a JSON file 
   const page = getPage();
   const ctx = page.context();
   const target = path.replace("~", process.env.HOME || "");
-  const data = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
+  let data: any;
+  try {
+    data = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Failed to load storage state from ${target}: ${e?.message || e}` }], isError: true };
+  }
   if (data.cookies && data.cookies.length) await ctx.addCookies(data.cookies);
   let lsCount = 0, ssCount = 0;
   if (navigate_to) {
@@ -2117,7 +2204,12 @@ server.tool("cookie_import_file", "Import cookies from a JSON file (Playwright f
 }, async ({ path }) => {
   const page = getPage();
   const target = path.replace("~", process.env.HOME || "");
-  const cookies = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
+  let cookies: any;
+  try {
+    cookies = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Failed to import cookies from ${target}: ${e?.message || e}` }], isError: true };
+  }
   await page.context().addCookies(cookies);
   return { content: [{ type: "text", text: `Imported ${cookies.length} cookies from ${target}` }] };
 });
@@ -2272,8 +2364,11 @@ server.tool("assert_text_present", "Assert text is present anywhere on page (cas
   text: z.string(),
 }, async ({ text }) => {
   const page = getPage();
-  const body = await page.evaluate(`document.body.innerText`) as string;
-  const found = body.includes(text);
+  // Do the substring test in-page so we ship back a boolean, not the entire
+  // document text (which can be megabytes on large pages).
+  const found = await page.evaluate(
+    `document.body.innerText.includes(${JSON.stringify(text)})`
+  ) as boolean;
   return { content: [{ type: "text", text: found ? `PASS: '${text}' present` : `FAIL: '${text}' not found in body` }] };
 });
 

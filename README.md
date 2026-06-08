@@ -333,7 +333,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 
 | Tool | Description |
 |------|-------------|
-| `tab_list` | List all tabs |
+| `tab_list` | List all tabs. Pages the site opens itself (`window.open` / `target=_blank`, e.g. OAuth popups) are auto-tracked and appear here too. |
 | `tab_new` | Open new tab |
 | `tab_select` | Switch tab by `index` or `url_contains` (first tab whose URL matches) |
 | `tab_close` | Close tab by `index` (-1 = active) or `url_contains` |
@@ -422,8 +422,8 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 
 | Tool | Description |
 |------|-------------|
-| `console_start` / `console_get` | Capture and retrieve browser console messages |
-| `network_start` / `network_get` | Capture network requests. `network_start(capture_bodies=true)` also records request/response headers + text bodies. `network_get(filter=...)` narrows by URL substring; each row shows an `#id`. |
+| `console_start` / `console_get` | Capture and retrieve browser console messages. Capture spans **all tabs** and follows newly opened tabs/popups (re-calling `console_start` resets cleanly — no listener stacking). |
+| `network_start` / `network_get` | Capture network requests across **all tabs** (follows tab switches + popups). `network_start(capture_bodies=true)` also records request/response headers + text bodies. `network_get(filter=...)` narrows by URL substring; each row shows an `#id`. |
 | `network_get_detail` | Full request + response (headers + text body) for one captured request by `#id` or `url` substring. Needs `capture_bodies=true`. Replaces the `evaluate()`+`fetch()` workaround for inspecting API payloads. |
 
 ### Compound (reduce round-trips) (4)
