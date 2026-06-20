@@ -1369,55 +1369,113 @@ server.tool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-l
   return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y}) steps=${steps}` }] };
 });
 
-server.tool("click_turnstile", "Auto-find and click Cloudflare Turnstile checkbox. Port of mcp-stealth-chrome's proven pattern — single pre-drift + direct click, leaning on Camoufox's built-in humanize + disable_coop for cross-origin iframe support. Works on Interactive Turnstile widgets (visible iframe). Managed Challenge interstitials not supported — use mcp-stealth-chrome for those.", {
-  offset_x: z.number().default(30).describe("Pixels from widget left edge (calibrated for CF checkbox)"),
+server.tool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox. Locates the widget via in-page selectors AND the Playwright frame API (handles closed shadow roots that document.querySelector misses), polls for render, skips if already solved, then does a humanized real-mouse click with retries + small nudge, verifying the cf-turnstile-response token after each attempt. Managed Challenge full-page interstitials still need mcp-stealth-chrome.", {
+  offset_x: z.number().default(30).describe("Pixels from widget left edge to the checkbox (calibrated for CF checkbox)"),
   offset_y: z.number().optional().describe("Vertical offset from widget top (default = height/2)"),
-  wait_render_ms: z.number().default(500).describe("Wait before detection to let widget render"),
-}, async ({ offset_x, offset_y, wait_render_ms }) => {
+  wait_render_ms: z.number().default(500).describe("Wait before first detection to let widget render"),
+  max_attempts: z.number().default(3).describe("Max click attempts (small vertical nudge between tries) until token appears"),
+}, async ({ offset_x, offset_y, wait_render_ms, max_attempts }) => {
   const page = getPage();
   await page.waitForTimeout(wait_render_ms);
 
-  // Widget detection — 6 selectors ordered by specificity (port from mcp-stealth-chrome)
-  const coords = await page.evaluate(() => {
-    const sels = [
-      'iframe[src*="challenges.cloudflare.com"]',
-      'iframe[src*="turnstile"]',
-      '[data-testid*="challenge-widget"]',
-      '[data-testid*="turnstile"]',
-      '[data-sitekey]',
-      '.cf-turnstile',
-    ];
-    for (const sel of sels) {
-      const el = document.querySelector(sel) as HTMLElement | null;
+  type TSCoords = { found: string; left: number; top: number; width: number; height: number };
+
+  // Locate widget: in-page querySelector (light DOM) first, then Playwright frame
+  // API (the Turnstile <iframe> often sits in a CLOSED shadow root, invisible to
+  // document.querySelector but still tracked by page.frames()).
+  const locate = async (): Promise<TSCoords | null> => {
+    const viaSel = await page.evaluate(() => {
+      const sels = [
+        'iframe[src*="challenges.cloudflare.com"]',
+        'iframe[src*="turnstile"]',
+        '[data-testid*="challenge-widget"]',
+        '[data-testid*="turnstile"]',
+        '[data-sitekey]',
+        '.cf-turnstile',
+      ];
+      for (const sel of sels) {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        if (!el) continue;
+        let r = el.getBoundingClientRect();
+        if (r.width < 50 || r.height < 20) continue;  // size is scroll-invariant — gate first
+        el.scrollIntoView({ block: "center", inline: "center" });  // below-fold widget → into view so the click lands
+        r = el.getBoundingClientRect();  // re-read position after scroll
+        return { found: sel, left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) };
+      }
+      return null;
+    }).catch(() => null);
+    if (viaSel) return viaSel as TSCoords;
+
+    for (const frame of page.frames()) {
+      const u = frame.url() || "";
+      const n = frame.name() || "";
+      if (!(/challenges\.cloudflare\.com|turnstile/i.test(u) || /^cf-chl-widget/i.test(n))) continue;
+      const el = await frame.frameElement().catch(() => null);
       if (!el) continue;
-      const r = el.getBoundingClientRect();
-      if (r.width < 50 || r.height < 20) continue;
-      return {
-        found: sel,
-        left: Math.round(r.left),
-        top: Math.round(r.top),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
-      };
+      await el.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
+      const box = await el.boundingBox().catch(() => null);
+      if (box && box.width >= 50 && box.height >= 20) {
+        return { found: `frame:${n || u.slice(0, 40)}`, left: Math.round(box.x), top: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+      }
     }
     return null;
-  });
+  };
 
-  if (!coords) {
-    return { content: [{ type: "text", text: "Turnstile widget not found — selector miss. Likely a Managed Challenge interstitial (use mcp-stealth-chrome) or widget hasn't rendered yet (try wait_render_ms=3000)." }] };
+  // Success signal: Turnstile injects the solved token into a hidden response field
+  // (in the host page light DOM). Non-trivial length => solved.
+  const isSolved = async (): Promise<boolean> => {
+    return await page.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll(
+        'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"]'
+      )) as HTMLInputElement[];
+      return inputs.some((i) => (i.value || "").length > 20);
+    }).catch(() => false);
+  };
+
+  // Poll for the widget to render (~6s).
+  let coords: TSCoords | null = null;
+  for (let i = 0; i < 12 && !coords; i++) {
+    coords = await locate();
+    if (!coords) await page.waitForTimeout(500);
   }
 
-  const targetX = coords.left + offset_x;
-  const targetY = coords.top + (offset_y ?? Math.floor(coords.height / 2));
+  // Idempotent: if already solved, never click (a re-click can reset a solved widget).
+  if (await isSolved()) {
+    return { content: [{ type: "text", text: "Turnstile already solved (token present) — no click needed." }] };
+  }
 
-  // Single pre-drift then direct click (matches stealth-chrome's pattern).
-  // Camoufox's humanize layer handles path curvature + timing automatically,
-  // so extra Bezier hops would be redundant and slow (~3s extra).
-  await page.mouse.move(targetX + 180, targetY - 80, { steps: 15 });
-  await page.waitForTimeout(150);
-  await page.mouse.click(targetX, targetY);
+  if (!coords) {
+    return { content: [{ type: "text", text: "Turnstile widget not found — selector + frame-API both missed. Likely a Managed Challenge interstitial (use mcp-stealth-chrome) or not rendered yet (retry with wait_render_ms=3000)." }] };
+  }
 
-  return { content: [{ type: "text", text: `clicked Turnstile at (${targetX},${targetY}) — widget found via ${coords.found} (${coords.width}x${coords.height})` }] };
+  // Click with retries. Each attempt re-locates (widget can shift), applies a tiny
+  // vertical nudge, then polls the token up to ~4s — so we break the instant it
+  // solves and avoid re-clicking an already-solved widget.
+  let solved = false;
+  let lastTarget = "";
+  const attempts = Math.max(1, max_attempts);
+  for (let attempt = 0; attempt < attempts && !solved; attempt++) {
+    const fresh = await locate();
+    if (fresh) coords = fresh;
+    if (!coords) break;
+    const nudge = attempt === 0 ? 0 : (attempt % 2 === 1 ? -6 : 6);
+    const targetX = coords.left + offset_x;
+    const targetY = coords.top + (offset_y ?? Math.floor(coords.height / 2)) + nudge;
+    lastTarget = `${targetX},${targetY}`;
+
+    // Single pre-drift from off-target, then direct real-mouse click. Camoufox's
+    // humanize layer handles path curvature + timing; extra Bezier hops are redundant.
+    await page.mouse.move(targetX + 180, targetY - 80, { steps: 15 });
+    await page.waitForTimeout(150);
+    await page.mouse.click(targetX, targetY);
+
+    for (let j = 0; j < 8 && !solved; j++) {
+      await page.waitForTimeout(500);
+      solved = await isSolved();
+    }
+  }
+
+  return { content: [{ type: "text", text: `Turnstile ${solved ? "SOLVED ✓" : "clicked but token not detected"} at (${lastTarget}) via ${coords?.found ?? "?"}${solved ? "" : " — if still unsolved it may be a Managed Challenge (use mcp-stealth-chrome) or needs a screenshot to confirm 'Success!'"}` }] };
 });
 
 server.tool("drag_and_drop", "Drag from one element to another.", {
