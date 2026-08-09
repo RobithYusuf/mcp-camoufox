@@ -1,7 +1,12 @@
 // Test click_turnstile with EXPANDED selector set to handle nopecha page.
 import { Camoufox } from "camoufox-js";
+import { mkdirSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 
 const URL = process.argv[2] || "https://nopecha.com/demo/turnstile";
+const SHOTS = join(homedir(), ".camoufox-mcp", "screenshots");
+mkdirSync(SHOTS, { recursive: true });
 
 const ctx = await Camoufox({
   headless: false,
@@ -52,7 +57,7 @@ const coords = await page.evaluate(() => {
 
 console.log("[*] widget:", coords);
 if (!coords) {
-  await page.screenshot({ path: "/Users/macbook/.camoufox-mcp/screenshots/cf-nowidget.png" });
+  await page.screenshot({ path: join(SHOTS, "cf-nowidget.png") });
   await ctx.close();
   process.exit(1);
 }
@@ -75,6 +80,6 @@ for (let i = 0; i < 20; i++) {
   if (state.tokenSet || state.hasSuccess) { verified = true; console.log(`[*] verified after ${Date.now() - t1}ms (success=${state.hasSuccess}, token=${state.tokenSet})`); break; }
 }
 
-await page.screenshot({ path: "/Users/macbook/.camoufox-mcp/screenshots/cf-demo-result.png" });
+await page.screenshot({ path: join(SHOTS, "cf-demo-result.png") });
 console.log(`[ok] result: ${verified ? "PASS ✅" : "FAIL ❌"}  total: ${Date.now() - t0}ms`);
 await ctx.close();

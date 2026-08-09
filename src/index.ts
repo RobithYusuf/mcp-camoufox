@@ -45,6 +45,14 @@ function getPage(): Page {
 import { mkdirSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { createHmac } from "crypto";
+import { createRequire } from "module";
+
+// Real package version — read at runtime so the MCP handshake never drifts from
+// package.json (npm always ships package.json next to dist/).
+const PKG_VERSION: string = (() => {
+  try { return createRequire(import.meta.url)("../package.json").version || "0.0.0"; }
+  catch { return "0.0.0"; }
+})();
 
 // Shared default timeout for element actions (click/fill/check/etc.).
 const ACTION_TIMEOUT = 5000;
@@ -53,6 +61,54 @@ function ensureDirs() {
   mkdirSync(PROFILE_DIR, { recursive: true });
   mkdirSync(SCREENSHOT_DIR, { recursive: true });
 }
+
+// Safely embed a JS string literal inside an evaluate() source string. Manual
+// quote-escaping breaks on backslashes/newlines/quotes; JSON.stringify doesn't.
+function jsStr(s: string): string {
+  return JSON.stringify(s ?? "");
+}
+
+// Expand a leading ~ only (a bare .replace("~", HOME) would rewrite a tilde
+// anywhere in the path, e.g. "/tmp/a~b.json").
+function expandHome(p: string): string {
+  if (p === "~") return HOME_DIR;
+  if (p.startsWith("~/")) return HOME_DIR + p.slice(1);
+  return p;
+}
+
+// Expand ~, create the parent directory, return the absolute target path.
+function resolveOutPath(p: string): string {
+  const target = expandHome(p);
+  const dir = target.substring(0, target.lastIndexOf("/"));
+  if (dir) mkdirSync(dir, { recursive: true });
+  return target;
+}
+
+// Runs before every page script on every navigation — populates the buffer that
+// get_page_errors reads. Without this the tool always returned [].
+const ERROR_HOOK_JS = `(() => {
+  if (window.__mcp_errors) return;
+  window.__mcp_errors = [];
+  var push = function (e) { if (window.__mcp_errors.length < 100) window.__mcp_errors.push(e); };
+  window.addEventListener('error', function (ev) {
+    push({
+      type: 'error',
+      message: String(ev.message || '').slice(0, 300),
+      source: String(ev.filename || '').slice(0, 200),
+      line: ev.lineno || 0,
+      col: ev.colno || 0,
+      stack: ev.error && ev.error.stack ? String(ev.error.stack).slice(0, 500) : '',
+    });
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    var r = ev.reason;
+    push({
+      type: 'unhandledrejection',
+      message: String((r && (r.message || r)) || '').slice(0, 300),
+      stack: r && r.stack ? String(r.stack).slice(0, 500) : '',
+    });
+  });
+})()`;
 
 // Base32 decode (RFC 4648) — for TOTP secrets used by login_classic
 function base32Decode(s: string): Buffer {
@@ -83,17 +139,134 @@ function totpFromSecret(secret: string, step = 30, digits = 6): string {
   return (code % 10 ** digits).toString().padStart(digits, "0");
 }
 
-// Click a locator, falling back to a JS .click() when an overlay blocks the
-// real pointer event (same pattern every click tool in this file uses).
-async function clickWithFallback(loc: any): Promise<void> {
-  try { await loc.click({ timeout: ACTION_TIMEOUT }); }
-  catch { await loc.evaluate((el: any) => el.click()); }
+// Click a locator, falling back to synthetic events when Playwright's
+// actionability check fails (overlay, moving element, portal that just mounted).
+//
+// Returns which path was used so callers can SAY SO. The old version fell back
+// to a bare el.click() and still reported "Clicked" — pointer-driven widgets
+// (Radix, Headless UI, MUI) ignore that entirely, so a blocked click looked
+// successful while nothing happened. The fallback now replays the full pointer
+// sequence, and the mode is surfaced to the caller either way.
+type ClickMode = "real" | "fallback";
+async function clickWithFallback(
+  loc: any,
+  opts?: { button?: "left" | "right" | "middle"; dblclick?: boolean },
+): Promise<ClickMode> {
+  const button = opts?.button || "left";
+  try {
+    if (opts?.dblclick) await loc.dblclick({ button, timeout: ACTION_TIMEOUT });
+    else await loc.click({ button, timeout: ACTION_TIMEOUT });
+    return "real";
+  } catch {
+    await loc.evaluate((el: any) => {
+      const r = el.getBoundingClientRect();
+      const base: any = {
+        bubbles: true, cancelable: true, composed: true, view: window,
+        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+        button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true,
+      };
+      const PE = (window as any).PointerEvent || MouseEvent;
+      el.dispatchEvent(new PE("pointerover", { ...base, buttons: 0 }));
+      el.dispatchEvent(new MouseEvent("mouseover", { ...base, buttons: 0 }));
+      el.dispatchEvent(new PE("pointerdown", { ...base, buttons: 1 }));
+      el.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+      if (typeof el.focus === "function") { try { el.focus(); } catch {} }
+      el.dispatchEvent(new PE("pointerup", { ...base, buttons: 0 }));
+      el.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+      // el.click() (not a synthetic click event) so default actions — anchor
+      // navigation, form submit, label activation — still happen.
+      if (typeof el.click === "function") el.click();
+    }, undefined, { timeout: ACTION_TIMEOUT });
+    return "fallback";
+  }
+}
+
+// Suffix appended to every click result so a degraded click is never silent.
+function clickNote(mode: ClickMode): string {
+  return mode === "real"
+    ? ""
+    : " ⚠ real mouse click was blocked (overlay / actionability) — used synthetic pointer-event fallback. VERIFY the effect; if the widget ignores it, dismiss the blocker first or use mouse_click_xy.";
+}
+
+// Fill that really REPLACES the existing value.
+// Playwright's fill() types into "text-like" inputs after a select-all. In
+// Camoufox/Firefox that select-all is a no-op on input[type=email] and
+// input[type=number] (Firefox restricts the selection APIs on those types), so a
+// fill over a non-empty field APPENDS — e.g. re-filling an email field yields
+// "old@x.comnew@x.com". Clearing first makes fill deterministic for every type.
+async function fillLocator(loc: any, value: string): Promise<void> {
+  try {
+    await loc.evaluate((el: any) => {
+      if (el && typeof el.value === "string" && el.value !== "") {
+        el.value = "";
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }, undefined, { timeout: ACTION_TIMEOUT });
+  } catch {}
+  await loc.fill(value, { timeout: ACTION_TIMEOUT });
 }
 
 // Locator for a snapshot ref (data-mcp-ref). Centralizes the selector so the
 // ref scheme lives in exactly one place.
 function refLocator(page: Page, ref: string) {
   return page.locator(`[data-mcp-ref="${ref}"]`).first();
+}
+
+// Search root for text/role/label lookups, so a click can be confined to the
+// dialog the user is actually looking at instead of matching the whole page.
+//   ""        → whole page
+//   "@dialog" → topmost visible dialog/modal
+//   "ref:e5"  → a snapshot ref
+//   otherwise → CSS selector
+function scopeRoot(page: Page, within?: string): any {
+  const w = (within || "").trim();
+  if (!w) return page;
+  if (w === "@dialog") {
+    return page.locator('[role="dialog"], dialog[open], [aria-modal="true"]').filter({ visible: true }).last();
+  }
+  if (w.startsWith("ref:")) return refLocator(page, w.slice(4));
+  return page.locator(w).first();
+}
+
+// Tag up to `cap` matches with fresh refs and describe each (tag, text, ancestor
+// path). Used to answer "which one did you mean?" instead of guessing.
+async function describeMatches(loc: any, cap = 8): Promise<{ total: number; items: any[] }> {
+  const all = await loc.all();
+  const items: any[] = [];
+  for (let i = 0; i < Math.min(all.length, cap); i++) {
+    const info = await all[i].evaluate((el: any, idx: number) => {
+      const ref = "m" + Date.now().toString(36) + "_" + idx;
+      el.setAttribute("data-mcp-ref", ref);
+      const parts: string[] = [];
+      let e: any = el;
+      for (let d = 0; e && d < 4; d++, e = e.parentElement) {
+        let s = e.tagName ? e.tagName.toLowerCase() : "?";
+        if (e.id) s += "#" + e.id;
+        else if (e.getAttribute && e.getAttribute("role")) s += "[role=" + e.getAttribute("role") + "]";
+        else if (typeof e.className === "string" && e.className.trim()) s += "." + e.className.trim().split(/\s+/)[0];
+        parts.unshift(s);
+      }
+      const r = el.getBoundingClientRect();
+      return {
+        ref, index: idx,
+        tag: el.tagName.toLowerCase(),
+        role: el.getAttribute("role") || "",
+        text: (el.innerText || el.value || "").trim().slice(0, 60),
+        path: parts.join(" > "),
+        visible: r.width > 0 && r.height > 0,
+        at: `${Math.round(r.x)},${Math.round(r.y)}`,
+      };
+    }, i, { timeout: ACTION_TIMEOUT }).catch(() => null);
+    if (info) items.push(info);
+  }
+  return { total: all.length, items };
+}
+
+function candidateList(total: number, items: any[]): string {
+  const lines = items.map(c =>
+    `  index=${c.index} ref=${c.ref}  [${c.tag}${c.role ? ` role=${c.role}` : ""}] "${c.text}"  at ${c.at}${c.visible ? "" : " (hidden)"}\n      in: ${c.path}`);
+  const more = total > items.length ? `\n  … ${total - items.length} more` : "";
+  return lines.join("\n") + more;
 }
 
 // Track a page in the global pages[] list and auto-remove it on close.
@@ -227,7 +400,7 @@ async function snapshotPage(
 
 const server = new McpServer({
   name: "camoufox-browser",
-  version: "0.2.0",
+  version: PKG_VERSION,
 });
 
 // ── Tools: Browser Lifecycle ───────────────────────────────────────────────
@@ -295,7 +468,7 @@ server.tool(
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
         await page.waitForTimeout(1500);
       }
-      return { content: [{ type: "text", text: `Already running. Navigated to: ${page.url()}` }] };
+      return { content: [{ type: "text", text: `Already running — launch options (headless/humanize/geoip/locale/size/fresh_profile) were IGNORED; call browser_close first to relaunch with new options. Navigated to: ${page.url()}` }] };
     }
 
     ensureDirs();
@@ -339,6 +512,9 @@ server.tool(
     }
 
     browserContext = ctx;
+    // Page-error hook must be installed before the first navigation so
+    // get_page_errors has something to read (it runs on every page load).
+    try { await ctx.addInitScript(ERROR_HOOK_JS); } catch {}
     activeProfileDir = profileDir;
     activeProfileIsTemp = isTemp;
     pages = [];
@@ -369,10 +545,22 @@ server.tool(
     "If the launch used fresh_profile=true, the temp profile is removed.",
   {},
   async () => {
+    // Say what actually persists. "Profile saved" alone was misleading: session
+    // cookies (no expiry) live in memory and die here, which reads as "the
+    // profile lost my login".
+    let cookieNote = "";
+    if (browserContext) {
+      try {
+        const cookies = await browserContext.cookies();
+        const session = cookies.filter((c: any) => !c.expires || c.expires <= 0).length;
+        const persisted = cookies.length - session;
+        cookieNote = ` Cookies: ${persisted} persisted, ${session} session-only (dropped — standard browser behaviour; use cookie_set(expires_days=…) or storage_state_save to keep a login).`;
+      } catch {}
+    }
     if (browserContext) {
       try { await browserContext.close(); } catch {}
     }
-    let note = "Profile saved.";
+    let note = "Profile saved." + cookieNote;
     if (activeProfileIsTemp && activeProfileDir) {
       try {
         rmSync(activeProfileDir, { recursive: true, force: true });
@@ -488,16 +676,45 @@ server.tool(
 
 server.tool(
   "screenshot",
-  "Take a screenshot of the current page.",
+  "Screenshot the page, or a single element with ref/selector (great for documenting one modal). " +
+    "Returns the IMAGE inline — no second Read call — plus the saved path. Set return_image=false for path only.",
   {
     name: z.string().default("page").describe("Filename prefix"),
-    full_page: z.boolean().default(false).describe("Full scrollable page"),
+    full_page: z.boolean().default(false).describe("Full scrollable page (ignored when ref/selector is set)"),
+    ref: z.string().default("").describe("Snapshot ref — capture just that element."),
+    selector: z.string().default("").describe("CSS selector — capture just that element (ignored if ref is set)."),
+    return_image: z.boolean().default(true).describe("Embed the PNG in the response. false = only save to disk."),
   },
-  async ({ name, full_page }) => {
+  async ({ name, full_page, ref, selector, return_image }) => {
     const page = getPage();
     const path = join(SCREENSHOT_DIR, `${name}.png`);
-    await page.screenshot({ path, fullPage: full_page });
-    return { content: [{ type: "text", text: `Screenshot saved: ${path}\nURL: ${page.url()}` }] };
+    let buf: Buffer;
+    let what = full_page ? "full page" : "viewport";
+    if (ref || selector) {
+      const loc = ref ? refLocator(page, ref) : page.locator(selector).first();
+      if (await loc.count() === 0) {
+        return { content: [{ type: "text", text: `No element for ${ref ? `ref=${ref}` : `selector=${selector}`} — nothing to capture.` }], isError: true };
+      }
+      try { await loc.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT }); } catch {}
+      buf = await loc.screenshot({ path, timeout: 15000 });
+      what = ref ? `element ref=${ref}` : `element ${selector}`;
+    } else {
+      buf = await page.screenshot({ path, fullPage: full_page });
+    }
+    const info = `Screenshot (${what}) saved: ${path}\nURL: ${page.url()}  (${Math.round(buf.length / 1024)} KB)`;
+    // Very large captures (long full_page shots) stay on disk only — an
+    // oversized inline payload is worse than a path.
+    const MAX_INLINE = 6_000_000;
+    if (!return_image || buf.length > MAX_INLINE) {
+      const why = return_image ? " — too large to inline, read the file if you need to see it" : "";
+      return { content: [{ type: "text", text: info + why }] };
+    }
+    return {
+      content: [
+        { type: "image", data: buf.toString("base64"), mimeType: "image/png" },
+        { type: "text", text: info },
+      ],
+    };
   }
 );
 
@@ -513,55 +730,89 @@ server.tool(
   },
   async ({ ref, button, dblclick }) => {
     const page = getPage();
-    const loc = refLocator(page, ref);
-    try {
-      if (dblclick) await loc.dblclick({ button, timeout: ACTION_TIMEOUT });
-      else await loc.click({ button, timeout: ACTION_TIMEOUT });
-    } catch {
-      await loc.evaluate((el: any) => el.click());
-    }
+    const mode = await clickWithFallback(refLocator(page, ref), { button, dblclick });
     await page.waitForTimeout(1000);
-    return { content: [{ type: "text", text: `Clicked ref=${ref}. URL: ${page.url()}` }] };
+    return { content: [{ type: "text", text: `Clicked ref=${ref}. URL: ${page.url()}${clickNote(mode)}` }] };
   }
 );
 
 server.tool(
   "click_text",
-  "Click element by visible text.",
+  "Click element by visible text. If the text matches several elements it FAILS with a numbered candidate list instead of silently clicking the first one — " +
+    'narrow with within ("@dialog", a CSS selector, or "ref:e5") or pick one with index.',
   {
     text: z.string().describe("Visible text"),
     exact: z.boolean().default(true),
+    within: z.string().default("").describe('Limit the search: "@dialog" = topmost modal, "ref:e5" = inside a snapshot ref, or any CSS selector.'),
+    index: z.number().default(-1).describe("Which match to click when several match (0-based). -1 = require a unique match."),
   },
-  async ({ text, exact }) => {
+  async ({ text, exact, within, index }) => {
     const page = getPage();
-    const loc = page.getByText(text, { exact }).first();
-    if (await loc.count() === 0) {
-      return { content: [{ type: "text", text: `No element matched text='${text}' (exact=${exact}). Current URL: ${page.url()}. Try exact=false, browser_snapshot, or click_role.` }], isError: true };
+    const scope = within ? ` within=${within}` : "";
+    let loc: any;
+    try {
+      loc = scopeRoot(page, within).getByText(text, { exact });
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Invalid within=${within}: ${e?.message || e}` }], isError: true };
     }
-    await clickWithFallback(loc);
+    const n = await loc.count();
+    if (n === 0) {
+      return { content: [{ type: "text", text: `No element matched text='${text}' (exact=${exact})${scope}. Current URL: ${page.url()}. Try exact=false, a different within, browser_snapshot, or click_role.` }], isError: true };
+    }
+    if (n > 1 && index < 0) {
+      const { total, items } = await describeMatches(loc);
+      return {
+        content: [{ type: "text", text: `Ambiguous: text='${text}'${scope} matches ${total} elements — refusing to guess (clicking the wrong one can be destructive).\n${candidateList(total, items)}\n\nRe-run with index=N, add within="@dialog"/CSS, or click(ref=…) using a ref above.` }],
+        isError: true,
+      };
+    }
+    if (index >= n) {
+      return { content: [{ type: "text", text: `index=${index} out of range — only ${n} match(es) for text='${text}'${scope}.` }], isError: true };
+    }
+    const target = index >= 0 ? loc.nth(index) : loc.first();
+    const mode = await clickWithFallback(target);
     await page.waitForTimeout(1000);
-    return { content: [{ type: "text", text: `Clicked text='${text}'. URL: ${page.url()}` }] };
+    return { content: [{ type: "text", text: `Clicked text='${text}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}. URL: ${page.url()}${clickNote(mode)}` }] };
   }
 );
 
 server.tool(
   "click_role",
-  "Click element by ARIA role and name.",
+  "Click element by ARIA role and name. Same ambiguity guard as click_text: several matches → candidate list, not a guess.",
   {
     role: z.string().describe("ARIA role (button, link, textbox, etc.)"),
     name: z.string().default("").describe("Accessible name"),
+    within: z.string().default("").describe('Limit the search: "@dialog", "ref:e5", or a CSS selector.'),
+    index: z.number().default(-1).describe("Which match to click when several match (0-based). -1 = require a unique match."),
   },
-  async ({ role, name: ariaName }) => {
+  async ({ role, name: ariaName, within, index }) => {
     const page = getPage();
-    const loc = ariaName
-      ? page.getByRole(role as any, { name: ariaName, exact: true }).first()
-      : page.getByRole(role as any).first();
-    if (await loc.count() === 0) {
-      return { content: [{ type: "text", text: `No element matched role=${role} name='${ariaName}'. Current URL: ${page.url()}. Try browser_snapshot or click_text.` }], isError: true };
+    const scope = within ? ` within=${within}` : "";
+    let loc: any;
+    try {
+      const root = scopeRoot(page, within);
+      loc = ariaName ? root.getByRole(role as any, { name: ariaName, exact: true }) : root.getByRole(role as any);
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Invalid within=${within}: ${e?.message || e}` }], isError: true };
     }
-    await clickWithFallback(loc);
+    const n = await loc.count();
+    if (n === 0) {
+      return { content: [{ type: "text", text: `No element matched role=${role} name='${ariaName}'${scope}. Current URL: ${page.url()}. Try browser_snapshot or click_text.` }], isError: true };
+    }
+    if (n > 1 && index < 0) {
+      const { total, items } = await describeMatches(loc);
+      return {
+        content: [{ type: "text", text: `Ambiguous: role=${role} name='${ariaName}'${scope} matches ${total} elements — refusing to guess.\n${candidateList(total, items)}\n\nRe-run with index=N, add within=…, or click(ref=…).` }],
+        isError: true,
+      };
+    }
+    if (index >= n) {
+      return { content: [{ type: "text", text: `index=${index} out of range — only ${n} match(es) for role=${role} name='${ariaName}'${scope}.` }], isError: true };
+    }
+    const target = index >= 0 ? loc.nth(index) : loc.first();
+    const mode = await clickWithFallback(target);
     await page.waitForTimeout(1000);
-    return { content: [{ type: "text", text: `Clicked role=${role} name='${ariaName}'. URL: ${page.url()}` }] };
+    return { content: [{ type: "text", text: `Clicked role=${role} name='${ariaName}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}. URL: ${page.url()}${clickNote(mode)}` }] };
   }
 );
 
@@ -573,12 +824,12 @@ server.tool("hover", "Hover over element by ref ID.", {
   return { content: [{ type: "text", text: `Hovered ref=${ref}` }] };
 });
 
-server.tool("fill", "Fill input/textarea by ref ID. Clears existing content.", {
+server.tool("fill", "Fill input/textarea by ref ID. Always replaces existing content (email/number inputs are cleared explicitly first — Firefox's select-all is a no-op on those, which would otherwise append).", {
   ref: z.string().describe("Element ref"),
   value: z.string().describe("Text to fill"),
 }, async ({ ref, value }) => {
   const page = getPage();
-  await refLocator(page, ref).fill(value, { timeout: ACTION_TIMEOUT });
+  await fillLocator(refLocator(page, ref), value);
   return { content: [{ type: "text", text: `Filled ref=${ref} with '${value.slice(0, 50)}'` }] };
 });
 
@@ -815,14 +1066,20 @@ server.tool("tab_close", "Close a tab by index (-1 = active), or by url_contains
   if (idx < 0 || idx >= pages.length) {
     return { content: [{ type: "text", text: `Invalid index.` }] };
   }
+  // Remember the active page by IDENTITY before splicing — closing a
+  // lower-indexed tab shifts every later index down, so a plain
+  // Math.min(activePage, len-1) would silently move "active" to another tab.
+  const activeObj = pages[activePage];
   const page = pages.splice(idx, 1)[0];
   try { await page.close(); } catch {}
   if (pages.length === 0) {
     activePage = 0;
     return { content: [{ type: "text", text: "Last tab closed." }] };
   }
-  activePage = Math.min(activePage, pages.length - 1);
-  return { content: [{ type: "text", text: `Closed tab [${idx}]. Active: [${activePage}]` }] };
+  const reFound = pages.indexOf(activeObj);
+  // If we closed the active tab itself, fall back to whatever took its slot.
+  activePage = reFound >= 0 ? reFound : Math.min(idx, pages.length - 1);
+  return { content: [{ type: "text", text: `Closed tab [${idx}]. Active: [${activePage}] ${pages[activePage].url()}` }] };
 });
 
 // ── Tools: Cookies ─────────────────────────────────────────────────────────
@@ -837,13 +1094,31 @@ server.tool("cookie_list", "List cookies.", {
   return { content: [{ type: "text", text: lines.length ? `Cookies (${cookies.length}):\n${lines.join("\n")}` : "No cookies." }] };
 });
 
-server.tool("cookie_set", "Set a cookie.", {
-  name: z.string(), value: z.string(), domain: z.string(), path: z.string().default("/"),
-}, async ({ name, value, domain, path }) => {
-  if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
-  await browserContext.addCookies([{ name, value, domain, path }]);
-  return { content: [{ type: "text", text: `Cookie set: ${name}=${value.slice(0, 40)} domain=${domain}` }] };
-});
+server.tool("cookie_set",
+  "Set a cookie. IMPORTANT: with expires_days=0 this creates a SESSION cookie, which Firefox keeps in memory only — " +
+  "it is gone after browser_close even though the profile itself persists. Pass expires_days (e.g. 30) to write a " +
+  "login session that survives a relaunch.",
+  {
+    name: z.string(), value: z.string(), domain: z.string(), path: z.string().default("/"),
+    expires_days: z.number().default(0).describe("Lifetime in days. 0 = session cookie (dies with the browser)."),
+    http_only: z.boolean().default(false).describe("Set the HttpOnly flag (hides it from page JS, like a real auth cookie)."),
+    secure: z.boolean().default(false).describe("Set the Secure flag (HTTPS only). Required when same_site='None'."),
+    same_site: z.enum(["Lax", "Strict", "None"]).default("Lax"),
+  },
+  async ({ name, value, domain, path, expires_days, http_only, secure, same_site }) => {
+    if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
+    const cookie: any = { name, value, domain, path, httpOnly: http_only, secure, sameSite: same_site };
+    // Playwright: expires is epoch SECONDS; -1 (or omitted) means session cookie.
+    if (expires_days > 0) cookie.expires = Math.floor(Date.now() / 1000 + expires_days * 86400);
+    if (same_site === "None" && !secure) {
+      return { content: [{ type: "text", text: "same_site='None' requires secure=true — browsers reject SameSite=None without Secure." }], isError: true };
+    }
+    await browserContext.addCookies([cookie]);
+    const life = expires_days > 0
+      ? `expires in ${expires_days}d (survives browser_close)`
+      : "SESSION cookie — will be LOST on browser_close; pass expires_days to persist";
+    return { content: [{ type: "text", text: `Cookie set: ${name}=${value.slice(0, 40)} domain=${domain} — ${life}` }] };
+  });
 
 server.tool("cookie_delete", "Delete cookies. Both empty = clear all.", {
   name: z.string().default(""), domain: z.string().default(""),
@@ -867,16 +1142,27 @@ server.tool("cookie_delete", "Delete cookies. Both empty = clear all.", {
 
 // ── Tools: Dialog ──────────────────────────────────────────────────────────
 
-server.tool("dialog_handle", "Set handler for next alert/confirm/prompt.", {
+server.tool("dialog_handle", "Set handler for the next alert/confirm/prompt on ANY open tab (first dialog wins, handler then clears).", {
   action: z.enum(["accept", "dismiss"]).default("accept"),
   prompt_text: z.string().default(""),
 }, async ({ action, prompt_text }) => {
-  const page = getPage();
-  page.once("dialog", async (dialog: Dialog) => {
-    if (action === "accept") await dialog.accept(prompt_text);
-    else await dialog.dismiss();
-  });
-  return { content: [{ type: "text", text: `Next dialog will be ${action}'d` }] };
+  if (!pages.length) throw new Error("Browser not running. Call browser_launch first.");
+  // Arm every tab, not just the active one — a dialog can fire on a popup the
+  // site opened. The first dialog disarms all tabs; later dialogs get
+  // Playwright's default auto-dismiss instead of hanging the page.
+  const armed = pages.slice();
+  let used = false;
+  const handler = async (dialog: Dialog) => {
+    if (used) { try { await dialog.dismiss(); } catch {} return; }
+    used = true;
+    for (const p of armed) { try { p.off("dialog", handler); } catch {} }
+    try {
+      if (action === "accept") await dialog.accept(prompt_text);
+      else await dialog.dismiss();
+    } catch {}
+  };
+  for (const p of armed) p.on("dialog", handler);
+  return { content: [{ type: "text", text: `Next dialog will be ${action}'d (armed on ${armed.length} tab(s))` }] };
 });
 
 // ── Tools: File Upload ─────────────────────────────────────────────────────
@@ -888,6 +1174,122 @@ server.tool("upload_file", "Upload file to file input.", {
   await refLocator(page, ref).setInputFiles(file_path, { timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Uploaded ${file_path} to ref=${ref}` }] };
 });
+
+// ── Tool: ChatGPT image generation (high-level, end-to-end) ──────────────────
+server.tool(
+  "chatgpt_generate_image",
+  "Generate or edit an image on chatgpt.com end-to-end and save it to disk in ONE call. Opens a fresh chat, optionally uploads reference images (e.g. a brand logo), submits the prompt, waits for the generated image to finish, then writes the result PNG to output_path. Requires an authenticated chatgpt.com session (import cookies first via cookie_import). Returns the saved path and pixel dimensions. Note: chatgpt image generation is slow (~60-120s) — set timeout_ms accordingly.",
+  {
+    prompt: z.string().describe("Text prompt for image generation/editing."),
+    output_path: z.string().describe("Absolute path to write the resulting PNG."),
+    image_paths: z.array(z.string()).default([]).describe("Optional reference image file paths to upload before prompting (e.g. a logo)."),
+    timeout_ms: z.number().default(240000).describe("Max ms to wait for the generated image."),
+  },
+  async ({ prompt, output_path, image_paths, timeout_ms }) => {
+    const page = getPage();
+    // 1) fresh chat
+    await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForSelector("#prompt-textarea", { timeout: 30000 });
+    // dismiss blocking modals (e.g. subscription-failure) that intercept clicks
+    try { await page.evaluate(`(() => { const m = document.getElementById('modal-subscription-failure'); if (m) m.remove(); document.querySelectorAll('div[data-state="open"].z-50').forEach(e => e.remove()); })()`); } catch {}
+    try { await page.keyboard.press("Escape"); } catch {}
+    // 2) upload reference images (e.g. logo) to the hidden file input
+    if (image_paths.length > 0) {
+      await page.locator('input[type="file"]').first().setInputFiles(image_paths, { timeout: ACTION_TIMEOUT });
+      await page.waitForTimeout(2500); // let thumbnails attach
+    }
+    // 3) type prompt + submit
+    const editor = page.locator("#prompt-textarea");
+    await editor.click();
+    await page.keyboard.insertText(prompt);
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Enter");
+    // 4) wait for a finished assistant image (>=1000px, loaded)
+    const READY = `(() => { const imgs = Array.from(document.querySelectorAll('main img')).filter(i => !i.closest('[data-message-author-role="user"]')); return imgs.some(i => i.complete && i.naturalWidth >= 1000 && i.naturalHeight >= 1000); })()`;
+    await page.waitForFunction(READY, undefined, { timeout: timeout_ms, polling: 2000 });
+    // 5) settle until the largest image src stops changing (preview -> final)
+    let lastSrc = "";
+    for (let i = 0; i < 8; i++) {
+      await page.waitForTimeout(2500);
+      const cur = await page.evaluate(`(() => { const imgs = Array.from(document.querySelectorAll('main img')).filter(i => !i.closest('[data-message-author-role="user"]')).filter(i => i.complete && i.naturalWidth >= 1000); imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight)); return imgs[0] ? imgs[0].src : ""; })()`) as string;
+      if (cur && cur === lastSrc) break;
+      lastSrc = cur;
+    }
+    // 6) fetch the largest assistant image as a data URL, write to disk
+    const dataUrl = await page.evaluate(`(async () => { const imgs = Array.from(document.querySelectorAll('main img')).filter(i => !i.closest('[data-message-author-role="user"]')).filter(i => i.complete && i.naturalWidth >= 1000); imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight)); const big = imgs[0]; if (!big) return null; const r = await fetch(big.src); const b = await r.blob(); return await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(b); }); })()`) as string | null;
+    if (!dataUrl || typeof dataUrl !== "string" || dataUrl.indexOf(",") < 0) {
+      throw new Error("Generated image not found / could not be fetched after wait.");
+    }
+    const dims = await page.evaluate(`(() => { const imgs = Array.from(document.querySelectorAll('main img')).filter(i => !i.closest('[data-message-author-role="user"]')).filter(i => i.complete && i.naturalWidth >= 1000); imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight)); const big = imgs[0]; return big ? (big.naturalWidth + "x" + big.naturalHeight) : "?"; })()`) as string;
+    const buf = Buffer.from(dataUrl.split(",")[1], "base64");
+    const target = resolveOutPath(output_path);
+    writeFileSync(target, buf);
+    return { content: [{ type: "text", text: `Saved ${target} (${dims}, ${buf.length} bytes)` }] };
+  }
+);
+
+server.tool(
+  "chatgpt_generate_batch",
+  "Generate MANY images on chatgpt.com IN PARALLEL (one tab per job, fire-all-then-collect) and save each to disk. Submits every job first WITHOUT waiting, then waits for all generations concurrently — far faster than sequential. For a CONSISTENT feed set, pass shared_image_paths (e.g. [logo] and/or a style-reference image like a previously-generated hero) uploaded to EVERY tab, plus style_suffix (a shared style spec) appended to every prompt. Requires an authenticated chatgpt.com session (import cookies first). Returns per-job results (saved path / ok / bytes / error).",
+  {
+    jobs: z.array(z.object({ prompt: z.string(), output_path: z.string() })).describe("Per-image jobs: each has a prompt and an output PNG path."),
+    shared_image_paths: z.array(z.string()).default([]).describe("Reference images uploaded to EVERY tab (e.g. [logoPath, styleRefPath]) — key for visual consistency."),
+    style_suffix: z.string().default("").describe("Shared style spec text appended to every prompt (exact colors, typography, layout, mood) for consistency."),
+    timeout_ms: z.number().default(300000).describe("Max ms to wait for each image to finish."),
+    stagger_ms: z.number().default(900).describe("Delay between submitting each tab (avoids UI/anti-bot races)."),
+  },
+  async ({ jobs, shared_image_paths, style_suffix, timeout_ms, stagger_ms }) => {
+    if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
+    const NOTUSER = `Array.from(document.querySelectorAll('main img')).filter(i => !i.closest('[data-message-author-role="user"]'))`;
+    const submit = async (page: Page, prompt: string) => {
+      await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForSelector("#prompt-textarea", { timeout: 30000 });
+      try { await page.evaluate(`(() => { const m=document.getElementById('modal-subscription-failure'); if(m)m.remove(); document.querySelectorAll('div[data-state="open"].z-50').forEach(e=>e.remove()); })()`); } catch {}
+      if (shared_image_paths.length > 0) {
+        await page.locator('input[type="file"]').first().setInputFiles(shared_image_paths, { timeout: ACTION_TIMEOUT });
+        await page.waitForTimeout(2500);
+      }
+      await page.locator("#prompt-textarea").click();
+      await page.keyboard.insertText(prompt + (style_suffix ? "\n\n" + style_suffix : ""));
+      await page.waitForTimeout(300);
+      await page.keyboard.press("Enter");
+    };
+    const collect = async (page: Page, output_path: string): Promise<number> => {
+      const READY = `(() => { const imgs = ${NOTUSER}; return imgs.some(i => i.complete && i.naturalWidth >= 1000 && i.naturalHeight >= 1000); })()`;
+      await page.waitForFunction(READY, undefined, { timeout: timeout_ms, polling: 2000 });
+      let last = "";
+      for (let i = 0; i < 8; i++) {
+        await page.waitForTimeout(2500);
+        const cur = await page.evaluate(`(() => { const imgs = ${NOTUSER}.filter(i => i.complete && i.naturalWidth >= 1000); imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight)); return imgs[0] ? imgs[0].src : ""; })()`) as string;
+        if (cur && cur === last) break;
+        last = cur;
+      }
+      const dataUrl = await page.evaluate(`(async () => { const imgs = ${NOTUSER}.filter(i => i.complete && i.naturalWidth >= 1000); imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight)); const big = imgs[0]; if (!big) return null; const r = await fetch(big.src); const b = await r.blob(); return await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(b); }); })()`) as string | null;
+      if (!dataUrl || typeof dataUrl !== "string" || dataUrl.indexOf(",") < 0) throw new Error("image not found");
+      const buf = Buffer.from(dataUrl.split(",")[1], "base64");
+      writeFileSync(resolveOutPath(output_path), buf);
+      return buf.length;
+    };
+    // Phase 1: open a tab per job and SUBMIT (staggered), without waiting for generation
+    const entries: { page: Page; output_path: string; submitErr: string | null }[] = [];
+    for (const job of jobs) {
+      const page = await browserContext.newPage();
+      let submitErr: string | null = null;
+      try { await submit(page, job.prompt); } catch (e) { submitErr = String(e); }
+      entries.push({ page, output_path: job.output_path, submitErr });
+      await page.waitForTimeout(stagger_ms);
+    }
+    // Phase 2: wait for ALL generations concurrently + save
+    const results = await Promise.all(entries.map(async (en) => {
+      if (en.submitErr) return { output_path: en.output_path, ok: false, error: "submit: " + en.submitErr };
+      try { const bytes = await collect(en.page, en.output_path); return { output_path: en.output_path, ok: true, bytes }; }
+      catch (e) { return { output_path: en.output_path, ok: false, error: String(e) }; }
+    }));
+    for (const en of entries) { try { await en.page.close(); } catch {} }
+    const okCount = results.filter(r => r.ok).length;
+    return { content: [{ type: "text", text: `Batch done: ${okCount}/${jobs.length} succeeded.\n` + JSON.stringify(results, null, 2) }] };
+  }
+);
 
 // ── Tools: Scroll ──────────────────────────────────────────────────────────
 
@@ -913,6 +1315,7 @@ const consoleMessages: { type: string; text: string }[] = [];
 
 interface NetEntry {
   id: number;
+  ts: number;                        // capture time (ms epoch) — used by export_har
   method: string;
   status: number;
   url: string;                       // full URL (truncated only in list view)
@@ -974,6 +1377,7 @@ server.tool("network_start",
           const req = res.request();
           const entry: NetEntry = {
             id: networkSeq++,
+            ts: Date.now(),
             method: req.method(),
             status: res.status(),
             url: res.url(),
@@ -1008,7 +1412,7 @@ server.tool("network_start",
   });
 
 server.tool("network_get",
-  "List captured network requests (newest first-capped). Each row shows an #id usable with network_get_detail.",
+  "List captured network requests in capture order, keeping the most recent `limit` rows. Each row shows an #id usable with network_get_detail.",
   {
     filter: z.string().default("").describe("Only show requests whose URL contains this substring."),
     limit: z.number().default(50).describe("Max rows to return."),
@@ -1056,12 +1460,26 @@ server.tool("network_get_detail",
 
 // ── Tools: PDF ─────────────────────────────────────────────────────────────
 
-server.tool("save_pdf", "Save page as PDF.", {
-  path: z.string().default(""),
-}, async ({ path: pdfPath }) => {
+server.tool("save_pdf",
+  "Save page as PDF. NOTE: Playwright can only generate PDFs in headless Chromium — Camoufox is Firefox, " +
+  "so this fails by design here. Use screenshot(full_page=true) instead. Kept for API compatibility.",
+  {
+    path: z.string().default(""),
+  }, async ({ path: pdfPath }) => {
   const page = getPage();
-  const target = pdfPath || join(SCREENSHOT_DIR, "page.pdf");
-  await page.pdf({ path: target });
+  const target = pdfPath ? resolveOutPath(pdfPath) : join(SCREENSHOT_DIR, "page.pdf");
+  try {
+    await page.pdf({ path: target });
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (/Headless Chromium|not implemented|not supported/i.test(msg)) {
+      return {
+        content: [{ type: "text", text: "save_pdf is unavailable on Camoufox: Playwright implements PDF generation only for headless Chromium, and Camoufox is a Firefox build. Use screenshot(full_page=true) for a full-page capture instead." }],
+        isError: true,
+      };
+    }
+    throw e;
+  }
   return { content: [{ type: "text", text: `PDF saved: ${target}` }] };
 });
 
@@ -1082,11 +1500,10 @@ server.tool("batch_actions", "Execute multiple actions in one call. Each action:
   for (const action of actions) {
     try {
       if (action.type === "click" && action.ref) {
-        const loc = refLocator(page, action.ref);
-        await clickWithFallback(loc);
-        results.push(`click ${action.ref}: OK`);
+        const mode = await clickWithFallback(refLocator(page, action.ref));
+        results.push(`click ${action.ref}: OK${mode === "fallback" ? " (⚠ synthetic fallback — verify effect)" : ""}`);
       } else if (action.type === "fill" && action.ref && action.value !== undefined) {
-        await refLocator(page, action.ref).fill(action.value, { timeout: ACTION_TIMEOUT });
+        await fillLocator(refLocator(page, action.ref), action.value);
         results.push(`fill ${action.ref}: OK`);
       } else if (action.type === "type" && action.text) {
         await page.keyboard.type(action.text, { delay: 50 });
@@ -1124,14 +1541,12 @@ server.tool("fill_form", "Fill multiple form fields and optionally submit.", {
 }, async ({ fields, submit_ref }) => {
   const page = getPage();
   for (const f of fields) {
-    await refLocator(page, f.ref).fill(f.value, { timeout: ACTION_TIMEOUT });
+    await fillLocator(refLocator(page, f.ref), f.value);
   }
-  if (submit_ref) {
-    const btn = refLocator(page, submit_ref);
-    await clickWithFallback(btn);
-  }
+  let mode: ClickMode = "real";
+  if (submit_ref) mode = await clickWithFallback(refLocator(page, submit_ref));
   await page.waitForTimeout(1000);
-  return { content: [{ type: "text", text: `Filled ${fields.length} fields${submit_ref ? " + submitted" : ""}. URL: ${page.url()}` }] };
+  return { content: [{ type: "text", text: `Filled ${fields.length} fields${submit_ref ? " + submitted" : ""}. URL: ${page.url()}${clickNote(mode)}` }] };
 });
 
 server.tool("login_classic",
@@ -1164,7 +1579,9 @@ server.tool("login_classic",
     try {
       const ef = page.locator(EMAIL_SEL).first();
       await ef.waitFor({ state: "visible", timeout: step_timeout_ms });
-      await ef.fill(email);
+      // fillLocator, not fill — a pre-filled email field would otherwise be
+      // appended to ("olduser@x.comnewuser@x.com") on Firefox.
+      await fillLocator(ef, email);
       log.push("email filled");
     } catch { return finish("FAILED — email field not found"); }
 
@@ -1181,7 +1598,7 @@ server.tool("login_classic",
     try {
       const pf = page.locator(PW_SEL).first();
       await pf.waitFor({ state: "visible", timeout: step_timeout_ms });
-      await pf.fill(password);
+      await fillLocator(pf, password);
       log.push("password filled");
     } catch { return finish("FAILED — password field not found after email step"); }
 
@@ -1199,7 +1616,7 @@ server.tool("login_classic",
       try {
         const tf = page.locator(TOTP_SEL).first();
         await tf.waitFor({ state: "visible", timeout: 4000 });
-        await tf.fill(code);
+        await fillLocator(tf, code);
         log.push(`2FA code filled (${code})`);
         const sb = page.locator(NEXT_SEL).first();
         if (await sb.count() && await sb.isVisible()) await clickWithFallback(sb);
@@ -1259,13 +1676,14 @@ server.tool("query_selector_all", "Query elements by CSS selector, return text/a
 }, async ({ selector, attribute, limit }) => {
   const page = getPage();
   const results = await page.evaluate(`(() => {
-    var els = document.querySelectorAll("${selector.replace(/"/g, '\\"')}");
+    var attrName = ${jsStr(attribute)};
+    var els = document.querySelectorAll(${jsStr(selector)});
     var out = [];
     for (var i = 0; i < Math.min(els.length, ${limit}); i++) {
       out.push({
         i: i,
         text: (els[i].innerText || '').trim().slice(0, 100),
-        attr: "${attribute}" ? els[i].getAttribute("${attribute}") || '' : '',
+        attr: attrName ? (els[i].getAttribute(attrName) || '') : '',
         tag: els[i].tagName.toLowerCase()
       });
     }
@@ -1279,13 +1697,14 @@ server.tool("get_links", "Get all links on the page with URL and text.", {
 }, async ({ filter }) => {
   const page = getPage();
   const links = await page.evaluate(`(() => {
+    var filter = ${jsStr(filter)};
     var links = document.querySelectorAll('a[href]');
     var out = [];
     for (var i = 0; i < links.length; i++) {
       var href = links[i].href || '';
       var text = (links[i].innerText || '').trim().slice(0, 80);
       if (!text && !href) continue;
-      if ("${filter}" && href.indexOf("${filter}") === -1) continue;
+      if (filter && href.indexOf(filter) === -1) continue;
       out.push({ text: text, href: href.slice(0, 150) });
     }
     return out;
@@ -1302,7 +1721,7 @@ server.tool("localstorage_get", "Get all localStorage data or a specific key.", 
 }, async ({ key }) => {
   const page = getPage();
   if (key) {
-    const val = await page.evaluate(`localStorage.getItem("${key.replace(/"/g, '\\"')}")`);
+    const val = await page.evaluate(`localStorage.getItem(${jsStr(key)})`);
     return { content: [{ type: "text", text: `${key}=${val}` }] };
   }
   const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); o[k] = localStorage.getItem(k); } return o; })()`);
@@ -1313,7 +1732,7 @@ server.tool("localstorage_set", "Set a localStorage item.", {
   key: z.string(), value: z.string(),
 }, async ({ key, value }) => {
   const page = getPage();
-  await page.evaluate(`localStorage.setItem("${key.replace(/"/g, '\\"')}", "${value.replace(/"/g, '\\"')}")`);
+  await page.evaluate(`localStorage.setItem(${jsStr(key)}, ${jsStr(value)})`);
   return { content: [{ type: "text", text: `localStorage set: ${key}` }] };
 });
 
@@ -1328,7 +1747,7 @@ server.tool("sessionstorage_get", "Get all sessionStorage data or a specific key
 }, async ({ key }) => {
   const page = getPage();
   if (key) {
-    const val = await page.evaluate(`sessionStorage.getItem("${key.replace(/"/g, '\\"')}")`);
+    const val = await page.evaluate(`sessionStorage.getItem(${jsStr(key)})`);
     return { content: [{ type: "text", text: `${key}=${val}` }] };
   }
   const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < sessionStorage.length; i++) { var k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; })()`);
@@ -1339,7 +1758,7 @@ server.tool("sessionstorage_set", "Set a sessionStorage item.", {
   key: z.string(), value: z.string(),
 }, async ({ key, value }) => {
   const page = getPage();
-  await page.evaluate(`sessionStorage.setItem("${key.replace(/"/g, '\\"')}", "${value.replace(/"/g, '\\"')}")`);
+  await page.evaluate(`sessionStorage.setItem(${jsStr(key)}, ${jsStr(value)})`);
   return { content: [{ type: "text", text: `sessionStorage set: ${key}` }] };
 });
 
@@ -1598,13 +2017,21 @@ server.tool("server_status", "Health check — verify server, browser status, ac
   }, null, 2) }] };
 });
 
-server.tool("get_page_errors", "Get JavaScript errors from the page.", {}, async () => {
+server.tool("get_page_errors",
+  "Get uncaught JavaScript errors + unhandled promise rejections from the current page. " +
+  "Captured by a hook installed at browser_launch, so the buffer resets on every navigation " +
+  "(read it before navigating away). Max 100 entries per page load.",
+  {}, async () => {
   const page = getPage();
   const errors = await page.evaluate(`(() => {
-    var errs = window.__mcp_errors || [];
-    return errs.slice(-20);
-  })()`);
-  return { content: [{ type: "text", text: JSON.stringify(errors, null, 2) }] };
+    if (!window.__mcp_errors) return null;
+    return window.__mcp_errors.slice(-20);
+  })()`) as any[] | null;
+  if (errors === null) {
+    return { content: [{ type: "text", text: "Error hook not installed on this page — it is added at browser_launch and applies from the next navigation onward. Navigate (or reload) and retry." }] };
+  }
+  if (!errors.length) return { content: [{ type: "text", text: "No JS errors captured on this page load." }] };
+  return { content: [{ type: "text", text: `Page errors (${errors.length}):\n${JSON.stringify(errors, null, 2)}` }] };
 });
 
 server.tool("inject_init_script", "Inject a script that runs before every page load.", {
@@ -1617,19 +2044,70 @@ server.tool("inject_init_script", "Inject a script that runs before every page l
 
 // ── Tools: Export ──────────────────────────────────────────────────────────
 
-server.tool("export_har", "Export network traffic as HAR file.", {
-  path: z.string().default(""),
-}, async ({ path: harPath }) => {
+server.tool("export_har",
+  "Export captured network traffic as a HAR 1.2 file (openable in DevTools/other HAR viewers). " +
+  "Requires network_start first; headers and bodies are only included when network_start(capture_bodies=true) was used.",
+  {
+    path: z.string().default(""),
+    limit: z.number().default(200).describe("Max (most recent) requests to include."),
+  }, async ({ path: harPath, limit }) => {
   const page = getPage();
-  const target = harPath || join(SCREENSHOT_DIR, "network.har");
-  // Collect network entries
-  const entries = networkRequests.slice(-100).map(r => ({
-    request: { method: r.method, url: r.url },
-    response: { status: r.status },
+  const target = harPath ? resolveOutPath(harPath) : join(SCREENSHOT_DIR, "network.har");
+  // HAR wants [{name, value}] pairs, not an object map.
+  const harHeaders = (h?: Record<string, string>) =>
+    h ? Object.entries(h).map(([name, value]) => ({ name, value: String(value) })) : [];
+  const rows = networkRequests.slice(-Math.max(1, limit));
+  const entries = rows.map(r => ({
+    startedDateTime: new Date(r.ts).toISOString(),
+    time: 0,                                    // per-request timings aren't captured
+    request: {
+      method: r.method,
+      url: r.url,
+      httpVersion: "HTTP/1.1",
+      headers: harHeaders(r.reqHeaders),
+      queryString: [],
+      cookies: [],
+      headersSize: -1,
+      bodySize: r.reqBody ? Buffer.byteLength(r.reqBody) : -1,
+      ...(r.reqBody
+        ? { postData: { mimeType: r.reqHeaders?.["content-type"] || "", text: r.reqBody } }
+        : {}),
+    },
+    response: {
+      status: r.status,
+      statusText: "",
+      httpVersion: "HTTP/1.1",
+      headers: harHeaders(r.resHeaders),
+      cookies: [],
+      content: {
+        size: r.resBody ? Buffer.byteLength(r.resBody) : 0,
+        mimeType: r.mimeType || "",
+        ...(r.resBody ? { text: r.resBody } : {}),
+      },
+      redirectURL: "",
+      headersSize: -1,
+      bodySize: -1,
+    },
+    cache: {},
+    timings: { send: -1, wait: -1, receive: -1 },
+    _resourceType: r.resourceType || "",
   }));
-  const har = { log: { version: "1.2", entries } };
+  const har = {
+    log: {
+      version: "1.2",
+      creator: { name: "mcp-camoufox", version: PKG_VERSION },
+      pages: [{
+        startedDateTime: new Date(rows[0]?.ts ?? Date.now()).toISOString(),
+        id: "page_1",
+        title: page.url(),
+        pageTimings: { onContentLoad: -1, onLoad: -1 },
+      }],
+      entries: entries.map(e => ({ ...e, pageref: "page_1" })),
+    },
+  };
   writeFileSync(target, JSON.stringify(har, null, 2));
-  return { content: [{ type: "text", text: `HAR exported: ${target} (${entries.length} entries)` }] };
+  const bodyNote = networkCaptureBodies ? "" : " (no headers/bodies — restart with network_start capture_bodies=true)";
+  return { content: [{ type: "text", text: `HAR exported: ${target} (${entries.length} entries)${bodyNote}` }] };
 });
 
 // ── Tools: Scraping / Extraction ───────────────────────────────────────────
@@ -1760,13 +2238,14 @@ server.tool("extract_structured", "Extract structured data from repeated element
     }
 
     // Get ALL matching containers, then filter to only top-level (not nested)
-    var allContainers = document.querySelectorAll("${container_selector.replace(/"/g, '\\"')}");
+    var containerSel = ${jsStr(container_selector)};
+    var allContainers = document.querySelectorAll(containerSel);
     var containers = [];
     for (var c = 0; c < allContainers.length; c++) {
       var isNested = false;
       var parent = allContainers[c].parentElement;
       while (parent) {
-        if (parent.matches && parent.matches("${container_selector.replace(/"/g, '\\"')}")) {
+        if (parent.matches && parent.matches(containerSel)) {
           isNested = true;
           break;
         }
@@ -1779,7 +2258,7 @@ server.tool("extract_structured", "Extract structured data from repeated element
     var directOnly = ${direct_text_only};
     var out = [];
     var seenKeys = {};
-    var dedup = "${deduplicate_by}";
+    var dedup = ${jsStr(deduplicate_by)};
 
     for (var i = 0; i < Math.min(containers.length, ${limit * 2}); i++) {
       var item = {};
@@ -1839,7 +2318,7 @@ server.tool("extract_table", "Extract data from an HTML table as JSON array.", {
 }, async ({ selector, limit }) => {
   const page = getPage();
   const results = await page.evaluate(`(() => {
-    var table = document.querySelector("${selector.replace(/"/g, '\\"')}");
+    var table = document.querySelector(${jsStr(selector)});
     if (!table) return { error: 'Table not found' };
     var headers = [];
     var ths = table.querySelectorAll('thead th, thead td, tr:first-child th, tr:first-child td');
@@ -1996,15 +2475,10 @@ server.tool(
   },
   async ({ ref, wait_ms }) => {
     const page = getPage();
-    const loc = refLocator(page, ref);
-    try {
-      await loc.click({ timeout: ACTION_TIMEOUT });
-    } catch {
-      await loc.evaluate((el: any) => el.click());
-    }
+    const mode = await clickWithFallback(refLocator(page, ref));
     await page.waitForTimeout(wait_ms);
     const snap = await snapshotPage(page);
-    return { content: [{ type: "text", text: snap }] };
+    return { content: [{ type: "text", text: (mode === "real" ? "" : `NOTE:${clickNote(mode)}\n\n`) + snap }] };
   }
 );
 
@@ -2012,48 +2486,56 @@ server.tool(
 
 server.tool(
   "find_by_text",
-  "Find element by visible text — returns ref ID or null. Skip browser_snapshot if you know exact text.",
+  "Find elements by visible text — returns EVERY match (total + a ref and ancestor path per candidate), so you can tell whether the one you want is really the one you'd click. Skip browser_snapshot when you know the text.",
   {
     text: z.string().describe("Visible text to search for"),
     exact: z.boolean().default(true),
+    within: z.string().default("").describe('Limit the search: "@dialog", "ref:e5", or a CSS selector.'),
+    limit: z.number().default(8).describe("Max candidates to describe."),
   },
-  async ({ text, exact }) => {
+  async ({ text, exact, within, limit }) => {
     const page = getPage();
-    const loc = page.getByText(text, { exact }).first();
-    const count = await loc.count();
-    if (count === 0) {
-      return { content: [{ type: "text", text: `No element found with text "${text}"` }] };
+    const scope = within ? ` within=${within}` : "";
+    let loc: any;
+    try {
+      loc = scopeRoot(page, within).getByText(text, { exact });
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Invalid within=${within}: ${e?.message || e}` }], isError: true };
     }
-    // Tag with ref
-    const info = await loc.evaluate((el: any) => {
-      const ref = 'f' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
-      el.setAttribute('data-mcp-ref', ref);
-      return {
-        ref,
-        tag: el.tagName.toLowerCase(),
-        role: el.getAttribute('role') || '',
-        text: (el.innerText || el.value || '').trim().slice(0, 100),
-        href: el.href || '',
-      };
-    });
-    return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+    const { total, items } = await describeMatches(loc, Math.max(1, limit));
+    if (total === 0) {
+      return { content: [{ type: "text", text: `No element found with text "${text}"${scope}` }] };
+    }
+    return {
+      content: [{ type: "text", text: `${total} match(es) for text="${text}"${scope}${total > 1 ? " — pick deliberately, don't assume the first" : ""}:\n${candidateList(total, items)}` }],
+    };
   }
 );
 
 server.tool(
   "find_by_label",
-  "Find input element by its label text (<label>). Returns ref.",
+  "Find input element by its label text (<label>). Returns ref + how many matched.",
   {
     label: z.string().describe("Label text (e.g. 'Email', 'Password')"),
+    within: z.string().default("").describe('Limit the search: "@dialog", "ref:e5", or a CSS selector.'),
   },
-  async ({ label }) => {
+  async ({ label, within }) => {
     const page = getPage();
-    const loc = page.getByLabel(label).first();
+    let loc: any;
+    try {
+      loc = scopeRoot(page, within).getByLabel(label);
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Invalid within=${within}: ${e?.message || e}` }], isError: true };
+    }
     const count = await loc.count();
     if (count === 0) {
-      return { content: [{ type: "text", text: `No input found with label "${label}"` }] };
+      return { content: [{ type: "text", text: `No input found with label "${label}"${within ? ` within=${within}` : ""}` }] };
     }
-    const info = await loc.evaluate((el: any) => {
+    if (count > 1) {
+      const { total, items } = await describeMatches(loc);
+      return { content: [{ type: "text", text: `${total} inputs match label "${label}" — choose one by ref:\n${candidateList(total, items)}` }] };
+    }
+    const info = await loc.first().evaluate((el: any) => {
       const ref = 'l' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
       el.setAttribute('data-mcp-ref', ref);
       return {
@@ -2071,18 +2553,28 @@ server.tool(
 
 server.tool(
   "find_by_placeholder",
-  "Find input by placeholder text. Returns ref.",
+  "Find input by placeholder text. Returns ref + how many matched.",
   {
     placeholder: z.string(),
+    within: z.string().default("").describe('Limit the search: "@dialog", "ref:e5", or a CSS selector.'),
   },
-  async ({ placeholder }) => {
+  async ({ placeholder, within }) => {
     const page = getPage();
-    const loc = page.getByPlaceholder(placeholder).first();
+    let loc: any;
+    try {
+      loc = scopeRoot(page, within).getByPlaceholder(placeholder);
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Invalid within=${within}: ${e?.message || e}` }], isError: true };
+    }
     const count = await loc.count();
     if (count === 0) {
-      return { content: [{ type: "text", text: `No input with placeholder "${placeholder}"` }] };
+      return { content: [{ type: "text", text: `No input with placeholder "${placeholder}"${within ? ` within=${within}` : ""}` }] };
     }
-    const info = await loc.evaluate((el: any) => {
+    if (count > 1) {
+      const { total, items } = await describeMatches(loc);
+      return { content: [{ type: "text", text: `${total} inputs match placeholder "${placeholder}" — choose one by ref:\n${candidateList(total, items)}` }] };
+    }
+    const info = await loc.first().evaluate((el: any) => {
       const ref = 'p' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
       el.setAttribute('data-mcp-ref', ref);
       return {
@@ -2187,9 +2679,7 @@ server.tool("storage_state_save", "Save cookies + localStorage to a JSON file. R
     }
     return { url: location.href, origin: location.origin, ...data };
   })()`);
-  const target = path.replace("~", process.env.HOME || "");
-  const dir = target.substring(0, target.lastIndexOf("/"));
-  if (dir) mkdirSync(dir, { recursive: true });
+  const target = resolveOutPath(path);
   writeFileSync(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
   return { content: [{ type: "text", text: `Saved storage state: ${target} (${cookies.length} cookies, ${Object.keys((origins as any).local || {}).length} localStorage, ${Object.keys((origins as any).session || {}).length} sessionStorage)` }] };
 });
@@ -2200,7 +2690,7 @@ server.tool("storage_state_load", "Load cookies + localStorage from a JSON file 
 }, async ({ path, navigate_to }) => {
   const page = getPage();
   const ctx = page.context();
-  const target = path.replace("~", process.env.HOME || "");
+  const target = expandHome(path);
   let data: any;
   try {
     data = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
@@ -2236,9 +2726,7 @@ server.tool("auth_capture", "Save current session as named auth state (e.g. logg
     for (var j = 0; j < sessionStorage.length; j++) { var k = sessionStorage.key(j); data.session[k] = sessionStorage.getItem(k); }
     return { url: location.href, origin: location.origin, ...data };
   })()`);
-  const dir = `${process.env.HOME}/.camoufox-mcp/sessions`;
-  mkdirSync(dir, { recursive: true });
-  const target = `${dir}/${name}.json`;
+  const target = resolveOutPath(`${PROFILE_PARENT}/sessions/${name}.json`);
   writeFileSync(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
   return { content: [{ type: "text", text: `auth_capture saved: ${target}` }] };
 });
@@ -2250,9 +2738,7 @@ server.tool("cookie_export_file", "Export all cookies to a JSON file (Playwright
 }, async ({ path }) => {
   const page = getPage();
   const cookies = await page.context().cookies();
-  const target = path.replace("~", process.env.HOME || "");
-  const dir = target.substring(0, target.lastIndexOf("/"));
-  if (dir) mkdirSync(dir, { recursive: true });
+  const target = resolveOutPath(path);
   writeFileSync(target, JSON.stringify(cookies, null, 2));
   return { content: [{ type: "text", text: `Exported ${cookies.length} cookies to ${target}` }] };
 });
@@ -2261,12 +2747,15 @@ server.tool("cookie_import_file", "Import cookies from a JSON file (Playwright f
   path: z.string().describe("Input JSON file path"),
 }, async ({ path }) => {
   const page = getPage();
-  const target = path.replace("~", process.env.HOME || "");
+  const target = expandHome(path);
   let cookies: any;
   try {
     cookies = JSON.parse((await import("fs")).readFileSync(target, "utf8"));
   } catch (e: any) {
     return { content: [{ type: "text", text: `Failed to import cookies from ${target}: ${e?.message || e}` }], isError: true };
+  }
+  if (!Array.isArray(cookies)) {
+    return { content: [{ type: "text", text: `Invalid cookie file ${target}: expected a JSON array (Playwright format).` }], isError: true };
   }
   await page.context().addCookies(cookies);
   return { content: [{ type: "text", text: `Imported ${cookies.length} cookies from ${target}` }] };
@@ -2279,10 +2768,17 @@ server.tool("humanize_click", "Click element with humanized mouse approach (3-st
   selector: z.string().optional().describe("CSS selector"),
 }, async ({ ref, selector }) => {
   const page = getPage();
-  const sel = ref ? `[data-mcp-ref="${ref}"]` : selector;
-  if (!sel) return { content: [{ type: "text", text: "Error: ref or selector required" }] };
-  const box = await page.locator(sel).first().boundingBox();
-  if (!box) return { content: [{ type: "text", text: "Error: element has no bounding box" }] };
+  if (!ref && !selector) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+  const loc = ref ? refLocator(page, ref) : page.locator(selector!).first();
+  // Scroll into view first: boundingBox() is viewport-relative, so on a scrolled
+  // page an off-screen element yields negative coords and the "click" lands nowhere.
+  try { await loc.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT }); } catch {}
+  const box = await loc.boundingBox();
+  if (!box) return { content: [{ type: "text", text: "Error: element has no bounding box" }], isError: true };
+  const vp = page.viewportSize() || { width: 1280, height: 800 };
+  if (box.x + box.width < 0 || box.y + box.height < 0 || box.x > vp.width || box.y > vp.height) {
+    return { content: [{ type: "text", text: `Error: element is outside the viewport (box x=${Math.round(box.x)} y=${Math.round(box.y)}), a real mouse click cannot reach it. Scroll it into view first.` }], isError: true };
+  }
   const tx = box.x + box.width / 2 + (Math.random() * 8 - 4);
   const ty = box.y + box.height / 2 + (Math.random() * 6 - 3);
   await page.mouse.move(tx + 200, ty - 100, { steps: 20 });
@@ -2302,8 +2798,8 @@ server.tool("humanize_type", "Type text with Gaussian-distributed delays between
   mean_delay_ms: z.number().default(80),
 }, async ({ ref, selector, text, mean_delay_ms }) => {
   const page = getPage();
-  const sel = ref ? `[data-mcp-ref="${ref}"]` : selector;
-  if (sel) await page.locator(sel).first().focus();
+  if (ref) await refLocator(page, ref).focus();
+  else if (selector) await page.locator(selector).first().focus();
   for (const ch of text) {
     await page.keyboard.type(ch);
     // Gaussian-ish delay (Box-Muller)
@@ -2378,8 +2874,9 @@ server.tool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) 
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
       await page.waitForTimeout(per * 0.4);
-      // Random scroll
-      await page.mouse.wheel(0, 200 + Math.random() * 400).catch(() => {});
+      // Random scroll — via window.scrollBy, since mouse.wheel is a no-op in Camoufox
+      const dy = Math.round(200 + Math.random() * 400);
+      await page.evaluate(`window.scrollBy(0, ${dy})`).catch(() => {});
       await page.waitForTimeout(per * 0.3);
     } catch {}
   }
@@ -2450,11 +2947,11 @@ server.tool("click_and_wait", "Click element then wait for navigation or selecto
   timeout_ms: z.number().default(15000),
 }, async ({ ref, selector, wait_for_url, wait_for_selector, timeout_ms }) => {
   const page = getPage();
-  const sel = ref ? `[data-mcp-ref="${ref}"]` : selector;
-  if (!sel) return { content: [{ type: "text", text: "Error: ref or selector required" }] };
+  if (!ref && !selector) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+  const loc = ref ? refLocator(page, ref) : page.locator(selector!).first();
   const beforeUrl = page.url();
   await Promise.all([
-    page.locator(sel).first().click({ timeout: timeout_ms }),
+    loc.click({ timeout: timeout_ms }),
     wait_for_url ? page.waitForURL((u) => u.toString().includes(wait_for_url), { timeout: timeout_ms }).catch(() => {}) :
     wait_for_selector ? page.waitForSelector(wait_for_selector, { timeout: timeout_ms }).catch(() => {}) :
     page.waitForLoadState("domcontentloaded", { timeout: timeout_ms }).catch(() => {}),
@@ -2462,13 +2959,40 @@ server.tool("click_and_wait", "Click element then wait for navigation or selecto
   return { content: [{ type: "text", text: `click_and_wait: ${beforeUrl} → ${page.url()}` }] };
 });
 
-server.tool("wait_for_network_idle", "Wait until network is idle for N ms (no in-flight requests). Better than fixed timeouts for SPAs.", {
-  idle_ms: z.number().default(500).describe("Idle threshold (Playwright default)"),
+server.tool("wait_for_network_idle", "Wait until there are no in-flight requests for idle_ms continuously. Better than fixed timeouts for SPAs.", {
+  idle_ms: z.number().default(500).describe("How long the network must stay quiet before returning."),
   timeout_ms: z.number().default(30000),
 }, async ({ idle_ms, timeout_ms }) => {
   const page = getPage();
-  await page.waitForLoadState("networkidle", { timeout: timeout_ms });
-  return { content: [{ type: "text", text: `network idle reached (>=${idle_ms}ms)` }] };
+  // Track in-flight requests ourselves instead of waitForLoadState("networkidle"),
+  // whose 500ms threshold is fixed — this actually honours idle_ms.
+  let inflight = 0;
+  const onRequest = () => { inflight++; };
+  const onSettled = () => { if (inflight > 0) inflight--; };
+  page.on("request", onRequest);
+  page.on("requestfinished", onSettled);
+  page.on("requestfailed", onSettled);
+  const started = Date.now();
+  try {
+    const deadline = started + timeout_ms;
+    let quietSince = inflight === 0 ? started : 0;
+    while (Date.now() < deadline) {
+      if (inflight === 0) {
+        if (!quietSince) quietSince = Date.now();
+        if (Date.now() - quietSince >= idle_ms) {
+          return { content: [{ type: "text", text: `network idle for ${idle_ms}ms (waited ${Date.now() - started}ms)` }] };
+        }
+      } else {
+        quietSince = 0;
+      }
+      await page.waitForTimeout(100);
+    }
+    return { content: [{ type: "text", text: `timeout after ${timeout_ms}ms — still ${inflight} request(s) in flight (never idle for ${idle_ms}ms).` }] };
+  } finally {
+    page.off("request", onRequest);
+    page.off("requestfinished", onSettled);
+    page.off("requestfailed", onSettled);
+  }
 });
 
 server.tool(

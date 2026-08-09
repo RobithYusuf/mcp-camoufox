@@ -10,3 +10,6 @@ PLAN-CHROMIUM-STEALTH.md
 # npm token (never commit)
 .npm-token
 *.token
+
+# experimental local build (project-scoped, not published)
+dist-exp/

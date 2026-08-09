@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **102 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **104 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -39,7 +39,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **102** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **104** | **Yes** | **Yes** | **Yes** |
 
 ## Proven on Real Sites
 
@@ -262,14 +262,15 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 102 Tools
+## All 104 Tools
 
-### Browser Lifecycle (2)
+### Browser Lifecycle (3)
 
 | Tool | Description |
 |------|-------------|
-| `browser_launch` | Launch stealth browser. Options: `url`, `headless`, `humanize`, `geoip`, `locale`, `width`, `height` |
-| `browser_close` | Close browser. Cookies preserved in profile. |
+| `browser_launch` | Launch stealth browser. Options: `url`, `headless`, `humanize`, `geoip`, `locale`, `width`, `height`, `fresh_profile`. If a browser is already running these options are ignored — `browser_close` first to relaunch. |
+| `browser_close` | Close browser. Reports exactly what survived — e.g. *"3 persisted, 1 session-only (dropped)"* — so a lost login is never a mystery. Temp profile removed if `fresh_profile` was used. |
+| `reset_profile` | Wipe the persistent profile at `~/.camoufox-mcp/profile` (browser must be closed first) |
 
 ### Navigation (4)
 
@@ -285,21 +286,21 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | Tool | Description |
 |------|-------------|
 | `browser_snapshot` | Get interactive elements with ref IDs. **Call after every navigation.** On large pages narrow with `roles=["button","textbox"]` or paginate with `offset`/`limit` — refs stay stable. |
-| `screenshot` | Capture viewport or full page. Options: `name`, `full_page` |
+| `screenshot` | Capture viewport, full page, or **one element** (`ref` / `selector` — perfect for documenting a modal). Returns the **image inline** plus the saved path, so no second read step. `return_image=false` for path only. |
 | `get_text` | Text from page or selector (max 5000 chars) |
 | `get_html` | HTML from page or selector (max 10000 chars) |
 | `get_url` | Current URL + title |
-| `save_pdf` | Export page as PDF |
+| `save_pdf` | ⚠️ Not available on Camoufox — Playwright implements PDF generation only for headless Chromium, and Camoufox is Firefox. Returns a clear error; use `screenshot(full_page=true)` instead. |
 
 ### Element Interaction (9)
 
 | Tool | Description |
 |------|-------------|
-| `click` | Click by ref ID. Auto JS-fallback for overlays. Options: `button`, `dblclick` |
-| `click_text` | Click by visible text. Options: `exact` |
-| `click_role` | Click by ARIA role + name |
+| `click` | Click by ref ID. Options: `button`, `dblclick`. If the real mouse click is blocked, it falls back to a full synthetic pointer sequence (`pointerdown`→`mousedown`→`pointerup`→`mouseup`→click) **and says so** — a degraded click is never reported as a clean one. |
+| `click_text` | Click by visible text. **Refuses to guess:** several matches → fails with a numbered candidate list (tag, text, ancestor path, ref). Narrow with `within` (`"@dialog"`, a CSS selector, or `"ref:e5"`) or choose with `index`. |
+| `click_role` | Click by ARIA role + name. Same `within` / `index` / ambiguity guard as `click_text`. |
 | `hover` | Hover over element |
-| `fill` | Fill input/textarea (clears first) |
+| `fill` | Fill input/textarea — always **replaces** the old value (`email`/`number` inputs are cleared explicitly first; Firefox's select-all is a no-op on those, which otherwise made a re-fill append) |
 | `select_option` | Select from dropdown |
 | `check` / `uncheck` | Toggle checkbox/radio |
 | `upload_file` | Upload file to input |
@@ -320,14 +321,15 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `click_turnstile` | Auto-find + humanized click on Cloudflare Turnstile widget. Params: `offset_x` (default 30), `offset_y`, `wait_render_ms`. Works on Interactive Turnstile (visible iframe widget). Not for Managed Challenge interstitials. |
 | `drag_and_drop` | Drag between two elements |
 
-### Wait (4)
+### Wait (5)
 
 | Tool | Description |
 |------|-------------|
 | `wait_for` | Wait for selector or text (visible/hidden/attached/detached) |
 | `wait_for_navigation` | Wait for page load |
-| `wait_for_url` | Wait for URL pattern match |
+| `wait_for_url` | Wait for URL pattern match. Wrap in `/…/` for regex; a bare `/path` is treated as a substring. |
 | `wait_for_response` | Wait for network response pattern |
+| `wait_for_any_of` | Race several conditions (`selector`/`text`/`url_contains`/`title_contains`) — returns the first that matches so the agent can branch in one call. Ideal for post-login flows. |
 
 ### Tabs (4)
 
@@ -336,14 +338,14 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `tab_list` | List all tabs. Pages the site opens itself (`window.open` / `target=_blank`, e.g. OAuth popups) are auto-tracked and appear here too. |
 | `tab_new` | Open new tab |
 | `tab_select` | Switch tab by `index` or `url_contains` (first tab whose URL matches) |
-| `tab_close` | Close tab by `index` (-1 = active) or `url_contains` |
+| `tab_close` | Close tab by `index` (-1 = active) or `url_contains`. The active tab is tracked by identity, so closing a lower-indexed tab never silently switches you to another one. |
 
 ### Cookies (3)
 
 | Tool | Description |
 |------|-------------|
 | `cookie_list` | List cookies. Options: `domain` filter |
-| `cookie_set` | Set cookie |
+| `cookie_set` | Set cookie with `expires_days`, `http_only`, `secure`, `same_site`. **`expires_days=0` (default) makes a session cookie that dies at `browser_close`** — pass a lifetime to keep a login across relaunches. |
 | `cookie_delete` | Delete by name/domain. Empty = clear all. |
 
 ### Local Storage (3)
@@ -410,7 +412,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 
 | Tool | Description |
 |------|-------------|
-| `dialog_handle` | Pre-set accept/dismiss for next alert/confirm/prompt |
+| `dialog_handle` | Pre-set accept/dismiss for the next alert/confirm/prompt on **any** open tab (first dialog wins, then disarms) |
 
 ### Accessibility (1)
 
@@ -439,25 +441,27 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 
 | Tool | Description |
 |------|-------------|
-| `find_by_text` | Find element by visible text, returns ref. Skip `browser_snapshot` when you know exact text. |
-| `find_by_label` | Find input by label text, returns ref. |
-| `find_by_placeholder` | Find input by placeholder, returns ref. |
+| `find_by_text` | Find by visible text — returns **every** match with a ref, ancestor path and total, so you can see whether the one you'd click is the one you mean. Supports `within`. |
+| `find_by_label` | Find input by label text, returns ref (lists all candidates if several match). Supports `within`. |
+| `find_by_placeholder` | Find input by placeholder, returns ref (lists all candidates if several match). Supports `within`. |
 
-### Session Portability (5)
+### Session Portability (7)
 
 | Tool | Description |
 |------|-------------|
 | `cookie_export` | Export all cookies as JSON (for transfer) |
 | `cookie_import` | Import cookies from JSON (restore session) |
+| `cookie_export_file` | Write all cookies to a JSON file (Playwright format) |
+| `cookie_import_file` | Load cookies from a JSON file (Playwright format) |
 | `storage_state_save` | Save cookies + localStorage + sessionStorage to JSON file. Reload to skip login/CF. |
 | `storage_state_load` | Restore session from JSON (cookies + storage). Use `navigate_to` param to apply localStorage. |
 | `auth_capture` | Convenience: save current session to `~/.camoufox-mcp/sessions/<name>.json` |
 
-### Humanize / Anti-Bot (4)
+### Humanize / Anti-Bot (5)
 
 | Tool | Description |
 |------|-------------|
-| `humanize_click` | 3-step Bezier mouse approach + small jitter before click. Use for CF/DataDome pages. |
+| `humanize_click` | 3-step Bezier mouse approach + small jitter before click. Scrolls the target into view first (a real mouse click can't reach an off-screen element). Use for CF/DataDome pages. |
 | `humanize_type` | Gaussian-distributed keystroke delays (mean 80ms, sigma 30ms). Mimics human rhythm. |
 | `mouse_drift` | Random mouse movements over duration — builds mouse history before action. |
 | `mouse_record` / `mouse_replay` | Capture human mouse path then replay (anti-bot gold). |
@@ -482,8 +486,8 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | Tool | Description |
 |------|-------------|
 | `click_and_wait` | Click + wait for navigation/selector atomically (fewer roundtrips) |
-| `wait_for_network_idle` | Wait until no in-flight requests for N ms (better than fixed timeouts for SPAs) |
-| `describe_page` | Compact LLM-friendly summary (title, h1, buttons, links, forms) — cheaper than `browser_snapshot` |
+| `wait_for_network_idle` | Wait until there are zero in-flight requests for `idle_ms` continuously (tracked per request — the threshold really is yours, not Playwright's fixed 500 ms) |
+| `describe_page` | Compact LLM-friendly summary (title, h1, buttons, links, forms) + `intent` classifier (`login_email`, `otp_input`, `captcha`, `stay_signed_in`, …) — cheaper than `browser_snapshot` |
 
 ### Scraping & Extraction (4)
 
@@ -499,9 +503,16 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | Tool | Description |
 |------|-------------|
 | `server_status` | Health check: browser status, tabs, URL |
-| `get_page_errors` | JS errors from page |
-| `export_har` | Export network traffic as HAR file |
+| `get_page_errors` | Uncaught JS errors + unhandled promise rejections, captured by a hook installed at `browser_launch`. Buffer resets on every navigation — read it before navigating away. |
+| `export_har` | Export captured traffic as a valid **HAR 1.2** file (opens in DevTools). Needs `network_start` first; headers/bodies included only with `capture_bodies=true`. |
 | `page_stats` | Element count, page size, load metrics + extraction strategy recommendation |
+
+### Site Automation (2)
+
+| Tool | Description |
+|------|-------------|
+| `chatgpt_generate_image` | End-to-end image generation/edit on chatgpt.com in one call: fresh chat → optional reference-image upload → prompt → wait for the finished image → save PNG to `output_path`. Requires an authenticated chatgpt.com session. |
+| `chatgpt_generate_batch` | Many images in parallel (one tab per job, submit-all-then-collect). `shared_image_paths` + `style_suffix` keep a set visually consistent. |
 
 ## Examples
 
@@ -673,7 +684,10 @@ The default profile persists across `browser_close` calls, so the next login on 
 | Problem | Fix |
 |---------|-----|
 | "Browser not running" | Call `browser_launch` first |
-| Click blocked by overlay | Auto JS-fallback handles it. Or `press_key("Escape")` first. |
+| Click blocked by overlay | A synthetic pointer-event fallback fires and the response warns you (`⚠`). If the widget still ignores it, dismiss the blocker (`press_key("Escape")`) or use `mouse_click_xy`. |
+| Clicked the wrong "Cancel"/"Save" | `click_text` now fails with a candidate list instead of guessing. Use `within="@dialog"` to stay inside the open modal, or `index=N`. |
+| Click on a Radix/Headless UI/MUI option did nothing | The real click was blocked and the old fallback used a bare `el.click()`, which those libraries ignore. Fixed — the fallback now replays the full pointer sequence. Upgrade if you're on ≤0.7.2. |
+| Login gone after `browser_close` | `cookie_set` without `expires_days` creates a session cookie, which no browser writes to disk. Pass `expires_days=30`, or use `storage_state_save`/`auth_capture`. `browser_close` now tells you how many cookies were dropped. |
 | Stale refs after navigation | Call `browser_snapshot` again — refs regenerate each time |
 | Window too large | `browser_launch(width=1024, height=768)` |
 | First launch slow | Downloading Camoufox binary (~80MB). Happens once. |
@@ -681,6 +695,9 @@ The default profile persists across `browser_close` calls, so the next login on 
 | iframe not accessible | Use `list_frames` + `frame_evaluate` |
 | CAPTCHA appears | Cannot auto-solve. Use `headless=false` and solve manually. |
 | Login lands on wrong account | Profile carry-over. Use `fresh_profile=true` on launch or `reset_profile`. |
+| Need a PDF | `save_pdf` can't work on Firefox/Camoufox. Use `screenshot(full_page=true)`. |
+| Field value looks concatenated | Fixed — `fill`/`fill_form`/`batch_actions`/`login_classic` now clear `email`/`number` inputs before typing. Upgrade if you're on ≤0.7.2. |
+| `humanize_click` did nothing | Fixed — it now scrolls the element into view and errors if the element is outside the viewport. |
 | MCP server silently dies | If you ran `pkill -f camoufox`, you killed the MCP node process too (its argv contains "camoufox"). Target the binary specifically — e.g. `pkill -f "Camoufox.app/Contents/MacOS"` — or use `pkill -f camoufox-js`. |
 
 ## License
