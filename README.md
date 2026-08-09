@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **129 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **127 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -39,7 +39,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **129** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **127** | **Yes** | **Yes** | **Yes** |
 
 ## Proven on Real Sites
 
@@ -262,7 +262,7 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 129 Tools
+## All 127 Tools
 
 ### Browser Lifecycle (4)
 
@@ -512,9 +512,11 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `extract_table` | Extract HTML table as JSON array with auto-detected headers |
 | `scrape_page` | Smart scraper: auto-extract main content (strips nav/footer), links, meta, headings. Smart truncation at paragraph boundary. |
 
-### Browserless HTTP & Research (6)
+### Browserless HTTP (4)
 
-The browser is the expensive path. `impit` (already shipped with camoufox-js) speaks a real **Firefox** TLS/HTTP2 fingerprint, so these tools fetch without launching anything — and the fingerprint matches the browser this server actually drives.
+The browser is the expensive path. `impit` (already shipped with camoufox-js) speaks a real **Firefox** TLS/HTTP2 fingerprint, so these tools fetch without launching anything — and the fingerprint matches the browser this server actually drives. Verified against a Cloudflare-protected site that these tools cleared **without opening a browser at all**.
+
+> No `web_search`/`deep_research` here by design: scraping a SERP without an API key returns confidently wrong results for whole classes of query (Bing answers any "how does …" question with dictionary pages) and one major engine is TLS-blocked by some ISPs. A search tool that fails silently is worse than none — use your client's own search (WebSearch/Exa/Tavily) and feed the URLs to `scrape_markdown`.
 
 | Tool | Description |
 |------|-------------|
@@ -522,8 +524,6 @@ The browser is the expensive path. `impit` (already shipped with camoufox-js) sp
 | `http_session_cookies` | Show which browser cookies would be sent to a URL (verify session sharing before relying on it) |
 | `scrape_markdown` | One URL → clean LLM-ready markdown (headings/links/lists kept, nav/footer/scripts stripped). Browserless by default, `use_browser=true` for JS-heavy pages |
 | `smart_fetch` | Tries HTTP first, escalates to the stealth browser **only** when the response looks anti-bot blocked. The efficiency core |
-| `web_search` | Web search with no browser and no API key (DuckDuckGo/Bing SERP) → title + url + snippet |
-| `deep_research` | search → fetch top N → markdown with citations, in one call. Blocked sources are flagged for a browser re-fetch |
 
 ### Storage Inspection (4)
 
