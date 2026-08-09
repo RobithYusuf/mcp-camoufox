@@ -3290,15 +3290,41 @@ function parseDDG(html: string): SerpHit[] {
   return hits;
 }
 
+// Bing wraps every result in a tracking redirect: /ck/a?…&u=a1<base64url>.
+// Left undecoded, a "result URL" is a bing.com redirect — deep_research would
+// fetch Bing instead of the source.
+function decodeBingHref(href: string): string {
+  if (!/bing\.com\/ck\/a/i.test(href)) return href;
+  try {
+    const enc = new URL(href, "https://www.bing.com").searchParams.get("u") || "";
+    if (enc.startsWith("a1")) {
+      const b64 = enc.slice(2).replace(/-/g, "+").replace(/_/g, "/");
+      const dec = Buffer.from(b64 + "=".repeat((4 - b64.length % 4) % 4), "base64").toString("utf8");
+      if (/^https?:\/\//i.test(dec)) return dec;
+    }
+  } catch {}
+  return href;
+}
+
 function parseBing(html: string): SerpHit[] {
   const hits: SerpHit[] = [];
+  const seen = new Set<string>();
   const blocks = html.split(/<li[^>]+class=["'][^"']*b_algo/i).slice(1);
   for (const b of blocks) {
-    const a = htmlAnchors(b).find(x => x.href.startsWith("http") && x.text);
+    // The <h2> anchor is the real result title; the first anchor in the block is
+    // often the breadcrumb/citation line ("example.com › docs").
+    const h2 = b.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i);
+    const a = (h2 ? htmlAnchors(h2[1]).find(x => x.href && x.text) : null)
+      || htmlAnchors(b).find(x => x.href && x.text);
     if (!a) continue;
+    const url = decodeBingHref(a.href);
+    if (!/^https?:\/\//i.test(url)) continue;
+    if (/^https?:\/\/(www\.)?bing\.com/i.test(url)) continue;   // redirect we couldn't decode
+    if (seen.has(url)) continue;
+    seen.add(url);
     const p = b.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
     hits.push({
-      title: a.text, url: a.href,
+      title: a.text, url,
       snippet: p ? decodeEntities(p[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 280) : "",
     });
   }
@@ -3455,7 +3481,7 @@ regTool("web_search",
   "Returns title + url + snippet per result. Pair with scrape_markdown or deep_research to actually read the hits.",
   {
     query: z.string(),
-    engine: z.enum(["duckduckgo", "bing"]).default("duckduckgo"),
+    engine: z.enum(["bing", "duckduckgo"]).default("bing").describe("bing is the default because some ISPs block DuckDuckGo outright; the other engine is still tried as a fallback."),
     count: z.number().default(8),
     proxy: z.string().default(""),
   },
@@ -3474,7 +3500,7 @@ regTool("deep_research",
   {
     query: z.string(),
     max_sources: z.number().default(4),
-    engine: z.enum(["duckduckgo", "bing"]).default("duckduckgo"),
+    engine: z.enum(["bing", "duckduckgo"]).default("bing"),
     per_source_chars: z.number().default(3000),
     proxy: z.string().default(""),
   },
