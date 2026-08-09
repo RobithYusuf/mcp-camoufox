@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **104 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **129 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -39,7 +39,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp | 45 | Yes | No (clone) | Yes |
 | Sekinal/camoufox-mcp | 49 | Yes | No (clone) | Yes |
 | Playwright CLI | 60+ | No | Yes | Yes |
-| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **104** | **Yes** | **Yes** | **Yes** |
+| **[mcp-camoufox](https://github.com/RobithYusuf/mcp-camoufox)** | **129** | **Yes** | **Yes** | **Yes** |
 
 ## Proven on Real Sites
 
@@ -262,15 +262,16 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 104 Tools
+## All 129 Tools
 
-### Browser Lifecycle (3)
+### Browser Lifecycle (4)
 
 | Tool | Description |
 |------|-------------|
 | `browser_launch` | Launch stealth browser. Options: `url`, `headless`, `humanize`, `geoip`, `locale`, `width`, `height`, `fresh_profile`. If a browser is already running these options are ignored — `browser_close` first to relaunch. |
 | `browser_close` | Close browser. Reports exactly what survived — e.g. *"3 persisted, 1 session-only (dropped)"* — so a lost login is never a mystery. Temp profile removed if `fresh_profile` was used. |
 | `reset_profile` | Wipe the persistent profile at `~/.camoufox-mcp/profile` (browser must be closed first) |
+| `browser_recover` | Escape hatch when the browser is wedged and `browser_close` can't finish: force-drops the connection, resets state, and reports a profile lock held by another Camoufox |
 
 ### Navigation (4)
 
@@ -281,7 +282,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `go_forward` | Forward in history |
 | `reload` | Reload page |
 
-### DOM & Content (6)
+### DOM & Content (7)
 
 | Tool | Description |
 |------|-------------|
@@ -291,8 +292,9 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `get_html` | HTML from page or selector (max 10000 chars) |
 | `get_url` | Current URL + title |
 | `save_pdf` | ⚠️ Not available on Camoufox — Playwright implements PDF generation only for headless Chromium, and Camoufox is Firefox. Returns a clear error; use `screenshot(full_page=true)` instead. |
+| `search_page` | Grep the current page's visible text with surrounding context — costs nothing next to a snapshot or screenshot |
 
-### Element Interaction (9)
+### Element Interaction (12)
 
 | Tool | Description |
 |------|-------------|
@@ -304,6 +306,9 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `select_option` | Select from dropdown |
 | `check` / `uncheck` | Toggle checkbox/radio |
 | `upload_file` | Upload file to input |
+| `click_element_offset` | Click at an x%/y% position inside an element — wide labels whose real checkbox sits at the left edge, sliders, split buttons |
+| `click_at_corner` | Click a corner (close/X, delete, dismiss controls live there, not in the centre) |
+| `paste_text` | Fill via a **real** clipboard paste (Ctrl/Cmd+V) so frameworks that only listen for `paste` — Svelte 5 / Solid runes, some Qwik forms — actually receive it |
 
 ### Keyboard (2)
 
@@ -321,7 +326,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `click_turnstile` | Auto-find + humanized click on Cloudflare Turnstile widget. Params: `offset_x` (default 30), `offset_y`, `wait_render_ms`. Works on Interactive Turnstile (visible iframe widget). Not for Managed Challenge interstitials. |
 | `drag_and_drop` | Drag between two elements |
 
-### Wait (5)
+### Wait (7)
 
 | Tool | Description |
 |------|-------------|
@@ -329,6 +334,8 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `wait_for_navigation` | Wait for page load |
 | `wait_for_url` | Wait for URL pattern match. Wrap in `/…/` for regex; a bare `/path` is treated as a substring. |
 | `wait_for_response` | Wait for network response pattern |
+| `wait_for_change` | Wait until the page actually CHANGES and report what changed (url/title/DOM size/text) — the honest replacement for a fixed sleep after a click |
+| `wait_for_request` | Block until the page ISSUES a matching request — confirms an action really fired its API call |
 | `wait_for_any_of` | Race several conditions (`selector`/`text`/`url_contains`/`title_contains`) — returns the first that matches so the agent can branch in one call. Ideal for post-login flows. |
 
 ### Tabs (4)
@@ -356,12 +363,13 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `localstorage_set` | Set key-value |
 | `localstorage_clear` | Clear all |
 
-### Session Storage (2)
+### Session Storage (3)
 
 | Tool | Description |
 |------|-------------|
 | `sessionstorage_get` | Get all or specific key |
 | `sessionstorage_set` | Set key-value |
+| `sessionstorage_clear` | Clear all sessionStorage for the origin (parity with `localstorage_clear`) |
 
 ### JavaScript (2)
 
@@ -370,7 +378,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `evaluate` | Run JS in page context |
 | `inject_init_script` | Inject script that runs on every page load |
 
-### Element Inspection (4)
+### Element Inspection (5)
 
 | Tool | Description |
 |------|-------------|
@@ -378,6 +386,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `get_attribute` | Get specific attribute |
 | `query_selector_all` | Query multiple elements by CSS selector |
 | `get_links` | Get all links with URL + text. Options: `filter` |
+| `form_introspect` | Whole-form analysis in one call: label, type, value, required/pattern/length, validation state, and the JS framework each field is bound to |
 
 ### Frames (2)
 
@@ -386,7 +395,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `list_frames` | List all frames/iframes |
 | `frame_evaluate` | Run JS inside a frame |
 
-### Batch Operations (4)
+### Batch Operations (6)
 
 | Tool | Description |
 |------|-------------|
@@ -394,6 +403,8 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `fill_form` | Fill multiple fields + optional submit |
 | `login_classic` | Composite login for email→password forms (Google/Microsoft/generic). Auto email→Next→password→submit, optional TOTP 2FA (`totp_secret` or `totp_code`). Collapses 5–8 calls into one. |
 | `navigate_and_snapshot` | Navigate + snapshot in one call |
+| `smart_fill` | Fill fields by **label text** (fuzzy) instead of refs — no snapshot needed; optional `submit_label` |
+| `workflow_run` | Run a list of tool calls in sequence; resumable via `start_at` after a failure |
 
 ### Viewport (2)
 
@@ -402,17 +413,19 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `get_viewport_size` | Get width x height |
 | `set_viewport_size` | Set dimensions |
 
-### Scroll (1)
+### Scroll (2)
 
 | Tool | Description |
 |------|-------------|
 | `scroll` | Scroll up/down/left/right by pixel amount |
+| `scroll_to` | Scroll a specific element into view (`ref`/`selector`, `block` alignment) |
 
-### Dialog (1)
+### Dialog (2)
 
 | Tool | Description |
 |------|-------------|
 | `dialog_handle` | Pre-set accept/dismiss for the next alert/confirm/prompt on **any** open tab (first dialog wins, then disarms) |
+| `dialog_auto_handle` | PERSISTENT handler — stays armed across every dialog and every tab, including popups. `enabled=false` removes it |
 
 ### Accessibility (1)
 
@@ -473,13 +486,14 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `session_warmup` | Visit Google/Wikipedia (random) before targeting protected site. Helps IP scoring. |
 | `detect_anti_bot` | Heuristic detection of CF/DataDome/Akamai/PerimeterX/Imperva/reCAPTCHA/hCaptcha. |
 
-### Assertions (3)
+### Assertions (4)
 
 | Tool | Description |
 |------|-------------|
 | `assert_element_visible` | PASS/FAIL — element exists and is visible |
 | `assert_text_present` | PASS/FAIL — text substring on page |
 | `assert_url_matches` | PASS/FAIL — URL matches pattern (substring or regex) |
+| `assert_clickable` | Hit-test **without clicking**: would a real click land? Names the element that would intercept it |
 
 ### Workflow Helpers (3)
 
@@ -498,7 +512,29 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `extract_table` | Extract HTML table as JSON array with auto-detected headers |
 | `scrape_page` | Smart scraper: auto-extract main content (strips nav/footer), links, meta, headings. Smart truncation at paragraph boundary. |
 
-### Debug (4)
+### Browserless HTTP & Research (6)
+
+The browser is the expensive path. `impit` (already shipped with camoufox-js) speaks a real **Firefox** TLS/HTTP2 fingerprint, so these tools fetch without launching anything — and the fingerprint matches the browser this server actually drives.
+
+| Tool | Description |
+|------|-------------|
+| `http_request` | HTTP with a real Firefox TLS fingerprint, reusing the live browser's cookies by default — log in with the browser, then hit the site's API cheaply |
+| `http_session_cookies` | Show which browser cookies would be sent to a URL (verify session sharing before relying on it) |
+| `scrape_markdown` | One URL → clean LLM-ready markdown (headings/links/lists kept, nav/footer/scripts stripped). Browserless by default, `use_browser=true` for JS-heavy pages |
+| `smart_fetch` | Tries HTTP first, escalates to the stealth browser **only** when the response looks anti-bot blocked. The efficiency core |
+| `web_search` | Web search with no browser and no API key (DuckDuckGo/Bing SERP) → title + url + snippet |
+| `deep_research` | search → fetch top N → markdown with citations, in one call. Blocked sources are flagged for a browser re-fetch |
+
+### Storage Inspection (4)
+
+| Tool | Description |
+|------|-------------|
+| `storage_snapshot` | Capture cookies + localStorage + sessionStorage into a named slot |
+| `storage_diff` | Diff current state against that slot — the fastest way to find which key holds a session token |
+| `indexeddb_list` | List IndexedDB databases for the origin (where many SPAs hide auth state) |
+| `indexeddb_delete` | Delete an IndexedDB database by name |
+
+### Debug (5)
 
 | Tool | Description |
 |------|-------------|
@@ -506,6 +542,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `get_page_errors` | Uncaught JS errors + unhandled promise rejections, captured by a hook installed at `browser_launch`. Buffer resets on every navigation — read it before navigating away. |
 | `export_har` | Export captured traffic as a valid **HAR 1.2** file (opens in DevTools). Needs `network_start` first; headers/bodies included only with `capture_bodies=true`. |
 | `page_stats` | Element count, page size, load metrics + extraction strategy recommendation |
+| `performance_timeline` | TTFB, DOMContentLoaded, load, FCP, LCP + the 5 slowest resources (CLS is unavailable — Firefox has no layout-shift API) |
 
 ### Site Automation (2)
 

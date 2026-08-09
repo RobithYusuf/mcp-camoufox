@@ -280,6 +280,9 @@ function trackPage(p: Page): void {
   pages.push(p);
   if (consoleHandler) p.on("console", consoleHandler);
   if (networkHandler) p.on("response", networkHandler);
+  // A persistent dialog handler must cover tabs the site opens later too,
+  // otherwise a popup's confirm() hangs the flow.
+  if (autoDialogHandler) p.on("dialog", autoDialogHandler);
   p.once("close", () => {
     const i = pages.indexOf(p);
     if (i < 0) return;
@@ -403,6 +406,17 @@ const server = new McpServer({
   version: PKG_VERSION,
 });
 
+// Every tool registers through here so workflow_run can invoke tools by name.
+// Same signature as server.tool(name, description, schema, handler) — the schema
+// is kept so a workflow step gets the same zod validation + defaults a real MCP
+// call would get, instead of handlers seeing undefined for omitted params.
+const toolRegistry = new Map<string, { schema: any; handler: Function }>();
+// Typed as server.tool itself so every handler keeps its inferred argument types.
+const regTool: typeof server.tool = ((name: any, description: any, schema: any, handler: any) => {
+  toolRegistry.set(name, { schema, handler });
+  return (server as any).tool(name, description, schema, handler);
+}) as any;
+
 // ── Tools: Browser Lifecycle ───────────────────────────────────────────────
 
 async function ensureCamoufoxBinary() {
@@ -441,7 +455,7 @@ async function ensureCamoufoxBinary() {
   console.error("\n[mcp-camoufox] Download complete.\n");
 }
 
-server.tool(
+regTool(
   "browser_launch",
   "Launch Camoufox stealth browser and navigate to URL. Browser persists between calls. " +
     "By default cookies/localStorage persist in ~/.camoufox-mcp/profile. " +
@@ -503,6 +517,11 @@ server.tool(
           "permissions.default.desktop-notification": 2,
           "dom.webnotifications.enabled": false,
           "browser.translations.automaticallyPopup": false,
+          // Lets navigator.clipboard.writeText work without a user gesture, so
+          // paste_text can deliver a REAL (trusted) paste event. Firefox refuses
+          // to attach clipboardData to a synthetic ClipboardEvent, so without
+          // this a paste-only framework field can never be filled.
+          "dom.events.testing.asyncClipboard": true,
         },
       }) as BrowserContext;
     } catch (e) {
@@ -539,7 +558,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "browser_close",
   "Close the browser. Cookies are preserved in the persistent profile (~/.camoufox-mcp/profile). " +
     "If the launch used fresh_profile=true, the temp profile is removed.",
@@ -583,11 +602,15 @@ server.tool(
     networkCaptureBodies = false;
     networkHandler = null;
     consoleHandler = null;
+    autoDialogHandler = null;
+    autoDialogCfg = null;
+    oneShotDialogArmed = false;
+    storageSnapshots.clear();
     return { content: [{ type: "text", text: `Browser closed. ${note}` }] };
   }
 );
 
-server.tool(
+regTool(
   "reset_profile",
   "Delete the persistent profile (~/.camoufox-mcp/profile) entirely. " +
     "Use to start fresh — cookies, localStorage, history all wiped. " +
@@ -621,7 +644,7 @@ server.tool(
 
 // ── Tools: Navigation ──────────────────────────────────────────────────────
 
-server.tool(
+regTool(
   "navigate",
   "Navigate to a URL.",
   {
@@ -637,19 +660,19 @@ server.tool(
   }
 );
 
-server.tool("go_back", "Navigate back in history.", {}, async () => {
+regTool("go_back", "Navigate back in history.", {}, async () => {
   const page = getPage();
   await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 });
   return { content: [{ type: "text", text: `Went back. URL: ${page.url()}` }] };
 });
 
-server.tool("go_forward", "Navigate forward in history.", {}, async () => {
+regTool("go_forward", "Navigate forward in history.", {}, async () => {
   const page = getPage();
   await page.goForward({ waitUntil: "domcontentloaded", timeout: 15000 });
   return { content: [{ type: "text", text: `Went forward. URL: ${page.url()}` }] };
 });
 
-server.tool("reload", "Reload the current page.", {}, async () => {
+regTool("reload", "Reload the current page.", {}, async () => {
   const page = getPage();
   await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
   return { content: [{ type: "text", text: `Reloaded. URL: ${page.url()}` }] };
@@ -657,7 +680,7 @@ server.tool("reload", "Reload the current page.", {}, async () => {
 
 // ── Tools: Snapshot & Screenshot ───────────────────────────────────────────
 
-server.tool(
+regTool(
   "browser_snapshot",
   "Get visible interactive elements with ref IDs. Use refs with click/fill. Always call after navigation. " +
     'On large pages (Outlook, dashboards) the response can be truncated — narrow with roles=["button","textbox"] ' +
@@ -674,7 +697,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "screenshot",
   "Screenshot the page, or a single element with ref/selector (great for documenting one modal). " +
     "Returns the IMAGE inline — no second Read call — plus the saved path. Set return_image=false for path only.",
@@ -720,7 +743,7 @@ server.tool(
 
 // ── Tools: Element Interaction ─────────────────────────────────────────────
 
-server.tool(
+regTool(
   "click",
   "Click element by ref ID from browser_snapshot. Auto JS-fallback for overlays.",
   {
@@ -736,7 +759,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "click_text",
   "Click element by visible text. If the text matches several elements it FAILS with a numbered candidate list instead of silently clicking the first one — " +
     'narrow with within ("@dialog", a CSS selector, or "ref:e5") or pick one with index.',
@@ -776,7 +799,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "click_role",
   "Click element by ARIA role and name. Same ambiguity guard as click_text: several matches → candidate list, not a guess.",
   {
@@ -816,7 +839,7 @@ server.tool(
   }
 );
 
-server.tool("hover", "Hover over element by ref ID.", {
+regTool("hover", "Hover over element by ref ID.", {
   ref: z.string(),
 }, async ({ ref }) => {
   const page = getPage();
@@ -824,7 +847,7 @@ server.tool("hover", "Hover over element by ref ID.", {
   return { content: [{ type: "text", text: `Hovered ref=${ref}` }] };
 });
 
-server.tool("fill", "Fill input/textarea by ref ID. Always replaces existing content (email/number inputs are cleared explicitly first — Firefox's select-all is a no-op on those, which would otherwise append).", {
+regTool("fill", "Fill input/textarea by ref ID. Always replaces existing content (email/number inputs are cleared explicitly first — Firefox's select-all is a no-op on those, which would otherwise append).", {
   ref: z.string().describe("Element ref"),
   value: z.string().describe("Text to fill"),
 }, async ({ ref, value }) => {
@@ -833,7 +856,7 @@ server.tool("fill", "Fill input/textarea by ref ID. Always replaces existing con
   return { content: [{ type: "text", text: `Filled ref=${ref} with '${value.slice(0, 50)}'` }] };
 });
 
-server.tool("select_option", "Select option from <select> dropdown.", {
+regTool("select_option", "Select option from <select> dropdown.", {
   ref: z.string(), value: z.string(),
 }, async ({ ref, value }) => {
   const page = getPage();
@@ -841,13 +864,13 @@ server.tool("select_option", "Select option from <select> dropdown.", {
   return { content: [{ type: "text", text: `Selected '${value}' in ref=${ref}` }] };
 });
 
-server.tool("check", "Check checkbox or radio button.", { ref: z.string() }, async ({ ref }) => {
+regTool("check", "Check checkbox or radio button.", { ref: z.string() }, async ({ ref }) => {
   const page = getPage();
   await refLocator(page, ref).check({ timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Checked ref=${ref}` }] };
 });
 
-server.tool("uncheck", "Uncheck a checkbox.", { ref: z.string() }, async ({ ref }) => {
+regTool("uncheck", "Uncheck a checkbox.", { ref: z.string() }, async ({ ref }) => {
   const page = getPage();
   await refLocator(page, ref).uncheck({ timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: `Unchecked ref=${ref}` }] };
@@ -855,7 +878,7 @@ server.tool("uncheck", "Uncheck a checkbox.", { ref: z.string() }, async ({ ref 
 
 // ── Tools: Keyboard ────────────────────────────────────────────────────────
 
-server.tool("type_text", "Type text char by char via keyboard.", {
+regTool("type_text", "Type text char by char via keyboard.", {
   text: z.string(),
   delay: z.number().default(50).describe("Delay between keys (ms)"),
 }, async ({ text, delay }) => {
@@ -864,7 +887,7 @@ server.tool("type_text", "Type text char by char via keyboard.", {
   return { content: [{ type: "text", text: `Typed: '${text.slice(0, 50)}'` }] };
 });
 
-server.tool("press_key", "Press key or combo (Enter, Escape, Control+a, etc.).", {
+regTool("press_key", "Press key or combo (Enter, Escape, Control+a, etc.).", {
   key: z.string().describe("Key name"),
 }, async ({ key }) => {
   const page = getPage();
@@ -875,7 +898,7 @@ server.tool("press_key", "Press key or combo (Enter, Escape, Control+a, etc.).",
 
 // ── Tools: Wait ────────────────────────────────────────────────────────────
 
-server.tool("wait_for", "Wait for element/text to appear or disappear.", {
+regTool("wait_for", "Wait for element/text to appear or disappear.", {
   selector: z.string().default("").describe("CSS selector"),
   text: z.string().default("").describe("Text to wait for"),
   state: z.enum(["visible", "hidden", "attached", "detached"]).default("visible"),
@@ -893,7 +916,7 @@ server.tool("wait_for", "Wait for element/text to appear or disappear.", {
   return { content: [{ type: "text", text: `Waited ${timeout}ms` }] };
 });
 
-server.tool("wait_for_navigation", "Wait for page load to complete.", {
+regTool("wait_for_navigation", "Wait for page load to complete.", {
   timeout: z.number().default(15000),
 }, async ({ timeout }) => {
   const page = getPage();
@@ -901,7 +924,7 @@ server.tool("wait_for_navigation", "Wait for page load to complete.", {
   return { content: [{ type: "text", text: `Navigation complete. URL: ${page.url()}` }] };
 });
 
-server.tool(
+regTool(
   "wait_for_any_of",
   "Race multiple wait conditions — returns the first that matches, so the agent can branch immediately without sequential probes. " +
     "Each condition is {kind: 'selector'|'text'|'url_contains'|'title_contains', value: string}. " +
@@ -965,7 +988,7 @@ server.tool(
 
 // ── Tools: JavaScript ──────────────────────────────────────────────────────
 
-server.tool("evaluate", "Execute JavaScript in page context.", {
+regTool("evaluate", "Execute JavaScript in page context.", {
   expression: z.string().describe("JS expression"),
 }, async ({ expression }) => {
   const page = getPage();
@@ -976,12 +999,12 @@ server.tool("evaluate", "Execute JavaScript in page context.", {
 
 // ── Tools: Page Info ───────────────────────────────────────────────────────
 
-server.tool("get_url", "Get current URL and title.", {}, async () => {
+regTool("get_url", "Get current URL and title.", {}, async () => {
   const page = getPage();
   return { content: [{ type: "text", text: `URL: ${page.url()}\nTitle: ${await page.title()}` }] };
 });
 
-server.tool("get_text", "Get visible text from page or element.", {
+regTool("get_text", "Get visible text from page or element.", {
   selector: z.string().default("body"),
 }, async ({ selector }) => {
   const page = getPage();
@@ -990,7 +1013,7 @@ server.tool("get_text", "Get visible text from page or element.", {
   return { content: [{ type: "text", text }] };
 });
 
-server.tool("get_html", "Get HTML content from page or element.", {
+regTool("get_html", "Get HTML content from page or element.", {
   selector: z.string().default("body"),
   outer: z.boolean().default(false),
 }, async ({ selector, outer }) => {
@@ -1005,7 +1028,7 @@ server.tool("get_html", "Get HTML content from page or element.", {
 
 // ── Tools: Tab Management ──────────────────────────────────────────────────
 
-server.tool("tab_list", "List all open tabs.", {}, async () => {
+regTool("tab_list", "List all open tabs.", {}, async () => {
   const lines: string[] = [];
   for (let i = 0; i < pages.length; i++) {
     const a = i === activePage ? " (active)" : "";
@@ -1016,7 +1039,7 @@ server.tool("tab_list", "List all open tabs.", {}, async () => {
   return { content: [{ type: "text", text: `Tabs (${pages.length}):\n${lines.join("\n")}` }] };
 });
 
-server.tool("tab_new", "Open new tab.", {
+regTool("tab_new", "Open new tab.", {
   url: z.string().default("about:blank"),
 }, async ({ url }) => {
   if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -1031,7 +1054,7 @@ server.tool("tab_new", "Open new tab.", {
   return { content: [{ type: "text", text: `New tab [${activePage}]. URL: ${page.url()}` }] };
 });
 
-server.tool("tab_select", "Switch to a tab by index, or by url_contains (first tab whose URL contains the substring).", {
+regTool("tab_select", "Switch to a tab by index, or by url_contains (first tab whose URL contains the substring).", {
   index: z.number().default(-1).describe("Tab index. Ignored if url_contains is set."),
   url_contains: z.string().default("").describe("Select the first tab whose URL contains this substring."),
 }, async ({ index, url_contains }) => {
@@ -1052,7 +1075,7 @@ server.tool("tab_select", "Switch to a tab by index, or by url_contains (first t
   return { content: [{ type: "text", text: `Switched to tab [${idx}]. URL: ${pages[idx].url()}` }] };
 });
 
-server.tool("tab_close", "Close a tab by index (-1 = active), or by url_contains.", {
+regTool("tab_close", "Close a tab by index (-1 = active), or by url_contains.", {
   index: z.number().default(-1),
   url_contains: z.string().default("").describe("Close the first tab whose URL contains this substring (overrides index)."),
 }, async ({ index, url_contains }) => {
@@ -1084,7 +1107,7 @@ server.tool("tab_close", "Close a tab by index (-1 = active), or by url_contains
 
 // ── Tools: Cookies ─────────────────────────────────────────────────────────
 
-server.tool("cookie_list", "List cookies.", {
+regTool("cookie_list", "List cookies.", {
   domain: z.string().default(""),
 }, async ({ domain }) => {
   if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -1094,7 +1117,7 @@ server.tool("cookie_list", "List cookies.", {
   return { content: [{ type: "text", text: lines.length ? `Cookies (${cookies.length}):\n${lines.join("\n")}` : "No cookies." }] };
 });
 
-server.tool("cookie_set",
+regTool("cookie_set",
   "Set a cookie. IMPORTANT: with expires_days=0 this creates a SESSION cookie, which Firefox keeps in memory only — " +
   "it is gone after browser_close even though the profile itself persists. Pass expires_days (e.g. 30) to write a " +
   "login session that survives a relaunch.",
@@ -1120,7 +1143,7 @@ server.tool("cookie_set",
     return { content: [{ type: "text", text: `Cookie set: ${name}=${value.slice(0, 40)} domain=${domain} — ${life}` }] };
   });
 
-server.tool("cookie_delete", "Delete cookies. Both empty = clear all.", {
+regTool("cookie_delete", "Delete cookies. Both empty = clear all.", {
   name: z.string().default(""), domain: z.string().default(""),
 }, async ({ name, domain }) => {
   if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -1142,7 +1165,7 @@ server.tool("cookie_delete", "Delete cookies. Both empty = clear all.", {
 
 // ── Tools: Dialog ──────────────────────────────────────────────────────────
 
-server.tool("dialog_handle", "Set handler for the next alert/confirm/prompt on ANY open tab (first dialog wins, handler then clears).", {
+regTool("dialog_handle", "Set handler for the next alert/confirm/prompt on ANY open tab (first dialog wins, handler then clears).", {
   action: z.enum(["accept", "dismiss"]).default("accept"),
   prompt_text: z.string().default(""),
 }, async ({ action, prompt_text }) => {
@@ -1152,9 +1175,12 @@ server.tool("dialog_handle", "Set handler for the next alert/confirm/prompt on A
   // Playwright's default auto-dismiss instead of hanging the page.
   const armed = pages.slice();
   let used = false;
+  // Tell a persistent dialog_auto_handle to stand down for this one dialog.
+  oneShotDialogArmed = true;
   const handler = async (dialog: Dialog) => {
     if (used) { try { await dialog.dismiss(); } catch {} return; }
     used = true;
+    oneShotDialogArmed = false;
     for (const p of armed) { try { p.off("dialog", handler); } catch {} }
     try {
       if (action === "accept") await dialog.accept(prompt_text);
@@ -1167,7 +1193,7 @@ server.tool("dialog_handle", "Set handler for the next alert/confirm/prompt on A
 
 // ── Tools: File Upload ─────────────────────────────────────────────────────
 
-server.tool("upload_file", "Upload file to file input.", {
+regTool("upload_file", "Upload file to file input.", {
   ref: z.string(), file_path: z.string(),
 }, async ({ ref, file_path }) => {
   const page = getPage();
@@ -1176,7 +1202,7 @@ server.tool("upload_file", "Upload file to file input.", {
 });
 
 // ── Tool: ChatGPT image generation (high-level, end-to-end) ──────────────────
-server.tool(
+regTool(
   "chatgpt_generate_image",
   "Generate or edit an image on chatgpt.com end-to-end and save it to disk in ONE call. Opens a fresh chat, optionally uploads reference images (e.g. a brand logo), submits the prompt, waits for the generated image to finish, then writes the result PNG to output_path. Requires an authenticated chatgpt.com session (import cookies first via cookie_import). Returns the saved path and pixel dimensions. Note: chatgpt image generation is slow (~60-120s) — set timeout_ms accordingly.",
   {
@@ -1228,7 +1254,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "chatgpt_generate_batch",
   "Generate MANY images on chatgpt.com IN PARALLEL (one tab per job, fire-all-then-collect) and save each to disk. Submits every job first WITHOUT waiting, then waits for all generations concurrently — far faster than sequential. For a CONSISTENT feed set, pass shared_image_paths (e.g. [logo] and/or a style-reference image like a previously-generated hero) uploaded to EVERY tab, plus style_suffix (a shared style spec) appended to every prompt. Requires an authenticated chatgpt.com session (import cookies first). Returns per-job results (saved path / ok / bytes / error).",
   {
@@ -1293,7 +1319,7 @@ server.tool(
 
 // ── Tools: Scroll ──────────────────────────────────────────────────────────
 
-server.tool("scroll", "Scroll the page.", {
+regTool("scroll", "Scroll the page.", {
   direction: z.enum(["up", "down", "left", "right"]).default("down"),
   amount: z.number().default(500),
 }, async ({ direction, amount }) => {
@@ -1333,7 +1359,7 @@ let networkSeq = 0;
 let networkHandler: ((res: any) => void) | null = null;
 let consoleHandler: ((msg: any) => void) | null = null;
 
-server.tool("console_start", "Start capturing console messages from all tabs.", {}, async () => {
+regTool("console_start", "Start capturing console messages from all tabs.", {}, async () => {
   if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
   consoleMessages.length = 0;
   // Detach any prior handler from every page first so repeated console_start
@@ -1348,13 +1374,13 @@ server.tool("console_start", "Start capturing console messages from all tabs.", 
   return { content: [{ type: "text", text: `Console capture started (all ${pages.length} tab(s)).` }] };
 });
 
-server.tool("console_get", "Get captured console messages.", {}, async () => {
+regTool("console_get", "Get captured console messages.", {}, async () => {
   if (!consoleMessages.length) return { content: [{ type: "text", text: "No messages." }] };
   const lines = consoleMessages.slice(-50).map(m => `  [${m.type}] ${m.text}`);
   return { content: [{ type: "text", text: `Console (${consoleMessages.length}):\n${lines.join("\n")}` }] };
 });
 
-server.tool("network_start",
+regTool("network_start",
   "Start capturing network requests. With capture_bodies=true also records request/response " +
   "headers + text bodies (json/text/xml/form only, capped at body_limit bytes) so you can inspect " +
   "API payloads via network_get_detail — no need to pivot to evaluate()+fetch().",
@@ -1411,7 +1437,7 @@ server.tool("network_start",
     return { content: [{ type: "text", text: `Network capture started${capture_bodies ? ` (bodies ON, limit ${body_limit}B)` : ""} on ${pages.length} tab(s).` }] };
   });
 
-server.tool("network_get",
+regTool("network_get",
   "List captured network requests in capture order, keeping the most recent `limit` rows. Each row shows an #id usable with network_get_detail.",
   {
     filter: z.string().default("").describe("Only show requests whose URL contains this substring."),
@@ -1429,7 +1455,7 @@ server.tool("network_get",
     return { content: [{ type: "text", text: `Network (${rows.length}${filter ? " matched" : ""}):\n${lines.join("\n")}${hint}` }] };
   });
 
-server.tool("network_get_detail",
+regTool("network_get_detail",
   "Full request + response detail (headers and text body) for one captured request. " +
   "Requires network_start(capture_bodies=true) BEFORE the request fired. " +
   "Identify the request by id (from network_get) or by url substring.",
@@ -1460,7 +1486,7 @@ server.tool("network_get_detail",
 
 // ── Tools: PDF ─────────────────────────────────────────────────────────────
 
-server.tool("save_pdf",
+regTool("save_pdf",
   "Save page as PDF. NOTE: Playwright can only generate PDFs in headless Chromium — Camoufox is Firefox, " +
   "so this fails by design here. Use screenshot(full_page=true) instead. Kept for API compatibility.",
   {
@@ -1485,7 +1511,7 @@ server.tool("save_pdf",
 
 // ── Tools: Batch Operations ────────────────────────────────────────────────
 
-server.tool("batch_actions", "Execute multiple actions in one call. Each action: {type, ref?, value?, text?, key?, url?}.", {
+regTool("batch_actions", "Execute multiple actions in one call. Each action: {type, ref?, value?, text?, key?, url?}.", {
   actions: z.array(z.object({
     type: z.enum(["click", "fill", "type", "press", "select", "check", "uncheck", "wait"]),
     ref: z.string().optional(),
@@ -1532,7 +1558,7 @@ server.tool("batch_actions", "Execute multiple actions in one call. Each action:
   return { content: [{ type: "text", text: `Batch (${actions.length} actions):\n${results.map(r => "  " + r).join("\n")}` }] };
 });
 
-server.tool("fill_form", "Fill multiple form fields and optionally submit.", {
+regTool("fill_form", "Fill multiple form fields and optionally submit.", {
   fields: z.array(z.object({
     ref: z.string().describe("Element ref from snapshot"),
     value: z.string().describe("Value to fill"),
@@ -1549,7 +1575,7 @@ server.tool("fill_form", "Fill multiple form fields and optionally submit.", {
   return { content: [{ type: "text", text: `Filled ${fields.length} fields${submit_ref ? " + submitted" : ""}. URL: ${page.url()}${clickNote(mode)}` }] };
 });
 
-server.tool("login_classic",
+regTool("login_classic",
   "Composite login for classic email→password forms (Google, Microsoft, generic SSO). " +
   "Auto-detects the email field, clicks Next/Continue on multi-step forms, fills the password, submits, " +
   "and optionally enters a TOTP 2FA code. Collapses the usual 5–8 fill/click/snapshot calls into one. " +
@@ -1628,7 +1654,7 @@ server.tool("login_classic",
     return finish("done");
   });
 
-server.tool("navigate_and_snapshot", "Navigate to URL then return snapshot — combined in one call.", {
+regTool("navigate_and_snapshot", "Navigate to URL then return snapshot — combined in one call.", {
   url: z.string(),
   wait_until: z.enum(["domcontentloaded", "load", "networkidle"]).default("domcontentloaded"),
 }, async ({ url, wait_until }) => {
@@ -1641,7 +1667,7 @@ server.tool("navigate_and_snapshot", "Navigate to URL then return snapshot — c
 
 // ── Tools: Element Inspection ──────────────────────────────────────────────
 
-server.tool("inspect_element", "Get detailed info about an element (tag, attributes, bounding box, styles).", {
+regTool("inspect_element", "Get detailed info about an element (tag, attributes, bounding box, styles).", {
   ref: z.string(),
 }, async ({ ref }) => {
   const page = getPage();
@@ -1661,7 +1687,7 @@ server.tool("inspect_element", "Get detailed info about an element (tag, attribu
   return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
 });
 
-server.tool("get_attribute", "Get a specific attribute value from an element.", {
+regTool("get_attribute", "Get a specific attribute value from an element.", {
   ref: z.string(), attribute: z.string(),
 }, async ({ ref, attribute }) => {
   const page = getPage();
@@ -1669,7 +1695,7 @@ server.tool("get_attribute", "Get a specific attribute value from an element.", 
   return { content: [{ type: "text", text: `${attribute}=${val}` }] };
 });
 
-server.tool("query_selector_all", "Query elements by CSS selector, return text/attributes of all matches.", {
+regTool("query_selector_all", "Query elements by CSS selector, return text/attributes of all matches.", {
   selector: z.string(),
   attribute: z.string().default("").describe("Attribute to extract (empty = innerText)"),
   limit: z.number().default(20),
@@ -1692,7 +1718,7 @@ server.tool("query_selector_all", "Query elements by CSS selector, return text/a
   return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 });
 
-server.tool("get_links", "Get all links on the page with URL and text.", {
+regTool("get_links", "Get all links on the page with URL and text.", {
   filter: z.string().default("").describe("Filter links by URL pattern (empty = all)"),
 }, async ({ filter }) => {
   const page = getPage();
@@ -1716,7 +1742,7 @@ server.tool("get_links", "Get all links on the page with URL and text.", {
 
 // ── Tools: Storage ─────────────────────────────────────────────────────────
 
-server.tool("localstorage_get", "Get all localStorage data or a specific key.", {
+regTool("localstorage_get", "Get all localStorage data or a specific key.", {
   key: z.string().default("").describe("Key to get (empty = all)"),
 }, async ({ key }) => {
   const page = getPage();
@@ -1728,7 +1754,7 @@ server.tool("localstorage_get", "Get all localStorage data or a specific key.", 
   return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
 });
 
-server.tool("localstorage_set", "Set a localStorage item.", {
+regTool("localstorage_set", "Set a localStorage item.", {
   key: z.string(), value: z.string(),
 }, async ({ key, value }) => {
   const page = getPage();
@@ -1736,13 +1762,13 @@ server.tool("localstorage_set", "Set a localStorage item.", {
   return { content: [{ type: "text", text: `localStorage set: ${key}` }] };
 });
 
-server.tool("localstorage_clear", "Clear all localStorage.", {}, async () => {
+regTool("localstorage_clear", "Clear all localStorage.", {}, async () => {
   const page = getPage();
   await page.evaluate(`localStorage.clear()`);
   return { content: [{ type: "text", text: "localStorage cleared." }] };
 });
 
-server.tool("sessionstorage_get", "Get all sessionStorage data or a specific key.", {
+regTool("sessionstorage_get", "Get all sessionStorage data or a specific key.", {
   key: z.string().default(""),
 }, async ({ key }) => {
   const page = getPage();
@@ -1754,7 +1780,7 @@ server.tool("sessionstorage_get", "Get all sessionStorage data or a specific key
   return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
 });
 
-server.tool("sessionstorage_set", "Set a sessionStorage item.", {
+regTool("sessionstorage_set", "Set a sessionStorage item.", {
   key: z.string(), value: z.string(),
 }, async ({ key, value }) => {
   const page = getPage();
@@ -1764,7 +1790,7 @@ server.tool("sessionstorage_set", "Set a sessionStorage item.", {
 
 // ── Tools: Mouse XY ────────────────────────────────────────────────────────
 
-server.tool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpolated pre-movement (human-like).", {
+regTool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpolated pre-movement (human-like).", {
   x: z.number(), y: z.number(),
   button: z.enum(["left", "right", "middle"]).default("left"),
   steps: z.number().default(0).describe("Interpolation steps for pre-click movement (0=instant, 15-30=human-like)"),
@@ -1779,7 +1805,7 @@ server.tool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds inte
   return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button} steps=${steps}` }] };
 });
 
-server.tool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-like).", {
+regTool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-like).", {
   x: z.number(), y: z.number(),
   steps: z.number().default(0).describe("Interpolation steps (0=instant jump, 15-30=smooth)"),
 }, async ({ x, y, steps }) => {
@@ -1788,7 +1814,7 @@ server.tool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-l
   return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y}) steps=${steps}` }] };
 });
 
-server.tool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox. Locates the widget via in-page selectors AND the Playwright frame API (handles closed shadow roots that document.querySelector misses), polls for render, skips if already solved, then does a humanized real-mouse click with retries + small nudge, verifying the cf-turnstile-response token after each attempt. Managed Challenge full-page interstitials still need mcp-stealth-chrome.", {
+regTool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox. Locates the widget via in-page selectors AND the Playwright frame API (handles closed shadow roots that document.querySelector misses), polls for render, skips if already solved, then does a humanized real-mouse click with retries + small nudge, verifying the cf-turnstile-response token after each attempt. Managed Challenge full-page interstitials still need mcp-stealth-chrome.", {
   offset_x: z.number().default(30).describe("Pixels from widget left edge to the checkbox (calibrated for CF checkbox)"),
   offset_y: z.number().optional().describe("Vertical offset from widget top (default = height/2)"),
   wait_render_ms: z.number().default(500).describe("Wait before first detection to let widget render"),
@@ -1897,7 +1923,7 @@ server.tool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile chec
   return { content: [{ type: "text", text: `Turnstile ${solved ? "SOLVED ✓" : "clicked but token not detected"} at (${lastTarget}) via ${coords?.found ?? "?"}${solved ? "" : " — if still unsolved it may be a Managed Challenge (use mcp-stealth-chrome) or needs a screenshot to confirm 'Success!'"}` }] };
 });
 
-server.tool("drag_and_drop", "Drag from one element to another.", {
+regTool("drag_and_drop", "Drag from one element to another.", {
   source_ref: z.string().describe("Ref of element to drag"),
   target_ref: z.string().describe("Ref of drop target"),
 }, async ({ source_ref, target_ref }) => {
@@ -1910,14 +1936,14 @@ server.tool("drag_and_drop", "Drag from one element to another.", {
 
 // ── Tools: Frames/Iframes ──────────────────────────────────────────────────
 
-server.tool("list_frames", "List all frames/iframes in the page.", {}, async () => {
+regTool("list_frames", "List all frames/iframes in the page.", {}, async () => {
   const page = getPage();
   const frames = page.frames();
   const lines = frames.map((f, i) => `  [${i}] ${f.name() || "(unnamed)"} — ${f.url().slice(0, 100)}`);
   return { content: [{ type: "text", text: `Frames (${frames.length}):\n${lines.join("\n")}` }] };
 });
 
-server.tool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe.", {
+regTool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe.", {
   frame_name: z.string().default("").describe("Frame name (empty = by index)"),
   frame_index: z.number().default(0).describe("Frame index from list_frames"),
   expression: z.string(),
@@ -1939,7 +1965,7 @@ server.tool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe
 
 // ── Tools: Wait (extended) ─────────────────────────────────────────────────
 
-server.tool("wait_for_url", "Wait for URL to match a pattern.", {
+regTool("wait_for_url", "Wait for URL to match a pattern.", {
   pattern: z.string().describe("URL substring or regex pattern"),
   timeout: z.number().default(15000),
 }, async ({ pattern, timeout }) => {
@@ -1952,7 +1978,7 @@ server.tool("wait_for_url", "Wait for URL to match a pattern.", {
   return { content: [{ type: "text", text: `URL matched pattern '${pattern}'. Current: ${page.url()}` }] };
 });
 
-server.tool("wait_for_response", "Wait for a network response matching a URL pattern.", {
+regTool("wait_for_response", "Wait for a network response matching a URL pattern.", {
   url_pattern: z.string().describe("URL substring to match"),
   timeout: z.number().default(15000),
 }, async ({ url_pattern, timeout }) => {
@@ -1963,13 +1989,13 @@ server.tool("wait_for_response", "Wait for a network response matching a URL pat
 
 // ── Tools: Viewport ────────────────────────────────────────────────────────
 
-server.tool("get_viewport_size", "Get current viewport dimensions.", {}, async () => {
+regTool("get_viewport_size", "Get current viewport dimensions.", {}, async () => {
   const page = getPage();
   const size = page.viewportSize();
   return { content: [{ type: "text", text: `Viewport: ${size?.width || "?"}x${size?.height || "?"}` }] };
 });
 
-server.tool("set_viewport_size", "Set viewport width and height.", {
+regTool("set_viewport_size", "Set viewport width and height.", {
   width: z.number(), height: z.number(),
 }, async ({ width, height }) => {
   const page = getPage();
@@ -1979,7 +2005,7 @@ server.tool("set_viewport_size", "Set viewport width and height.", {
 
 // ── Tools: Accessibility ───────────────────────────────────────────────────
 
-server.tool("accessibility_snapshot", "Get accessibility tree snapshot — compact view of page structure for LLM understanding.", {}, async () => {
+regTool("accessibility_snapshot", "Get accessibility tree snapshot — compact view of page structure for LLM understanding.", {}, async () => {
   const page = getPage();
   const snap = await page.evaluate(`(() => {
     function walk(el, depth) {
@@ -2006,7 +2032,7 @@ server.tool("accessibility_snapshot", "Get accessibility tree snapshot — compa
 
 // ── Tools: Debug & Health ──────────────────────────────────────────────────
 
-server.tool("server_status", "Health check — verify server, browser status, active tabs.", {}, async () => {
+regTool("server_status", "Health check — verify server, browser status, active tabs.", {}, async () => {
   return { content: [{ type: "text", text: JSON.stringify({
     browser_up: browserUp,
     active_tabs: pages.length,
@@ -2017,7 +2043,7 @@ server.tool("server_status", "Health check — verify server, browser status, ac
   }, null, 2) }] };
 });
 
-server.tool("get_page_errors",
+regTool("get_page_errors",
   "Get uncaught JavaScript errors + unhandled promise rejections from the current page. " +
   "Captured by a hook installed at browser_launch, so the buffer resets on every navigation " +
   "(read it before navigating away). Max 100 entries per page load.",
@@ -2034,7 +2060,7 @@ server.tool("get_page_errors",
   return { content: [{ type: "text", text: `Page errors (${errors.length}):\n${JSON.stringify(errors, null, 2)}` }] };
 });
 
-server.tool("inject_init_script", "Inject a script that runs before every page load.", {
+regTool("inject_init_script", "Inject a script that runs before every page load.", {
   script: z.string().describe("JavaScript code to inject"),
 }, async ({ script }) => {
   if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -2044,7 +2070,7 @@ server.tool("inject_init_script", "Inject a script that runs before every page l
 
 // ── Tools: Export ──────────────────────────────────────────────────────────
 
-server.tool("export_har",
+regTool("export_har",
   "Export captured network traffic as a HAR 1.2 file (openable in DevTools/other HAR viewers). " +
   "Requires network_start first; headers and bodies are only included when network_start(capture_bodies=true) was used.",
   {
@@ -2112,7 +2138,7 @@ server.tool("export_har",
 
 // ── Tools: Scraping / Extraction ───────────────────────────────────────────
 
-server.tool("detect_content_pattern", "Auto-detect repeated content patterns (cards, listings, rows) and suggest CSS selectors. Run this BEFORE extract_structured to find the right selectors.", {
+regTool("detect_content_pattern", "Auto-detect repeated content patterns (cards, listings, rows) and suggest CSS selectors. Run this BEFORE extract_structured to find the right selectors.", {
   min_items: z.number().default(3).describe("Minimum repeated items to detect as pattern"),
 }, async ({ min_items }) => {
   const page = getPage();
@@ -2208,7 +2234,7 @@ server.tool("detect_content_pattern", "Auto-detect repeated content patterns (ca
   return { content: [{ type: "text", text }] };
 });
 
-server.tool("extract_structured", "Extract structured data from repeated elements (cards, rows, listings). Auto-deduplicates, filters empty items, extracts direct text only. Use detect_content_pattern first to find correct selectors.", {
+regTool("extract_structured", "Extract structured data from repeated elements (cards, rows, listings). Auto-deduplicates, filters empty items, extracts direct text only. Use detect_content_pattern first to find correct selectors.", {
   container_selector: z.string().describe("CSS selector for each repeated item. Use detect_content_pattern to find this."),
   fields: z.array(z.object({
     name: z.string().describe("Field name in output"),
@@ -2312,7 +2338,7 @@ server.tool("extract_structured", "Extract structured data from repeated element
   return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 });
 
-server.tool("extract_table", "Extract data from an HTML table as JSON array.", {
+regTool("extract_table", "Extract data from an HTML table as JSON array.", {
   selector: z.string().default("table").describe("CSS selector for the table"),
   limit: z.number().default(100).describe("Max rows"),
 }, async ({ selector, limit }) => {
@@ -2342,7 +2368,7 @@ server.tool("extract_table", "Extract data from an HTML table as JSON array.", {
   return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 });
 
-server.tool("scrape_page", "Smart page scraper — auto-detect and extract main content, links, metadata. Strips nav/footer noise.", {
+regTool("scrape_page", "Smart page scraper — auto-detect and extract main content, links, metadata. Strips nav/footer noise.", {
   include_links: z.boolean().default(true),
   include_meta: z.boolean().default(true),
   max_text_length: z.number().default(8000).describe("Max text chars (truncates at paragraph boundary)"),
@@ -2429,7 +2455,7 @@ server.tool("scrape_page", "Smart page scraper — auto-detect and extract main 
 
 // ── Tools: Compound (reduce round-trips) ───────────────────────────────────
 
-server.tool(
+regTool(
   "wait_and_snapshot",
   "Wait for selector/text then return snapshot. Combines wait_for + browser_snapshot in one call.",
   {
@@ -2450,7 +2476,7 @@ server.tool(
   }
 );
 
-server.tool("back_and_snapshot", "Navigate back + return snapshot.", {}, async () => {
+regTool("back_and_snapshot", "Navigate back + return snapshot.", {}, async () => {
   const page = getPage();
   await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 });
   await page.waitForTimeout(500);
@@ -2458,7 +2484,7 @@ server.tool("back_and_snapshot", "Navigate back + return snapshot.", {}, async (
   return { content: [{ type: "text", text: snap }] };
 });
 
-server.tool("reload_and_snapshot", "Reload page + return snapshot.", {}, async () => {
+regTool("reload_and_snapshot", "Reload page + return snapshot.", {}, async () => {
   const page = getPage();
   await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
   await page.waitForTimeout(500);
@@ -2466,7 +2492,7 @@ server.tool("reload_and_snapshot", "Reload page + return snapshot.", {}, async (
   return { content: [{ type: "text", text: snap }] };
 });
 
-server.tool(
+regTool(
   "click_and_snapshot",
   "Click element by ref + wait + return snapshot. Perfect for buttons that trigger navigation/dialog.",
   {
@@ -2484,7 +2510,7 @@ server.tool(
 
 // ── Tools: Smart Selectors (no snapshot needed) ────────────────────────────
 
-server.tool(
+regTool(
   "find_by_text",
   "Find elements by visible text — returns EVERY match (total + a ref and ancestor path per candidate), so you can tell whether the one you want is really the one you'd click. Skip browser_snapshot when you know the text.",
   {
@@ -2512,7 +2538,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "find_by_label",
   "Find input element by its label text (<label>). Returns ref + how many matched.",
   {
@@ -2551,7 +2577,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "find_by_placeholder",
   "Find input by placeholder text. Returns ref + how many matched.",
   {
@@ -2587,7 +2613,7 @@ server.tool(
 
 // ── Tools: Cookie Portability ──────────────────────────────────────────────
 
-server.tool(
+regTool(
   "cookie_export",
   "Export all cookies as JSON string. Use with cookie_import to transfer session.",
   {
@@ -2601,7 +2627,7 @@ server.tool(
   }
 );
 
-server.tool(
+regTool(
   "cookie_import",
   "Import cookies from JSON (from cookie_export). Restores session state.",
   {
@@ -2623,7 +2649,7 @@ server.tool(
 
 // ── Tools: Page Stats (debug/decision) ─────────────────────────────────────
 
-server.tool(
+regTool(
   "page_stats",
   "Page statistics: element count, size, load metrics. Use to decide extraction strategy.",
   {},
@@ -2663,7 +2689,7 @@ server.tool(
 
 // ── Tools: Storage State (Session Reuse) ───────────────────────────────────
 
-server.tool("storage_state_save", "Save cookies + localStorage to a JSON file. Reload via storage_state_load on a fresh browser to skip login/CF entirely.", {
+regTool("storage_state_save", "Save cookies + localStorage to a JSON file. Reload via storage_state_load on a fresh browser to skip login/CF entirely.", {
   path: z.string().describe("Output file path (e.g. ~/.camoufox-mcp/sessions/site.json)"),
 }, async ({ path }) => {
   const page = getPage();
@@ -2684,7 +2710,7 @@ server.tool("storage_state_save", "Save cookies + localStorage to a JSON file. R
   return { content: [{ type: "text", text: `Saved storage state: ${target} (${cookies.length} cookies, ${Object.keys((origins as any).local || {}).length} localStorage, ${Object.keys((origins as any).session || {}).length} sessionStorage)` }] };
 });
 
-server.tool("storage_state_load", "Load cookies + localStorage from a JSON file (created by storage_state_save). Bypass CF/login if session is fresh.", {
+regTool("storage_state_load", "Load cookies + localStorage from a JSON file (created by storage_state_save). Bypass CF/login if session is fresh.", {
   path: z.string().describe("Path to storage state JSON file"),
   navigate_to: z.string().optional().describe("URL to navigate to after loading (recommended — localStorage requires same-origin)"),
 }, async ({ path, navigate_to }) => {
@@ -2714,7 +2740,7 @@ server.tool("storage_state_load", "Load cookies + localStorage from a JSON file 
   return { content: [{ type: "text", text: `Loaded storage state: ${data.cookies?.length || 0} cookies${navigate_to ? `, ${lsCount} localStorage, ${ssCount} sessionStorage (after navigate)` : " (call navigate to apply localStorage)"}` }] };
 });
 
-server.tool("auth_capture", "Save current session as named auth state (e.g. logged-in user). Convenience wrapper: storage_state_save to ~/.camoufox-mcp/sessions/<name>.json", {
+regTool("auth_capture", "Save current session as named auth state (e.g. logged-in user). Convenience wrapper: storage_state_save to ~/.camoufox-mcp/sessions/<name>.json", {
   name: z.string().describe("Session name (e.g. 'github-bob', 'shopify-mystore')"),
 }, async ({ name }) => {
   const page = getPage();
@@ -2733,7 +2759,7 @@ server.tool("auth_capture", "Save current session as named auth state (e.g. logg
 
 // ── Tools: Cookie Bulk ─────────────────────────────────────────────────────
 
-server.tool("cookie_export_file", "Export all cookies to a JSON file (Playwright format).", {
+regTool("cookie_export_file", "Export all cookies to a JSON file (Playwright format).", {
   path: z.string().describe("Output JSON file path"),
 }, async ({ path }) => {
   const page = getPage();
@@ -2743,7 +2769,7 @@ server.tool("cookie_export_file", "Export all cookies to a JSON file (Playwright
   return { content: [{ type: "text", text: `Exported ${cookies.length} cookies to ${target}` }] };
 });
 
-server.tool("cookie_import_file", "Import cookies from a JSON file (Playwright format).", {
+regTool("cookie_import_file", "Import cookies from a JSON file (Playwright format).", {
   path: z.string().describe("Input JSON file path"),
 }, async ({ path }) => {
   const page = getPage();
@@ -2763,7 +2789,7 @@ server.tool("cookie_import_file", "Import cookies from a JSON file (Playwright f
 
 // ── Tools: Humanize ────────────────────────────────────────────────────────
 
-server.tool("humanize_click", "Click element with humanized mouse approach (3-step Bezier-like curve before click). Use for anti-bot pages.", {
+regTool("humanize_click", "Click element with humanized mouse approach (3-step Bezier-like curve before click). Use for anti-bot pages.", {
   ref: z.string().optional().describe("Element ref from snapshot"),
   selector: z.string().optional().describe("CSS selector"),
 }, async ({ ref, selector }) => {
@@ -2791,7 +2817,7 @@ server.tool("humanize_click", "Click element with humanized mouse approach (3-st
   return { content: [{ type: "text", text: `humanize_click at (${Math.round(tx)},${Math.round(ty)})` }] };
 });
 
-server.tool("humanize_type", "Type text with Gaussian-distributed delays between keystrokes (mean ~80ms, sigma ~30ms). Mimics human typing rhythm.", {
+regTool("humanize_type", "Type text with Gaussian-distributed delays between keystrokes (mean ~80ms, sigma ~30ms). Mimics human typing rhythm.", {
   ref: z.string().optional(),
   selector: z.string().optional(),
   text: z.string().describe("Text to type"),
@@ -2811,7 +2837,7 @@ server.tool("humanize_type", "Type text with Gaussian-distributed delays between
   return { content: [{ type: "text", text: `humanize_type typed ${text.length} chars` }] };
 });
 
-server.tool("mouse_drift", "Random mouse movements over a duration — builds up mouse history before action (CF/DataDome behavior analysis).", {
+regTool("mouse_drift", "Random mouse movements over a duration — builds up mouse history before action (CF/DataDome behavior analysis).", {
   duration_ms: z.number().default(2000).describe("Total drift duration"),
   points: z.number().default(5).describe("Number of random destinations"),
 }, async ({ duration_ms, points }) => {
@@ -2827,7 +2853,7 @@ server.tool("mouse_drift", "Random mouse movements over a duration — builds up
   return { content: [{ type: "text", text: `mouse_drift: ${points} points over ${duration_ms}ms` }] };
 });
 
-server.tool("mouse_record", "Start recording mouse positions (call mouse_replay later). Returns recorder handle.", {
+regTool("mouse_record", "Start recording mouse positions (call mouse_replay later). Returns recorder handle.", {
   duration_ms: z.number().default(5000),
   sample_rate_hz: z.number().default(30),
 }, async ({ duration_ms, sample_rate_hz }) => {
@@ -2843,7 +2869,7 @@ server.tool("mouse_record", "Start recording mouse positions (call mouse_replay 
   return { content: [{ type: "text", text: `mouse_record started: ${handle} (${duration_ms}ms, ~${sample_rate_hz}Hz). Move mouse manually then call mouse_replay.` }] };
 });
 
-server.tool("mouse_replay", "Replay last recorded mouse path with original timing.", {
+regTool("mouse_replay", "Replay last recorded mouse path with original timing.", {
   speed: z.number().default(1.0).describe("Replay speed multiplier (1.0=original, 2.0=2x faster)"),
 }, async ({ speed }) => {
   const page = getPage();
@@ -2861,7 +2887,7 @@ server.tool("mouse_replay", "Replay last recorded mouse path with original timin
 
 // ── Tools: Session Warmup & Anti-Bot Detection ─────────────────────────────
 
-server.tool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to build browsing history before targeting protected site. Helps with CF/DataDome IP scoring.", {
+regTool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to build browsing history before targeting protected site. Helps with CF/DataDome IP scoring.", {
   duration_ms: z.number().default(10000).describe("Total warmup time"),
   sites: z.array(z.string()).optional().describe("URLs to visit (default: google.com, wikipedia.org)"),
 }, async ({ duration_ms, sites }) => {
@@ -2883,7 +2909,7 @@ server.tool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) 
   return { content: [{ type: "text", text: `session_warmup: visited ${urls.length} sites over ${duration_ms}ms` }] };
 });
 
-server.tool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva).", {}, async () => {
+regTool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva).", {}, async () => {
   const page = getPage();
   const result = await page.evaluate(`(() => {
     var html = document.documentElement.outerHTML.slice(0, 50000);
@@ -2902,7 +2928,7 @@ server.tool("detect_anti_bot", "Heuristic detection of anti-bot vendor on curren
 
 // ── Tools: Assertions ──────────────────────────────────────────────────────
 
-server.tool("assert_element_visible", "Assert element exists and is visible. Returns success/fail (no throw).", {
+regTool("assert_element_visible", "Assert element exists and is visible. Returns success/fail (no throw).", {
   selector: z.string(),
 }, async ({ selector }) => {
   const page = getPage();
@@ -2915,7 +2941,7 @@ server.tool("assert_element_visible", "Assert element exists and is visible. Ret
   }
 });
 
-server.tool("assert_text_present", "Assert text is present anywhere on page (case-sensitive substring).", {
+regTool("assert_text_present", "Assert text is present anywhere on page (case-sensitive substring).", {
   text: z.string(),
 }, async ({ text }) => {
   const page = getPage();
@@ -2927,7 +2953,7 @@ server.tool("assert_text_present", "Assert text is present anywhere on page (cas
   return { content: [{ type: "text", text: found ? `PASS: '${text}' present` : `FAIL: '${text}' not found in body` }] };
 });
 
-server.tool("assert_url_matches", "Assert current URL matches pattern (substring or regex).", {
+regTool("assert_url_matches", "Assert current URL matches pattern (substring or regex).", {
   pattern: z.string(),
   regex: z.boolean().default(false),
 }, async ({ pattern, regex }) => {
@@ -2939,7 +2965,7 @@ server.tool("assert_url_matches", "Assert current URL matches pattern (substring
 
 // ── Tools: Convenience / Workflow ──────────────────────────────────────────
 
-server.tool("click_and_wait", "Click element then wait for navigation or selector. Atomic — fewer roundtrips than separate click + wait_for.", {
+regTool("click_and_wait", "Click element then wait for navigation or selector. Atomic — fewer roundtrips than separate click + wait_for.", {
   ref: z.string().optional(),
   selector: z.string().optional(),
   wait_for_url: z.string().optional().describe("URL substring to wait for after click"),
@@ -2959,7 +2985,7 @@ server.tool("click_and_wait", "Click element then wait for navigation or selecto
   return { content: [{ type: "text", text: `click_and_wait: ${beforeUrl} → ${page.url()}` }] };
 });
 
-server.tool("wait_for_network_idle", "Wait until there are no in-flight requests for idle_ms continuously. Better than fixed timeouts for SPAs.", {
+regTool("wait_for_network_idle", "Wait until there are no in-flight requests for idle_ms continuously. Better than fixed timeouts for SPAs.", {
   idle_ms: z.number().default(500).describe("How long the network must stay quiet before returning."),
   timeout_ms: z.number().default(30000),
 }, async ({ idle_ms, timeout_ms }) => {
@@ -2995,7 +3021,7 @@ server.tool("wait_for_network_idle", "Wait until there are no in-flight requests
   }
 });
 
-server.tool(
+regTool(
   "describe_page",
   "Compact LLM-friendly page summary (title, heading, key buttons, forms). Cheaper than browser_snapshot for agent context. " +
     "Also returns `intent` — a classified hint of what kind of page this is " +
@@ -3072,6 +3098,1089 @@ server.tool(
     return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
   }
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Browserless HTTP kit — TLS-impersonating fetch via impit
+//
+// The browser is the expensive path: a Camoufox launch costs seconds and ~400MB.
+// Most fetches don't need a DOM at all. impit ships with camoufox-js and speaks
+// a real Firefox TLS/HTTP2 fingerprint (JA4 t13d1715h2…), so the browserless
+// path is as "real" as the browser one — and here it matches the browser we
+// actually drive, instead of pretending to be Chrome.
+// ═══════════════════════════════════════════════════════════════════════════
+
+type Impersonate = "firefox" | "chrome";
+
+// impit is a native module; load it lazily so a platform without prebuilt
+// bindings still gets a working server (only these tools degrade).
+let impitMod: any = null;
+async function getImpit(impersonate: Impersonate, proxy?: string, timeoutMs = 30000): Promise<any> {
+  if (!impitMod) {
+    try { impitMod = await import("impit"); }
+    catch (e: any) {
+      throw new Error(`impit (native HTTP client) unavailable on this platform: ${e?.message || e}. Use the browser tools instead (navigate + scrape_page).`);
+    }
+  }
+  const opts: any = { browser: impersonate, timeout: timeoutMs, followRedirects: true };
+  if (proxy) opts.proxyUrl = proxy;
+  return new impitMod.Impit(opts);
+}
+
+// Cookies the live browser session would send for this URL — lets an HTTP call
+// ride a session established by a real login.
+async function cookieHeaderFor(url: string): Promise<string> {
+  if (!browserContext) return "";
+  try {
+    const cookies = await browserContext.cookies(url);
+    return cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+  } catch { return ""; }
+}
+
+const BLOCK_STATUS = new Set([401, 403, 405, 406, 409, 421, 429, 503]);
+const BLOCK_MARKERS = [
+  "just a moment", "cf-chl", "challenge-platform", "checking your browser",
+  "attention required", "captcha-delivery", "please verify you are a human",
+  "access denied", "enable javascript and cookies to continue",
+  "verifying you are human", "px-captcha", "incapsula incident",
+];
+
+// Does this response smell like an anti-bot wall (→ worth spending a browser on)?
+function looksBlocked(status: number | null, text: string): boolean {
+  if (status === null) return true;
+  if (BLOCK_STATUS.has(status)) return true;
+  const low = (text || "").slice(0, 6000).toLowerCase();
+  if (BLOCK_MARKERS.some(m => low.includes(m))) return true;
+  // A 200 with an almost-empty body is usually a JS-challenge shell.
+  if (status === 200 && (text || "").length < 512 && (low.includes("<html") || low.trim() === "")) return true;
+  return false;
+}
+
+async function impitFetch(opts: {
+  url: string; method?: string; headers?: Record<string, string>; body?: string;
+  impersonate?: Impersonate; proxy?: string; timeoutMs?: number; useBrowserCookies?: boolean;
+}): Promise<{ status: number | null; text: string; headers: Record<string, string>; url: string; error?: string }> {
+  const headers: Record<string, string> = { ...(opts.headers || {}) };
+  if (opts.useBrowserCookies !== false) {
+    const ck = await cookieHeaderFor(opts.url);
+    if (ck && !Object.keys(headers).some(k => k.toLowerCase() === "cookie")) headers["Cookie"] = ck;
+  }
+  try {
+    const client = await getImpit(opts.impersonate || "firefox", opts.proxy, opts.timeoutMs || 30000);
+    const res = await client.fetch(opts.url, {
+      method: (opts.method || "GET").toUpperCase(),
+      headers,
+      ...(opts.body ? { body: opts.body } : {}),
+    });
+    const text = await res.text().catch(() => "");
+    const hdrs: Record<string, string> = {};
+    try { for (const [k, v] of (res.headers as any).entries()) hdrs[k] = String(v); } catch {}
+    return { status: res.status, text, headers: hdrs, url: res.url || opts.url };
+  } catch (e: any) {
+    return { status: null, text: "", headers: {}, url: opts.url, error: String(e?.message || e) };
+  }
+}
+
+// ── HTML → markdown (no DOM, no dependency) ────────────────────────────────
+
+function decodeEntities(s: string): string {
+  const named: Record<string, string> = {
+    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", mdash: "—", ndash: "–",
+    hellip: "…", rsquo: "’", lsquo: "‘", ldquo: "“", rdquo: "”", middot: "·", bull: "•",
+    copy: "©", reg: "®", trade: "™", laquo: "«", raquo: "»", deg: "°", euro: "€", pound: "£",
+  };
+  return s.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, e) => {
+    if (e[0] === "#") {
+      const code = /^#x/i.test(e) ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      try { return Number.isFinite(code) ? String.fromCodePoint(code) : m; } catch { return m; }
+    }
+    return named[e.toLowerCase()] ?? m;
+  });
+}
+
+// Prefer the primary content container so nav/sidebar/footer noise never
+// reaches the model.
+function sliceMain(html: string): string {
+  const m = html.match(/<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i);
+  if (m && m[2].length > 400) return m[2];
+  const d = html.match(/<div[^>]+(?:id|class)=["'][^"']*(?:content|main|article|post|entry)[^"']*["'][^>]*>([\s\S]*)/i);
+  if (d && d[1].length > 800) return d[1];
+  const b = html.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
+  return b ? b[1] : html;
+}
+
+function htmlToMarkdown(html: string, baseUrl = "", maxChars = 20000): string {
+  if (!html) return "";
+  const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = tm ? decodeEntities(tm[1].replace(/<[^>]+>/g, "")).trim() : "";
+  let s = sliceMain(html);
+  s = s.replace(/<!--[\s\S]*?-->/g, " ");
+  s = s.replace(/<(script|style|noscript|svg|template|iframe|nav|header|footer|aside)\b[^>]*>[\s\S]*?<\/\1>/gi, " ");
+  s = s.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_m, t) => `\n\n\`\`\`\n${decodeEntities(t.replace(/<[^>]+>/g, "")).trim()}\n\`\`\`\n\n`);
+  s = s.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_m, l, t) => `\n\n${"#".repeat(Number(l))} ${t.replace(/<[^>]+>/g, " ").trim()}\n\n`);
+  s = s.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_m, t) => `\n- ${t.replace(/<[^>]+>/g, " ").trim()}`);
+  s = s.replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (_m, attrs, t) => {
+    const text = t.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (!text) return " ";
+    const h = String(attrs).match(/href=["']([^"']+)["']/i);
+    if (!h) return text;
+    let abs = h[1];
+    try { abs = new URL(h[1], baseUrl || undefined).toString(); } catch {}
+    return abs.startsWith("http") ? `[${text}](${abs})` : text;
+  });
+  s = s.replace(/<img\b[^>]*alt=["']([^"']+)["'][^>]*>/gi, (_m, a) => `![${a}] `);
+  s = s.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_m, t) => `\`${t.replace(/<[^>]+>/g, "").trim()}\``);
+  s = s.replace(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi, (_m, t) => ` ${t.replace(/<[^>]+>/g, " ").trim()} |`);
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<\/(p|div|section|tr|ul|ol|table|blockquote|h[1-6])>/gi, "\n\n");
+  s = s.replace(/<[^>]+>/g, " ");
+  s = decodeEntities(s);
+  const lines = s.split("\n").map(l => l.replace(/[ \t ]+/g, " ").trim());
+  let text = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (title && !text.startsWith("#")) text = `# ${title}\n\n${text}`;
+  if (text.length > maxChars) text = text.slice(0, maxChars).trimEnd() + `\n\n[truncated at ${maxChars} chars]`;
+  return text;
+}
+
+// ── SERP parsing ───────────────────────────────────────────────────────────
+
+interface SerpHit { title: string; url: string; snippet: string }
+
+function htmlAnchors(html: string): { attrs: string; href: string; text: string }[] {
+  const out: { attrs: string; href: string; text: string }[] = [];
+  const re = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const h = m[1].match(/href=["']([^"']+)["']/i);
+    out.push({
+      attrs: m[1], href: h ? decodeEntities(h[1]) : "",
+      text: decodeEntities(m[2].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim(),
+    });
+  }
+  return out;
+}
+
+// DuckDuckGo wraps results in /l/?uddg=<encoded>. Unwrap to the real URL.
+function decodeDdgHref(href: string): string {
+  let h = href;
+  if (h.startsWith("//")) h = "https:" + h;
+  if (h.includes("uddg=")) {
+    try {
+      const u = new URL(h, "https://duckduckgo.com");
+      const real = u.searchParams.get("uddg");
+      if (real) return real;
+    } catch {}
+  }
+  return h;
+}
+
+function parseDDG(html: string): SerpHit[] {
+  const hits: SerpHit[] = [];
+  for (const a of htmlAnchors(html)) {
+    if (!/result__a|result-link/.test(a.attrs)) continue;
+    const url = decodeDdgHref(a.href);
+    if (!url.startsWith("http") || !a.text) continue;
+    if (/duckduckgo\.com/.test(url)) continue;
+    hits.push({ title: a.text, url, snippet: "" });
+  }
+  const sre = /class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|td|div)>/gi;
+  let i = 0, sm: RegExpExecArray | null;
+  while ((sm = sre.exec(html)) && i < hits.length) {
+    hits[i++].snippet = decodeEntities(sm[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 280);
+  }
+  return hits;
+}
+
+function parseBing(html: string): SerpHit[] {
+  const hits: SerpHit[] = [];
+  const blocks = html.split(/<li[^>]+class=["'][^"']*b_algo/i).slice(1);
+  for (const b of blocks) {
+    const a = htmlAnchors(b).find(x => x.href.startsWith("http") && x.text);
+    if (!a) continue;
+    const p = b.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+    hits.push({
+      title: a.text, url: a.href,
+      snippet: p ? decodeEntities(p[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 280) : "",
+    });
+  }
+  return hits;
+}
+
+// Rapid-fire SERP hits get soft-blocked (degraded/decoy results). Keep a gap.
+let lastSerpAt = 0;
+async function serpThrottle(): Promise<void> {
+  const gap = 1000 - (Date.now() - lastSerpAt);
+  if (gap > 0) await new Promise(r => setTimeout(r, gap));
+  lastSerpAt = Date.now();
+}
+
+async function runSearch(query: string, engine: string, count: number, proxy?: string): Promise<{ hits: SerpHit[]; via: string }> {
+  const q = encodeURIComponent(query);
+  const attempts: { via: string; run: () => Promise<SerpHit[]> }[] = [];
+  const ddgHtml = async () => {
+    const r = await impitFetch({
+      url: "https://html.duckduckgo.com/html/", method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Referer: "https://html.duckduckgo.com/" },
+      body: `q=${q}&kl=us-en`, proxy, useBrowserCookies: false,
+    });
+    return r.status === 200 ? parseDDG(r.text) : [];
+  };
+  const ddgLite = async () => {
+    const r = await impitFetch({ url: `https://lite.duckduckgo.com/lite/?q=${q}`, proxy, useBrowserCookies: false });
+    return r.status === 200 ? parseDDG(r.text) : [];
+  };
+  const bing = async () => {
+    const r = await impitFetch({ url: `https://www.bing.com/search?q=${q}&setmkt=en-US`, proxy, useBrowserCookies: false });
+    return r.status === 200 ? parseBing(r.text) : [];
+  };
+  if (engine === "bing") attempts.push({ via: "bing", run: bing }, { via: "duckduckgo-html", run: ddgHtml }, { via: "duckduckgo-lite", run: ddgLite });
+  else attempts.push({ via: "duckduckgo-html", run: ddgHtml }, { via: "duckduckgo-lite", run: ddgLite }, { via: "bing", run: bing });
+  for (const a of attempts) {
+    await serpThrottle();
+    let hits: SerpHit[] = [];
+    try { hits = await a.run(); } catch {}
+    if (hits.length) return { hits: hits.slice(0, count), via: a.via };
+  }
+  return { hits: [], via: "none" };
+}
+
+regTool("http_request",
+  "HTTP request WITHOUT a browser, using a real Firefox TLS/HTTP2 fingerprint (impit). " +
+  "By default it reuses the live browser's cookies for that URL, so you can log in with the browser and then hit the site's API cheaply. " +
+  "Far faster and lighter than navigating — use it for APIs, JSON, and any page that doesn't need JS.",
+  {
+    url: z.string(),
+    method: z.string().default("GET"),
+    body: z.string().default("").describe("Raw request body (JSON string, form-encoded, …)"),
+    headers_json: z.string().default("").describe('Extra headers as JSON, e.g. {"Accept":"application/json"}'),
+    impersonate: z.enum(["firefox", "chrome"]).default("firefox").describe("TLS fingerprint to present. firefox matches the Camoufox browser."),
+    use_browser_cookies: z.boolean().default(true),
+    proxy: z.string().default("").describe("Proxy URL, e.g. http://user:pass@host:port"),
+    timeout_ms: z.number().default(30000),
+    max_chars: z.number().default(20000).describe("Max response body characters returned."),
+  },
+  async ({ url, method, body, headers_json, impersonate, use_browser_cookies, proxy, timeout_ms, max_chars }) => {
+    let headers: Record<string, string> = {};
+    if (headers_json) {
+      try { headers = JSON.parse(headers_json); }
+      catch (e: any) { return { content: [{ type: "text", text: `Invalid headers_json: ${e?.message || e}` }], isError: true }; }
+    }
+    const r = await impitFetch({ url, method, headers, body: body || undefined, impersonate, proxy: proxy || undefined, timeoutMs: timeout_ms, useBrowserCookies: use_browser_cookies });
+    if (r.error) return { content: [{ type: "text", text: `Request failed: ${r.error}` }], isError: true };
+    const blocked = looksBlocked(r.status, r.text);
+    const shown = r.text.length > max_chars ? r.text.slice(0, max_chars) + `\n…[truncated, ${r.text.length} chars total]` : r.text;
+    const hdrLines = Object.entries(r.headers).slice(0, 15).map(([k, v]) => `  ${k}: ${v}`).join("\n");
+    return {
+      content: [{ type: "text", text:
+        `${method.toUpperCase()} ${r.url}\nstatus: ${r.status}${blocked ? "  ⚠ looks anti-bot blocked — retry via the browser (smart_fetch escalates automatically)" : ""}\n` +
+        `cookies sent: ${use_browser_cookies ? "browser session" : "none"}  impersonate: ${impersonate}\n\n── headers ──\n${hdrLines}\n\n── body ──\n${shown}` }],
+    };
+  });
+
+regTool("http_session_cookies",
+  "Show which browser cookies would be sent with an HTTP request to this URL. Use it to confirm session sharing before relying on http_request.",
+  { url: z.string() },
+  async ({ url }) => {
+    if (!browserContext) throw new Error("Browser not running. Call browser_launch first.");
+    const cookies = await browserContext.cookies(url);
+    if (!cookies.length) return { content: [{ type: "text", text: `No cookies would be sent to ${url}.` }] };
+    const lines = cookies.map((c: any) =>
+      `  ${c.name}=${String(c.value).slice(0, 30)}…  domain=${c.domain} path=${c.path}${c.httpOnly ? " httpOnly" : ""}${c.secure ? " secure" : ""}${(!c.expires || c.expires <= 0) ? " [session]" : ""}`);
+    return { content: [{ type: "text", text: `${cookies.length} cookie(s) for ${url}:\n${lines.join("\n")}` }] };
+  });
+
+regTool("scrape_markdown",
+  "Fetch a URL and return clean, LLM-ready markdown (headings, links, lists preserved; nav/footer/scripts stripped). " +
+  "Default path is browserless (impit) — fast and cheap. Set use_browser=true for JS-rendered pages (needs browser_launch).",
+  {
+    url: z.string(),
+    use_browser: z.boolean().default(false).describe("Render in the stealth browser instead of a plain HTTP fetch."),
+    impersonate: z.enum(["firefox", "chrome"]).default("firefox"),
+    max_chars: z.number().default(20000),
+    proxy: z.string().default(""),
+  },
+  async ({ url, use_browser, impersonate, max_chars, proxy }) => {
+    if (use_browser) {
+      const page = getPage();
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await page.waitForTimeout(1200);
+      const html = await page.content();
+      return { content: [{ type: "text", text: `source: browser\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
+    }
+    const r = await impitFetch({ url, impersonate, proxy: proxy || undefined });
+    if (r.error) return { content: [{ type: "text", text: `Fetch failed: ${r.error}` }], isError: true };
+    if (looksBlocked(r.status, r.text)) {
+      return { content: [{ type: "text", text: `Blocked by anti-bot (status ${r.status}) at ${r.url}. Retry with use_browser=true, or call smart_fetch which escalates automatically.` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `source: http (${impersonate} TLS)\nstatus: ${r.status}\nurl: ${r.url}\n\n${htmlToMarkdown(r.text, r.url, max_chars)}` }] };
+  });
+
+regTool("smart_fetch",
+  "Dual-mode fetch: tries the browserless HTTP path first and escalates to the stealth browser ONLY when the response looks anti-bot blocked. " +
+  "This is the efficiency core — high-volume reading stays cheap, the browser fires only when it's actually needed.",
+  {
+    url: z.string(),
+    force_browser: z.boolean().default(false),
+    impersonate: z.enum(["firefox", "chrome"]).default("firefox"),
+    max_chars: z.number().default(20000),
+    proxy: z.string().default(""),
+  },
+  async ({ url, force_browser, impersonate, max_chars, proxy }) => {
+    let httpNote = "";
+    if (!force_browser) {
+      const r = await impitFetch({ url, impersonate, proxy: proxy || undefined });
+      if (!r.error && !looksBlocked(r.status, r.text)) {
+        return { content: [{ type: "text", text: `path: http (no browser used)\nstatus: ${r.status}\nurl: ${r.url}\n\n${htmlToMarkdown(r.text, r.url, max_chars)}` }] };
+      }
+      httpNote = r.error ? `http error: ${r.error}` : `http status ${r.status} looked blocked`;
+    }
+    if (!browserUp || pages.length === 0) {
+      return { content: [{ type: "text", text: `${httpNote || "browser forced"} — and no browser is running. Call browser_launch first, then retry.` }], isError: true };
+    }
+    const page = getPage();
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // Give a JS challenge time to clear itself before reading the DOM.
+    for (let i = 0; i < 8; i++) {
+      await page.waitForTimeout(1000);
+      const html = await page.content();
+      if (html.length > 1500 && !looksBlocked(200, html)) {
+        return { content: [{ type: "text", text: `path: browser (escalated — ${httpNote})\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
+      }
+    }
+    const html = await page.content();
+    return { content: [{ type: "text", text: `path: browser (escalated — ${httpNote}); challenge may still be active\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
+  });
+
+regTool("web_search",
+  "Web search with NO browser and NO API key — scrapes DuckDuckGo/Bing SERPs over the impersonated HTTP path. " +
+  "Returns title + url + snippet per result. Pair with scrape_markdown or deep_research to actually read the hits.",
+  {
+    query: z.string(),
+    engine: z.enum(["duckduckgo", "bing"]).default("duckduckgo"),
+    count: z.number().default(8),
+    proxy: z.string().default(""),
+  },
+  async ({ query, engine, count, proxy }) => {
+    const { hits, via } = await runSearch(query, engine, count, proxy || undefined);
+    if (!hits.length) {
+      return { content: [{ type: "text", text: `No results for "${query}" (tried ${engine} + fallbacks). SERP markup may have changed, or the query was soft-blocked — retry in a few seconds or use a proxy.` }], isError: true };
+    }
+    const lines = hits.map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}${h.snippet ? `\n   ${h.snippet}` : ""}`);
+    return { content: [{ type: "text", text: `${hits.length} result(s) for "${query}" via ${via}:\n\n${lines.join("\n\n")}` }] };
+  });
+
+regTool("deep_research",
+  "One call: search → fetch the top N results → return clean markdown per source with citations. Fully browserless; " +
+  "sources that are anti-bot blocked are flagged so you can re-fetch those few with smart_fetch(force_browser=true).",
+  {
+    query: z.string(),
+    max_sources: z.number().default(4),
+    engine: z.enum(["duckduckgo", "bing"]).default("duckduckgo"),
+    per_source_chars: z.number().default(3000),
+    proxy: z.string().default(""),
+  },
+  async ({ query, max_sources, engine, per_source_chars, proxy }) => {
+    const { hits, via } = await runSearch(query, engine, max_sources, proxy || undefined);
+    if (!hits.length) return { content: [{ type: "text", text: `No search results for "${query}".` }], isError: true };
+    const parts: string[] = [`# Research: ${query}`, `_${hits.length} source(s) via ${via}_`, ""];
+    let blocked = 0;
+    // Fetch sources concurrently — they're independent and this is the slow bit.
+    const fetched = await Promise.all(hits.map(h =>
+      impitFetch({ url: h.url, impersonate: "firefox", proxy: proxy || undefined, useBrowserCookies: false })
+        .then(r => ({ h, r })).catch(() => ({ h, r: { status: null, text: "", headers: {}, url: h.url, error: "fetch failed" } as any }))));
+    for (let i = 0; i < fetched.length; i++) {
+      const { h, r } = fetched[i];
+      parts.push(`## [${i + 1}] ${h.title}`, h.url, "");
+      if (r.error || looksBlocked(r.status, r.text)) {
+        blocked++;
+        parts.push(`_(blocked or unreachable — status ${r.status}${r.error ? `, ${r.error}` : ""}. Re-fetch with smart_fetch(force_browser=true).)_`, "");
+        if (h.snippet) parts.push(`Snippet from SERP: ${h.snippet}`, "");
+        continue;
+      }
+      parts.push(htmlToMarkdown(r.text, r.url, per_source_chars), "");
+    }
+    parts.push("---", `Sources: ${hits.map((h, i) => `[${i + 1}] ${h.url}`).join("  ")}`);
+    if (blocked) parts.push(`${blocked} of ${hits.length} source(s) were blocked on the HTTP path.`);
+    return { content: [{ type: "text", text: parts.join("\n") }] };
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LLM-ergonomics kit — fewer round-trips, fewer blind guesses
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ref OR css selector → locator (the pattern half these tools need).
+function targetLocator(page: Page, ref?: string, selector?: string): any | null {
+  if (ref) return refLocator(page, ref);
+  if (selector) return page.locator(selector).first();
+  return null;
+}
+
+regTool("search_page",
+  "Grep the CURRENT page's visible text and return matches with surrounding context. " +
+  "Costs nothing compared to a snapshot or a screenshot — use it first to find where a term actually appears.",
+  {
+    text: z.string().describe("Substring, or a regex source when regex=true"),
+    regex: z.boolean().default(false),
+    max_matches: z.number().default(20),
+    context_chars: z.number().default(120),
+    case_sensitive: z.boolean().default(false),
+  },
+  async ({ text, regex, max_matches, context_chars, case_sensitive }) => {
+    const page = getPage();
+    const res = await page.evaluate(`(() => {
+      var body = document.body ? (document.body.innerText || "") : "";
+      var needle = ${jsStr(text)};
+      var flags = "g" + (${case_sensitive} ? "" : "i");
+      var re;
+      try { re = ${regex} ? new RegExp(needle, flags) : new RegExp(needle.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&"), flags); }
+      catch (e) { return { error: String(e && e.message || e) }; }
+      var out = [], m, guard = 0;
+      while ((m = re.exec(body)) !== null && out.length < ${max_matches} && guard++ < 5000) {
+        if (m.index === re.lastIndex) re.lastIndex++;
+        var s = Math.max(0, m.index - ${context_chars});
+        var e2 = Math.min(body.length, m.index + m[0].length + ${context_chars});
+        out.push({ at: m.index, match: m[0].slice(0, 120), context: body.slice(s, e2).replace(/\\s+/g, " ").trim() });
+      }
+      return { total_text: body.length, matches: out };
+    })()`) as any;
+    if (res?.error) return { content: [{ type: "text", text: `Invalid pattern: ${res.error}` }], isError: true };
+    const ms = res?.matches || [];
+    if (!ms.length) return { content: [{ type: "text", text: `"${text}" not found in the page's visible text (${res?.total_text || 0} chars).` }] };
+    const lines = ms.map((m: any, i: number) => `${i + 1}. …${m.context}…`);
+    return { content: [{ type: "text", text: `${ms.length} match(es) for "${text}":\n${lines.join("\n")}` }] };
+  });
+
+regTool("wait_for_change",
+  "Wait until the page actually CHANGES and report what changed (url / title / DOM size / text). " +
+  "This is the honest version of a fixed sleep after a click: it returns as soon as something happened, or tells you nothing did.",
+  {
+    timeout: z.number().default(10000),
+    settle_ms: z.number().default(400).describe("Require the page to stay stable this long after the change."),
+    poll_ms: z.number().default(200),
+  },
+  async ({ timeout, settle_ms, poll_ms }) => {
+    const page = getPage();
+    const SIG = `(() => ({ url: location.href, title: document.title, els: document.querySelectorAll("*").length, len: (document.body ? (document.body.innerText||"").length : 0) }))()`;
+    const before: any = await page.evaluate(SIG);
+    const deadline = Date.now() + timeout;
+    let changedAt = 0, last: any = before;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(poll_ms);
+      let now: any;
+      try { now = await page.evaluate(SIG); } catch { continue; }   // mid-navigation
+      const diff = now.url !== before.url || now.title !== before.title ||
+        Math.abs(now.els - before.els) > 2 || Math.abs(now.len - before.len) > 20;
+      if (diff) {
+        if (!changedAt) changedAt = Date.now();
+        // settle: keep going until two consecutive polls agree
+        if (now.url === last.url && now.els === last.els && Math.abs(now.len - last.len) <= 5 && Date.now() - changedAt >= settle_ms) {
+          const what: string[] = [];
+          if (now.url !== before.url) what.push(`url: ${before.url} → ${now.url}`);
+          if (now.title !== before.title) what.push(`title: "${before.title}" → "${now.title}"`);
+          if (now.els !== before.els) what.push(`elements: ${before.els} → ${now.els}`);
+          if (now.len !== before.len) what.push(`text length: ${before.len} → ${now.len}`);
+          return { content: [{ type: "text", text: `Page changed after ~${Date.now() - (deadline - timeout)}ms:\n  ${what.join("\n  ")}` }] };
+        }
+      }
+      last = now;
+    }
+    return { content: [{ type: "text", text: `No change detected within ${timeout}ms (url ${before.url}, ${before.els} elements). The action may not have registered — check with assert_clickable or a snapshot.` }] };
+  });
+
+regTool("assert_clickable",
+  "Hit-test an element WITHOUT clicking: would a real click actually land on it? Answers \"why did my click do nothing?\" before you spend the click. " +
+  "Reports the element that would intercept the click when something covers it.",
+  {
+    ref: z.string().default(""),
+    selector: z.string().default(""),
+  },
+  async ({ ref, selector }) => {
+    const page = getPage();
+    const loc = targetLocator(page, ref, selector);
+    if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+    if (await loc.count() === 0) return { content: [{ type: "text", text: `Not found: ${ref ? `ref=${ref}` : selector}` }], isError: true };
+    const r = await loc.evaluate((el: any) => {
+      const rect = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      const desc = (n: any) => {
+        if (!n || !n.tagName) return "(none)";
+        let s = n.tagName.toLowerCase();
+        if (n.id) s += "#" + n.id;
+        else if (typeof n.className === "string" && n.className.trim()) s += "." + n.className.trim().split(/\s+/).slice(0, 2).join(".");
+        const t = (n.innerText || "").trim().slice(0, 40);
+        return t ? `${s} "${t}"` : s;
+      };
+      const out: any = {
+        rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+        display: cs.display, visibility: cs.visibility, opacity: cs.opacity,
+        pointerEvents: cs.pointerEvents, disabled: !!el.disabled,
+        inViewport: rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth,
+        zeroSize: rect.width < 1 || rect.height < 1,
+      };
+      const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+      if (cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight) {
+        const top = document.elementFromPoint(cx, cy);
+        out.topAtCenter = desc(top);
+        out.hit = !!top && (top === el || el.contains(top) || top.contains(el));
+      } else {
+        out.topAtCenter = "(centre outside viewport)";
+        out.hit = false;
+      }
+      return out;
+    });
+    const problems: string[] = [];
+    if (r.zeroSize) problems.push("element has zero size");
+    if (r.display === "none" || r.visibility === "hidden" || Number(r.opacity) === 0) problems.push(`hidden (display=${r.display} visibility=${r.visibility} opacity=${r.opacity})`);
+    if (r.disabled) problems.push("element is disabled");
+    if (!r.inViewport) problems.push("outside the viewport — scroll_to it first");
+    if (r.pointerEvents === "none") problems.push("pointer-events: none");
+    if (!r.hit && r.inViewport && !r.zeroSize) problems.push(`covered by ${r.topAtCenter} — that element would receive the click`);
+    const verdict = problems.length === 0 ? "PASS: a real click would reach this element." : `FAIL: ${problems.join("; ")}`;
+    return { content: [{ type: "text", text: `${verdict}\n\n${JSON.stringify(r, null, 2)}` }] };
+  });
+
+regTool("scroll_to",
+  "Scroll a specific element into view (the page-level `scroll` tool only moves by pixels).",
+  {
+    ref: z.string().default(""),
+    selector: z.string().default(""),
+    block: z.enum(["start", "center", "end", "nearest"]).default("center"),
+  },
+  async ({ ref, selector, block }) => {
+    const page = getPage();
+    const loc = targetLocator(page, ref, selector);
+    if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+    if (await loc.count() === 0) return { content: [{ type: "text", text: `Not found: ${ref ? `ref=${ref}` : selector}` }], isError: true };
+    await loc.evaluate((el: any, b: string) => el.scrollIntoView({ behavior: "smooth", block: b, inline: "nearest" }), block);
+    await page.waitForTimeout(500);
+    const pos = await loc.evaluate((el: any) => { const r = el.getBoundingClientRect(); return `${Math.round(r.x)},${Math.round(r.y)}`; });
+    return { content: [{ type: "text", text: `Scrolled ${ref ? `ref=${ref}` : selector} into view (block=${block}); now at ${pos}` }] };
+  });
+
+regTool("click_element_offset",
+  "Click at a percentage position inside an element instead of its centre — for wide labels whose real checkbox sits at the left edge, sliders, or split buttons.",
+  {
+    ref: z.string().default(""),
+    selector: z.string().default(""),
+    x_percent: z.number().default(50).describe("0 = left edge, 100 = right edge"),
+    y_percent: z.number().default(50).describe("0 = top edge, 100 = bottom edge"),
+  },
+  async ({ ref, selector, x_percent, y_percent }) => {
+    const page = getPage();
+    const loc = targetLocator(page, ref, selector);
+    if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+    try { await loc.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT }); } catch {}
+    const box = await loc.boundingBox();
+    if (!box) return { content: [{ type: "text", text: "Element has no bounding box (hidden?)" }], isError: true };
+    const x = box.x + box.width * (Math.min(100, Math.max(0, x_percent)) / 100);
+    const y = box.y + box.height * (Math.min(100, Math.max(0, y_percent)) / 100);
+    await page.mouse.move(x + 60, y - 40, { steps: 8 });
+    await page.mouse.click(x, y);
+    await page.waitForTimeout(600);
+    return { content: [{ type: "text", text: `Clicked at ${x_percent}%,${y_percent}% of the element → (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}` }] };
+  });
+
+regTool("click_at_corner",
+  "Click a corner of an element — close/X buttons, delete icons and dismiss controls usually live there, not in the centre.",
+  {
+    ref: z.string().default(""),
+    selector: z.string().default(""),
+    corner: z.enum(["top-left", "top-right", "bottom-left", "bottom-right"]).default("top-right"),
+    offset: z.number().default(8).describe("Inset in pixels from the corner."),
+  },
+  async ({ ref, selector, corner, offset }) => {
+    const page = getPage();
+    const loc = targetLocator(page, ref, selector);
+    if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+    try { await loc.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT }); } catch {}
+    const box = await loc.boundingBox();
+    if (!box) return { content: [{ type: "text", text: "Element has no bounding box (hidden?)" }], isError: true };
+    const left = corner.endsWith("left");
+    const top = corner.startsWith("top");
+    const x = left ? box.x + offset : box.x + box.width - offset;
+    const y = top ? box.y + offset : box.y + box.height - offset;
+    await page.mouse.move(x + 50, y - 30, { steps: 8 });
+    await page.mouse.click(x, y);
+    await page.waitForTimeout(600);
+    return { content: [{ type: "text", text: `Clicked ${corner} corner at (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}` }] };
+  });
+
+regTool("paste_text",
+  "Fill a field with a REAL paste. Puts the text on the clipboard and presses Ctrl/Cmd+V so the page receives a trusted paste event " +
+  "with actual clipboardData — the only thing that works for frameworks that listen to paste alone (Svelte 5 / SolidJS runes, some Qwik forms). " +
+  "Falls back to a synthetic event and then the native value setter.",
+  {
+    ref: z.string().default(""),
+    selector: z.string().default(""),
+    text: z.string(),
+  },
+  async ({ ref, selector, text }) => {
+    const page = getPage();
+    const loc = targetLocator(page, ref, selector);
+    if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+    if (await loc.count() === 0) return { content: [{ type: "text", text: `Not found: ${ref ? `ref=${ref}` : selector}` }], isError: true };
+
+    const readValue = () => loc.evaluate((el: any) => ("value" in el ? el.value : (el.textContent || "")));
+    // Tier 1 — the real thing: clipboard + trusted Ctrl/Cmd+V.
+    try {
+      await loc.focus({ timeout: ACTION_TIMEOUT });
+      await loc.evaluate((el: any) => { if ("value" in el) el.value = ""; else el.textContent = ""; });
+      await page.evaluate((t: string) => navigator.clipboard.writeText(t), text);
+      await page.keyboard.press("ControlOrMeta+V");
+      await page.waitForTimeout(250);
+      if (String(await readValue()) === text) {
+        return { content: [{ type: "text", text: `paste_text via real clipboard paste (trusted event) → field matches.` }] };
+      }
+    } catch {
+      // clipboard blocked (older profile without the pref, or no permission) → fall through
+    }
+
+    const result = await loc.evaluate((el: any, value: string) => {
+      const isField = "value" in el;
+      const before = isField ? el.value : (el.textContent || "");
+      try { el.focus(); } catch {}
+      let pasteHandled = false;
+      try {
+        const dt = new DataTransfer();
+        dt.setData("text/plain", value);
+        const ev = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt } as any);
+        el.dispatchEvent(ev);
+        pasteHandled = isField ? el.value !== before : (el.textContent || "") !== before;
+      } catch {}
+      if (!pasteHandled) {
+        if (isField) {
+          // Native setter so React's value tracker sees a real change.
+          const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const desc = Object.getOwnPropertyDescriptor(proto, "value");
+          if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+        } else {
+          el.textContent = value;
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      return { via: pasteHandled ? "synthetic-paste-event" : "native-setter+input", value: isField ? el.value : (el.textContent || "") };
+    }, text);
+    const ok = String(result.value) === text;
+    const caveat = result.via === "native-setter+input"
+      ? " (NOTE: the real clipboard path was unavailable and Firefox won't attach data to a synthetic paste — a field that ONLY listens for paste may still be empty in the app's state)"
+      : "";
+    return {
+      content: [{ type: "text", text: `paste_text via ${result.via} → field now ${ok ? "matches" : `DIFFERS: "${String(result.value).slice(0, 60)}"`}${caveat}` }],
+      ...(ok ? {} : { isError: true }),
+    };
+  });
+
+regTool("form_introspect",
+  "Analyse a form in one call: per field the label, type, current value, required/pattern/length constraints, validation state, and the JS framework it is bound to. " +
+  "Tells you what to fill and why a submit is being rejected without guessing from a snapshot.",
+  {
+    form_selector: z.string().default("").describe("CSS selector for the form. Empty = first form, or all top-level fields if the page has none."),
+  },
+  async ({ form_selector }) => {
+    const page = getPage();
+    const data = await page.evaluate(`(() => {
+      var sel = ${jsStr(form_selector)};
+      var form = sel ? document.querySelector(sel) : document.querySelector("form");
+      var root = form || document.body;
+      var fields = root.querySelectorAll("input:not([type=hidden]), textarea, select");
+      function labelFor(el) {
+        if (el.id) { var l = document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + '"]'); if (l) return (l.innerText||"").trim(); }
+        var p = el.closest("label"); if (p) return (p.innerText||"").trim();
+        if (el.getAttribute("aria-label")) return el.getAttribute("aria-label");
+        var ab = el.getAttribute("aria-labelledby");
+        if (ab) { var t = document.getElementById(ab); if (t) return (t.innerText||"").trim(); }
+        return el.placeholder || el.name || el.id || "";
+      }
+      function framework(el) {
+        var keys = Object.keys(el);
+        if (keys.some(function(k){return k.indexOf("__react") === 0;})) return "react";
+        if (el.__vue__ || el.__vnode || keys.some(function(k){return k.indexOf("__vue") === 0;})) return "vue";
+        if (el.__svelte_meta || keys.some(function(k){return k.indexOf("$$") === 0;})) return "svelte";
+        if (keys.some(function(k){return k.indexOf("_$") === 0;})) return "solid";
+        if (el.closest("[data-qwik], [q\\\\:container]")) return "qwik";
+        return "";
+      }
+      var out = [];
+      for (var i = 0; i < fields.length && i < 40; i++) {
+        var el = fields[i];
+        var v;
+        try { v = el.validity; } catch (e) { v = null; }
+        out.push({
+          label: labelFor(el).slice(0, 60),
+          tag: el.tagName.toLowerCase(),
+          type: el.type || "",
+          name: el.name || "",
+          id: el.id || "",
+          value: String(el.value || "").slice(0, 60),
+          required: !!el.required,
+          disabled: !!el.disabled,
+          readonly: !!el.readOnly,
+          pattern: el.getAttribute("pattern") || "",
+          minlength: el.getAttribute("minlength") || "",
+          maxlength: el.getAttribute("maxlength") || "",
+          valid: v ? v.valid : null,
+          validationMessage: el.validationMessage || "",
+          framework: framework(el),
+        });
+      }
+      return {
+        form_found: !!form,
+        action: form ? (form.action || "") : "",
+        method: form ? (form.method || "") : "",
+        field_count: fields.length,
+        fields: out,
+      };
+    })()`);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+regTool("smart_fill",
+  "Fill form fields by their LABEL text (fuzzy, case-insensitive) instead of refs — no snapshot needed. " +
+  "Values go through the same clearing logic as fill, so email/number fields replace rather than append.",
+  {
+    fields_json: z.string().describe('JSON object of {"Label": "value", …}, e.g. {"Email":"a@b.com","Password":"secret"}'),
+    within: z.string().default("").describe('Scope: "@dialog", "ref:e5", or a CSS selector.'),
+    submit_label: z.string().default("").describe("If set, click the button whose text matches after filling."),
+  },
+  async ({ fields_json, within, submit_label }) => {
+    const page = getPage();
+    let fields: Record<string, string>;
+    try {
+      fields = JSON.parse(fields_json);
+      if (!fields || typeof fields !== "object" || Array.isArray(fields)) throw new Error("expected a JSON object");
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Invalid fields_json: ${e?.message || e}` }], isError: true };
+    }
+    const scopeSel = within === "@dialog" ? '[role="dialog"], dialog[open], [aria-modal="true"]'
+      : within.startsWith("ref:") ? `[data-mcp-ref="${within.slice(4)}"]` : within;
+    const log: string[] = [];
+    for (const [label, value] of Object.entries(fields)) {
+      // Resolve the label to a concrete field IN THE PAGE, then tag it with a ref
+      // so the fill goes through the normal locator path.
+      const ref = await page.evaluate(`(() => {
+        var scopeSel = ${jsStr(scopeSel)};
+        var root = scopeSel ? (document.querySelector(scopeSel) || document) : document;
+        var want = ${jsStr(label)}.toLowerCase().trim();
+        var fields = root.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select");
+        function labelOf(el) {
+          var parts = [];
+          if (el.id) { var l = document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + '"]'); if (l) parts.push(l.innerText || ""); }
+          var p = el.closest("label"); if (p) parts.push(p.innerText || "");
+          parts.push(el.getAttribute("aria-label") || "", el.placeholder || "", el.name || "", el.id || "");
+          return parts.join(" ").toLowerCase();
+        }
+        var exact = null, partial = null;
+        for (var i = 0; i < fields.length; i++) {
+          var t = labelOf(fields[i]).trim();
+          if (!t) continue;
+          if (t === want) { exact = fields[i]; break; }
+          if (!partial && t.indexOf(want) !== -1) partial = fields[i];
+        }
+        var el = exact || partial;
+        if (!el) return "";
+        var ref = "sf" + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+        el.setAttribute("data-mcp-ref", ref);
+        return ref;
+      })()`) as string;
+      if (!ref) { log.push(`"${label}": NO FIELD MATCHED`); continue; }
+      try {
+        await fillLocator(refLocator(page, ref), value);
+        log.push(`"${label}": filled`);
+      } catch (e: any) {
+        log.push(`"${label}": FAILED — ${String(e?.message || e).slice(0, 80)}`);
+      }
+    }
+    let submitNote = "";
+    if (submit_label) {
+      const loc = scopeRoot(page, within).getByText(submit_label, { exact: false });
+      const n = await loc.count();
+      if (n === 0) submitNote = `\nsubmit: no element matched "${submit_label}"`;
+      else {
+        const mode = await clickWithFallback(loc.first());
+        await page.waitForTimeout(1000);
+        submitNote = `\nsubmit: clicked "${submit_label}"${n > 1 ? ` (${n} matched, took the first)` : ""}${clickNote(mode)}`;
+      }
+    }
+    const failed = log.filter(l => l.includes("NO FIELD") || l.includes("FAILED")).length;
+    return {
+      content: [{ type: "text", text: `smart_fill: ${log.length - failed}/${log.length} filled\n  ${log.join("\n  ")}${submitNote}\nURL: ${page.url()}` }],
+      ...(failed ? { isError: true } : {}),
+    };
+  });
+
+// ── Persistent dialog handling ─────────────────────────────────────────────
+
+let autoDialogCfg: { action: "accept" | "dismiss"; promptText: string } | null = null;
+let autoDialogHandler: ((d: Dialog) => void) | null = null;
+let oneShotDialogArmed = false;
+
+regTool("dialog_auto_handle",
+  "Install a PERSISTENT dialog handler that stays armed across every dialog and every tab (dialog_handle is one-shot). " +
+  "Reads its action at fire time, so you can change it without re-arming. Set enabled=false to remove it.",
+  {
+    action: z.enum(["accept", "dismiss"]).default("accept"),
+    prompt_text: z.string().default("").describe("Text to submit for prompt() dialogs."),
+    enabled: z.boolean().default(true),
+  },
+  async ({ action, prompt_text, enabled }) => {
+    if (!browserUp) throw new Error("Browser not running. Call browser_launch first.");
+    if (!enabled) {
+      if (autoDialogHandler) for (const p of pages) { try { p.off("dialog", autoDialogHandler); } catch {} }
+      autoDialogHandler = null; autoDialogCfg = null;
+      return { content: [{ type: "text", text: "Persistent dialog handler removed. Dialogs fall back to Playwright's auto-dismiss." }] };
+    }
+    autoDialogCfg = { action, promptText: prompt_text };
+    if (!autoDialogHandler) {
+      autoDialogHandler = async (dialog: Dialog) => {
+        // A one-shot dialog_handle takes precedence for the next dialog.
+        if (oneShotDialogArmed) return;
+        const cfg = autoDialogCfg;
+        if (!cfg) { try { await dialog.dismiss(); } catch {} return; }
+        try {
+          if (cfg.action === "accept") await dialog.accept(cfg.promptText);
+          else await dialog.dismiss();
+        } catch {}
+      };
+      for (const p of pages) p.on("dialog", autoDialogHandler);
+    }
+    return { content: [{ type: "text", text: `Persistent dialog handler armed: every dialog will be ${action}'d (${pages.length} tab(s), new tabs inherit it). Call with enabled=false to remove.` }] };
+  });
+
+regTool("sessionstorage_clear", "Clear all sessionStorage for the current origin (parity with localstorage_clear).", {}, async () => {
+  const page = getPage();
+  const n = await page.evaluate(`(() => { var n = sessionStorage.length; sessionStorage.clear(); return n; })()`);
+  return { content: [{ type: "text", text: `sessionStorage cleared (${n} key(s) removed).` }] };
+});
+
+regTool("wait_for_request",
+  "Block until the page ISSUES a request matching a URL substring (wait_for_response waits for the reply). " +
+  "Use it to confirm an action actually fired its API call.",
+  {
+    url_pattern: z.string(),
+    method: z.string().default("").describe("Optional HTTP verb filter (GET/POST/…)"),
+    timeout: z.number().default(15000),
+  },
+  async ({ url_pattern, method, timeout }) => {
+    const page = getPage();
+    try {
+      const req = await page.waitForRequest(
+        (r: any) => r.url().includes(url_pattern) && (!method || r.method().toUpperCase() === method.toUpperCase()),
+        { timeout });
+      const post = req.postData();
+      return { content: [{ type: "text", text: `Request: ${req.method()} ${req.url().slice(0, 200)}${post ? `\nbody: ${post.slice(0, 500)}` : ""}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `No request matching "${url_pattern}"${method ? ` (${method})` : ""} within ${timeout}ms.` }], isError: true };
+    }
+  });
+
+// ── Storage snapshot / diff ────────────────────────────────────────────────
+
+const storageSnapshots = new Map<string, any>();
+
+async function captureStorage(page: Page): Promise<any> {
+  const web = await page.evaluate(`(() => {
+    var l = {}, s = {};
+    try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); l[k] = localStorage.getItem(k); } } catch (e) {}
+    try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); s[k2] = sessionStorage.getItem(k2); } } catch (e) {}
+    return { url: location.href, local: l, session: s };
+  })()`) as any;
+  let cookies: any[] = [];
+  try { cookies = await page.context().cookies(); } catch {}
+  return { ...web, cookies: Object.fromEntries(cookies.map((c: any) => [`${c.domain}${c.path}:${c.name}`, String(c.value)])) };
+}
+
+function diffMaps(before: Record<string, string>, after: Record<string, string>) {
+  const added: any = {}, removed: any = {}, changed: any = {};
+  for (const k of Object.keys(after)) {
+    if (!(k in before)) added[k] = String(after[k]).slice(0, 120);
+    else if (before[k] !== after[k]) changed[k] = { from: String(before[k]).slice(0, 60), to: String(after[k]).slice(0, 60) };
+  }
+  for (const k of Object.keys(before)) if (!(k in after)) removed[k] = String(before[k]).slice(0, 120);
+  return { added, removed, changed };
+}
+
+regTool("storage_snapshot",
+  "Capture cookies + localStorage + sessionStorage + URL into a named slot, so storage_diff can tell you exactly what an action changed.",
+  { name: z.string().default("default") },
+  async ({ name }) => {
+    const page = getPage();
+    const snap = await captureStorage(page);
+    storageSnapshots.set(name, snap);
+    return { content: [{ type: "text", text: `Snapshot "${name}": ${Object.keys(snap.cookies).length} cookies, ${Object.keys(snap.local).length} localStorage, ${Object.keys(snap.session).length} sessionStorage @ ${snap.url}` }] };
+  });
+
+regTool("storage_diff",
+  "Compare current storage against an earlier storage_snapshot — shows exactly which cookies/localStorage/sessionStorage keys were added, removed or changed. " +
+  "The fastest way to find which key holds a session token.",
+  { name: z.string().default("default") },
+  async ({ name }) => {
+    const page = getPage();
+    const before = storageSnapshots.get(name);
+    if (!before) {
+      const have = [...storageSnapshots.keys()];
+      return { content: [{ type: "text", text: `No snapshot named "${name}".${have.length ? ` Available: ${have.join(", ")}` : " Call storage_snapshot first."}` }], isError: true };
+    }
+    const after = await captureStorage(page);
+    const out = {
+      url: before.url === after.url ? after.url : { from: before.url, to: after.url },
+      cookies: diffMaps(before.cookies, after.cookies),
+      localStorage: diffMaps(before.local, after.local),
+      sessionStorage: diffMaps(before.session, after.session),
+    };
+    const count = (d: any) => Object.keys(d.added).length + Object.keys(d.removed).length + Object.keys(d.changed).length;
+    const total = count(out.cookies) + count(out.localStorage) + count(out.sessionStorage);
+    return { content: [{ type: "text", text: `storage_diff vs "${name}": ${total} change(s)\n${JSON.stringify(out, null, 2)}` }] };
+  });
+
+// ── IndexedDB ──────────────────────────────────────────────────────────────
+
+regTool("indexeddb_list",
+  "List IndexedDB databases for the current origin. Many SPAs keep auth state and drafts here, invisible to cookie/localStorage tools.",
+  {}, async () => {
+    const page = getPage();
+    const dbs = await page.evaluate(`(async () => {
+      if (typeof indexedDB.databases !== "function") return { unsupported: true };
+      try { return { dbs: await indexedDB.databases() }; } catch (e) { return { error: String(e && e.message || e) }; }
+    })()`) as any;
+    if (dbs?.unsupported) return { content: [{ type: "text", text: "This browser build can't enumerate IndexedDB databases (indexedDB.databases unavailable). You can still delete one by name with indexeddb_delete." }] };
+    if (dbs?.error) return { content: [{ type: "text", text: `IndexedDB error: ${dbs.error}` }], isError: true };
+    const list = dbs?.dbs || [];
+    if (!list.length) return { content: [{ type: "text", text: "No IndexedDB databases for this origin." }] };
+    return { content: [{ type: "text", text: `IndexedDB (${list.length}):\n${list.map((d: any) => `  ${d.name}  v${d.version}`).join("\n")}` }] };
+  });
+
+regTool("indexeddb_delete",
+  "Delete an IndexedDB database by name for the current origin (clears SPA state that survives a cookie wipe).",
+  { name: z.string() },
+  async ({ name }) => {
+    const page = getPage();
+    const res = await page.evaluate(`(async () => {
+      return await new Promise(function (resolve) {
+        var req = indexedDB.deleteDatabase(${jsStr(name)});
+        var done = false;
+        req.onsuccess = function () { done = true; resolve("deleted"); };
+        req.onerror = function () { done = true; resolve("error"); };
+        req.onblocked = function () { done = true; resolve("blocked (a tab still holds a connection)"); };
+        setTimeout(function () { if (!done) resolve("timeout"); }, 5000);
+      });
+    })()`) as string;
+    const ok = res === "deleted";
+    return { content: [{ type: "text", text: `indexeddb_delete("${name}"): ${res}` }], ...(ok ? {} : { isError: true }) };
+  });
+
+regTool("performance_timeline",
+  "Navigation + paint + resource timing for the current page: TTFB, DOMContentLoaded, load, FCP, LCP, and the 5 slowest resources. " +
+  "Note: Firefox does not implement layout-shift, so CLS is unavailable here.",
+  {}, async () => {
+    const page = getPage();
+    const data = await page.evaluate(`(() => {
+      var nav = performance.getEntriesByType("navigation")[0] || null;
+      var paints = {};
+      performance.getEntriesByType("paint").forEach(function (p) { paints[p.name] = Math.round(p.startTime); });
+      var lcp = null;
+      try {
+        var l = performance.getEntriesByType("largest-contentful-paint");
+        if (l && l.length) lcp = Math.round(l[l.length - 1].startTime);
+      } catch (e) {}
+      var res = performance.getEntriesByType("resource").map(function (r) {
+        return { name: String(r.name).slice(0, 120), type: r.initiatorType, ms: Math.round(r.duration), size: r.transferSize || 0 };
+      }).sort(function (a, b) { return b.ms - a.ms; });
+      return {
+        url: location.href,
+        ttfb_ms: nav ? Math.round(nav.responseStart - nav.requestStart) : null,
+        dom_content_loaded_ms: nav ? Math.round(nav.domContentLoadedEventEnd) : null,
+        load_ms: nav ? Math.round(nav.loadEventEnd) : null,
+        dom_interactive_ms: nav ? Math.round(nav.domInteractive) : null,
+        transfer_size: nav ? nav.transferSize : null,
+        first_paint_ms: paints["first-paint"] != null ? paints["first-paint"] : null,
+        first_contentful_paint_ms: paints["first-contentful-paint"] != null ? paints["first-contentful-paint"] : null,
+        largest_contentful_paint_ms: lcp,
+        cumulative_layout_shift: "unsupported-in-firefox",
+        resource_count: res.length,
+        slowest_resources: res.slice(0, 5)
+      };
+    })()`);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+regTool("browser_recover",
+  "Escape hatch when the browser is wedged and browser_close can't complete: force-drops the connection and resets server state so browser_launch works again. " +
+  "Also reports a profile lock held by another Camoufox process, which is the usual cause of 'A copy of Camoufox is already open'.",
+  {}, async () => {
+    const steps: string[] = [];
+    if (browserContext) {
+      try {
+        await Promise.race([browserContext.close(), new Promise(r => setTimeout(r, 5000))]);
+        steps.push("context close attempted");
+      } catch (e: any) { steps.push(`context close failed (ignored): ${String(e?.message || e).slice(0, 80)}`); }
+    } else steps.push("no context held");
+    if (activeProfileIsTemp && activeProfileDir) {
+      try { rmSync(activeProfileDir, { recursive: true, force: true }); steps.push("temp profile removed"); } catch { steps.push("temp profile removal failed"); }
+    }
+    browserContext = null; pages = []; activePage = 0; browserUp = false;
+    activeProfileDir = null; activeProfileIsTemp = false;
+    consoleMessages.length = 0; networkRequests.length = 0; networkSeq = 0;
+    networkCaptureBodies = false; networkHandler = null; consoleHandler = null;
+    autoDialogHandler = null; autoDialogCfg = null; oneShotDialogArmed = false;
+    steps.push("server state reset");
+    // A stale lock file means another Camoufox still owns the shared profile.
+    let lockNote = "";
+    try {
+      const { existsSync } = await import("fs");
+      if (existsSync(`${PROFILE_DIR}/parent.lock`) || existsSync(`${PROFILE_DIR}/.parentlock`)) {
+        lockNote = `\nNOTE: a lock file still exists in ${PROFILE_DIR}. If browser_launch keeps failing with "A copy of Camoufox is already open", another Camoufox process owns that profile — launch with fresh_profile=true, or close the other browser.`;
+      }
+    } catch {}
+    return { content: [{ type: "text", text: `browser_recover:\n  ${steps.join("\n  ")}\nYou can call browser_launch again.${lockNote}` }] };
+  });
+
+regTool("workflow_run",
+  "Run a list of tool calls in sequence — any tool this server exposes, by name — and return a per-step log. " +
+  "Resumable: a failed run tells you the index, and start_at skips the steps that already succeeded. " +
+  'Each step is {"tool":"navigate","args":{"url":"…"},"label":"optional"}.',
+  {
+    steps: z.array(z.object({
+      tool: z.string(),
+      args: z.record(z.string(), z.any()).default({}),
+      label: z.string().default(""),
+    })).describe("Steps to execute in order."),
+    start_at: z.number().default(0).describe("Skip the first N steps (resume after a failure)."),
+    stop_on_error: z.boolean().default(true),
+  },
+  async ({ steps, start_at, stop_on_error }) => {
+    const log: string[] = [];
+    let ran = 0, failed = 0;
+    for (let i = Math.max(0, start_at); i < steps.length; i++) {
+      const step = steps[i];
+      const label = step.label || step.tool;
+      if (step.tool === "workflow_run") { log.push(`[${i}] ${label}: REFUSED — cannot nest workflow_run`); failed++; if (stop_on_error) break; continue; }
+      const entry = toolRegistry.get(step.tool);
+      if (!entry) { log.push(`[${i}] ${label}: UNKNOWN TOOL`); failed++; if (stop_on_error) { log.push(`stopped — fix the name and resume with start_at=${i}`); break; } continue; }
+      let args: any;
+      try { args = z.object(entry.schema).parse(step.args ?? {}); }
+      catch (e: any) { log.push(`[${i}] ${label}: BAD ARGS — ${String(e?.message || e).replace(/\s+/g, " ").slice(0, 200)}`); failed++; if (stop_on_error) { log.push(`stopped — resume with start_at=${i}`); break; } continue; }
+      try {
+        const res: any = await entry.handler(args, {});
+        const text = (res?.content || []).filter((c: any) => c.type === "text").map((c: any) => c.text).join(" ");
+        ran++;
+        if (res?.isError) {
+          failed++;
+          log.push(`[${i}] ${label}: ERROR — ${String(text).replace(/\s+/g, " ").slice(0, 220)}`);
+          if (stop_on_error) { log.push(`stopped — resume with start_at=${i} after fixing it`); break; }
+        } else {
+          log.push(`[${i}] ${label}: OK — ${String(text).replace(/\s+/g, " ").slice(0, 220)}`);
+        }
+      } catch (e: any) {
+        failed++;
+        log.push(`[${i}] ${label}: THREW — ${String(e?.message || e).replace(/\s+/g, " ").slice(0, 220)}`);
+        if (stop_on_error) { log.push(`stopped — resume with start_at=${i}`); break; }
+      }
+    }
+    return {
+      content: [{ type: "text", text: `workflow_run: ${ran} step(s) executed, ${failed} failed (of ${steps.length} total)\n${log.join("\n")}` }],
+      ...(failed ? { isError: true } : {}),
+    };
+  });
 
 // ── Start Server ───────────────────────────────────────────────────────────
 
