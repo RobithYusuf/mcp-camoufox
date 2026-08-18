@@ -26,7 +26,18 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          npm version patch
+
+          # Bump without auto-creating a tag, in case a previous run left the tag behind.
+          NEW_VERSION=$(npm version patch --no-git-tag-version | sed 's/^v//')
+
+          git add package.json package-lock.json
+          git commit -m "chore(release): v${NEW_VERSION}"
+
+          # Create the tag only if it does not already exist (locally or on remote).
+          if ! git rev-parse "v${NEW_VERSION}" >/dev/null 2>&1; then
+            git tag "v${NEW_VERSION}"
+          fi
+
           git push origin HEAD:main --follow-tags
 
       - run: npm publish --provenance --access public
