@@ -17,8 +17,8 @@ jobs:
 
       - uses: actions/setup-node@v7.0.0
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: "22.x"
+          registry-url: "https://registry.npmjs.org"
 
       - run: npm ci
 
