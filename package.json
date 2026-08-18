@@ -13,13 +13,13 @@
     "modelcontextprotocol",
     "claude"
   ],
-  "homepage": "https://github.com/RobithYusuf/mcp-camoufox#readme",
+  "homepage": "https://github.com/alessio-zamparelli/mcp-camoufox#readme",
   "bugs": {
-    "url": "https://github.com/RobithYusuf/mcp-camoufox/issues"
+    "url": "https://github.com/alessio-zamparelli/mcp-camoufox/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RobithYusuf/mcp-camoufox.git"
+    "url": "git+https://github.com/alessio-zamparelli/mcp-camoufox.git"
   },
   "license": "MIT",
   "author": "RobithYusuf <robithdev@gmail.com>",
