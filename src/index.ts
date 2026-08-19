@@ -31,6 +31,10 @@ let browserUp = false;
 // PROFILE_DIR otherwise. Cleaned on close when temp.
 let activeProfileDir: string | null = null;
 let activeProfileIsTemp = false;
+// The MCP SDK dispatches requests concurrently, so two browser_launch calls can
+// both pass the "already running" guard and each build a context — the loser is
+// then unreachable by browser_close. Callers queue on this instead.
+let launchInFlight: Promise<unknown> | null = null;
 
 function getPage(): Page {
   if (!browserUp || pages.length === 0) {
@@ -290,6 +294,12 @@ function candidateList(total: number, items: any[]): string {
   return lines.join("\n") + more;
 }
 
+// Per-page in-flight request counter, armed the moment a page is tracked.
+// wait_for_network_idle used to attach its own listeners at call time and start
+// counting from zero, so a request that was ALREADY in flight looked like idle.
+const inflightByPage = new WeakMap<Page, { n: number }>();
+function inflightOf(p: Page): number { return inflightByPage.get(p)?.n ?? 0; }
+
 // Track a page in the global pages[] list and auto-remove it on close.
 // Used for the initial page, tab_new, AND pages opened by the site itself
 // (window.open / target=_blank) via the browserContext "page" event — without
@@ -304,6 +314,11 @@ function trackPage(p: Page): void {
   // A persistent dialog handler must cover tabs the site opens later too,
   // otherwise a popup's confirm() hangs the flow.
   if (autoDialogHandler) p.on("dialog", autoDialogHandler);
+  const inflight = { n: 0 };
+  inflightByPage.set(p, inflight);
+  p.on("request", () => { inflight.n++; });
+  p.on("requestfinished", () => { if (inflight.n > 0) inflight.n--; });
+  p.on("requestfailed", () => { if (inflight.n > 0) inflight.n--; });
   p.once("close", () => {
     const i = pages.indexOf(p);
     if (i < 0) return;
@@ -339,7 +354,18 @@ const SNAPSHOT_JS = `(() => {
       ref: ref,
       tag: el.tagName.toLowerCase(),
       role: el.getAttribute('role') || '',
-      text: (el.innerText || el.value || '').trim().slice(0, 100),
+      text: (function () {
+        var t = el.innerText || '';
+        if (t) return t.trim().slice(0, 100);
+        var v = el.value || '';
+        if (!v) return '';
+        // A password/secret field's VALUE must never leave the browser: masking
+        // it only in fill() was pointless while every snapshot printed it.
+        var ty = (el.type || '').toLowerCase();
+        var hint = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('autocomplete') || '')).toLowerCase();
+        if (ty === 'password' || /pass|secret|token|otp|cvv|card|pin/.test(hint)) return '••• ' + v.length + ' chars (masked)';
+        return v.trim().slice(0, 100);
+      })(),
       type: el.getAttribute('type') || '',
       name: el.getAttribute('name') || '',
       placeholder: el.getAttribute('placeholder') || '',
@@ -501,6 +527,9 @@ regTool(
     ),
   },
   async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile, no_viewport }) => {
+    // Wait out a launch already in progress, then fall through to the
+    // already-running path rather than building a second context.
+    if (launchInFlight) { try { await launchInFlight; } catch {} }
     if (browserUp && browserContext) {
       const page = getPage();
       if (url && url !== "about:blank") {
@@ -510,6 +539,11 @@ regTool(
       return { content: [{ type: "text", text: `Already running — launch options (headless/humanize/geoip/locale/size/fresh_profile) were IGNORED; call browser_close first to relaunch with new options. Navigated to: ${page.url()}` }] };
     }
 
+    // Claim the launch slot with no await in between, so a second concurrent
+    // call cannot slip past the guard above and build a second context.
+    let releaseLaunch: () => void = () => {};
+    launchInFlight = new Promise<void>(res => { releaseLaunch = res; });
+    try {
     ensureDirs();
     const w = width > 0 ? width : 1280;
     const h = height > 0 ? height : 800;
@@ -597,6 +631,10 @@ regTool(
       geom += `\n(Viewport is shorter than the window by the browser chrome; use set_viewport_size for an exact viewport.)`;
     } catch {}
     return { content: [{ type: "text", text: `Browser launched${profileNote}. URL: ${page.url()}\nTitle: ${title}${geom}` }] };
+    } finally {
+      releaseLaunch();
+      launchInFlight = null;
+    }
   }
 );
 
@@ -1732,7 +1770,14 @@ regTool("inspect_element", "Get detailed info about an element (tag, attributes,
     for (const a of el.attributes) attrs[a.name] = a.value;
     return {
       tag: el.tagName.toLowerCase(), id: el.id, className: el.className,
-      text: (el.innerText || "").slice(0, 200), value: el.value || "",
+      text: (el.innerText || "").slice(0, 200),
+      value: (function () {
+        var v = el.value || "";
+        if (!v) return "";
+        var ty = (el.type || "").toLowerCase();
+        var hint = ((el.name || "") + " " + (el.id || "") + " " + (el.getAttribute("autocomplete") || "")).toLowerCase();
+        return (ty === "password" || /pass|secret|token|otp|cvv|card|pin/.test(hint)) ? "••• " + v.length + " chars (masked)" : v;
+      })(),
       attrs, rect: { x: r.x, y: r.y, width: r.width, height: r.height },
       visible: cs.display !== "none" && cs.visibility !== "hidden",
       fontSize: cs.fontSize, color: cs.color, bg: cs.backgroundColor,
@@ -2782,6 +2827,16 @@ regTool("storage_state_load", "Load cookies + localStorage from a JSON file (cre
   if (navigate_to) {
     await page.goto(navigate_to, { waitUntil: "domcontentloaded" });
     const origin = data.origins?.[0] || {};
+    // The saved storage belongs to ONE origin. Landing somewhere else (an open
+    // redirect, a login bounce) and writing it there hands those tokens to that
+    // site, so require the origin to match what we actually ended up on.
+    const landedOrigin = await page.evaluate("location.origin") as string;
+    if ((origin.local || origin.session) && origin.origin && origin.origin !== landedOrigin) {
+      return {
+        content: [{ type: "text", text: `Loaded ${data.cookies?.length || 0} cookies, but REFUSED to write localStorage/sessionStorage: it was captured on ${origin.origin} and the browser landed on ${landedOrigin} (redirect?). Writing it there would hand those tokens to a different site. Navigate to ${origin.origin} and retry.` }],
+        isError: true,
+      };
+    }
     if (origin.local || origin.session) {
       await page.evaluate(`((data) => {
         if (data.local) Object.entries(data.local).forEach(([k, v]) => { try { localStorage.setItem(k, v); } catch {} });
@@ -2910,20 +2965,32 @@ regTool("mouse_drift", "Random mouse movements over a duration — builds up mou
   return { content: [{ type: "text", text: `mouse_drift: ${points} points over ${duration_ms}ms` }] };
 });
 
-regTool("mouse_record", "Start recording mouse positions (call mouse_replay later). Returns recorder handle.", {
+regTool("mouse_record", "Start recording mouse positions in the page (replay with mouse_replay). Re-calling replaces any previous recorder instead of leaking its listener.", {
   duration_ms: z.number().default(5000),
-  sample_rate_hz: z.number().default(30),
-}, async ({ duration_ms, sample_rate_hz }) => {
+  max_points: z.number().default(2000).describe("Cap on stored points."),
+}, async ({ duration_ms, max_points }) => {
   const page = getPage();
   const handle = `rec-${Date.now()}`;
+  // Each recorder removes its OWN handler on expiry. The old version kept the
+  // handler on a single global, so a second mouse_record made the first timeout
+  // remove the NEW listener and leave the old one attached (and growing) for good.
   await page.evaluate(`(() => {
-    window.__mcp_mouse_rec = { points: [], start: Date.now() };
-    var h = (e) => window.__mcp_mouse_rec.points.push({ x: e.clientX, y: e.clientY, t: Date.now() - window.__mcp_mouse_rec.start });
+    if (window.__mcp_mouse_rec_handler) {
+      try { document.removeEventListener('mousemove', window.__mcp_mouse_rec_handler); } catch (e) {}
+      window.__mcp_mouse_rec_handler = null;
+    }
+    var cap = ${Math.max(1, max_points)};
+    var rec = { points: [], start: Date.now() };
+    window.__mcp_mouse_rec = rec;
+    var h = function (e) { if (rec.points.length < cap) rec.points.push({ x: e.clientX, y: e.clientY, t: Date.now() - rec.start }); };
     window.__mcp_mouse_rec_handler = h;
     document.addEventListener('mousemove', h, { passive: true });
-    setTimeout(() => document.removeEventListener('mousemove', window.__mcp_mouse_rec_handler), ${duration_ms});
+    setTimeout(function () {
+      document.removeEventListener('mousemove', h);
+      if (window.__mcp_mouse_rec_handler === h) window.__mcp_mouse_rec_handler = null;
+    }, ${duration_ms});
   })()`);
-  return { content: [{ type: "text", text: `mouse_record started: ${handle} (${duration_ms}ms, ~${sample_rate_hz}Hz). Move mouse manually then call mouse_replay.` }] };
+  return { content: [{ type: "text", text: `mouse_record started: ${handle} (${duration_ms}ms, max ${max_points} points). Move the mouse, then call mouse_replay.` }] };
 });
 
 regTool("mouse_replay", "Replay last recorded mouse path with original timing.", {
@@ -3033,49 +3100,47 @@ regTool("click_and_wait", "Click element then wait for navigation or selector. A
   if (!ref && !selector) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
   const loc = ref ? refLocator(page, ref) : page.locator(selector!).first();
   const beforeUrl = page.url();
+  // The wait result is REPORTED. Swallowing the timeout made an unmet condition
+  // look like a successful click+navigate.
+  let waitErr: string | null = null;
+  const condition = wait_for_url ? `url contains "${wait_for_url}"`
+    : wait_for_selector ? `selector "${wait_for_selector}"` : "domcontentloaded";
   await Promise.all([
     loc.click({ timeout: timeout_ms }),
-    wait_for_url ? page.waitForURL((u) => u.toString().includes(wait_for_url), { timeout: timeout_ms }).catch(() => {}) :
-    wait_for_selector ? page.waitForSelector(wait_for_selector, { timeout: timeout_ms }).catch(() => {}) :
-    page.waitForLoadState("domcontentloaded", { timeout: timeout_ms }).catch(() => {}),
+    (wait_for_url ? page.waitForURL((u) => u.toString().includes(wait_for_url), { timeout: timeout_ms })
+      : wait_for_selector ? page.waitForSelector(wait_for_selector, { timeout: timeout_ms })
+      : page.waitForLoadState("domcontentloaded", { timeout: timeout_ms })
+    ).catch((e: any) => { waitErr = String(e?.message || e).split("\n")[0].slice(0, 140); }),
   ]);
-  return { content: [{ type: "text", text: `click_and_wait: ${beforeUrl} → ${page.url()}` }] };
+  if (waitErr) {
+    return {
+      content: [{ type: "text", text: `click_and_wait: the CLICK happened but the wait did NOT succeed — ${condition} was never met within ${timeout_ms}ms (${waitErr}). URL: ${beforeUrl} → ${page.url()}` }],
+      isError: true,
+    };
+  }
+  return { content: [{ type: "text", text: `click_and_wait: ${condition} met. ${beforeUrl} → ${page.url()}` }] };
 });
 
-regTool("wait_for_network_idle", "Wait until there are no in-flight requests for idle_ms continuously. Better than fixed timeouts for SPAs.", {
+regTool("wait_for_network_idle", "Wait until there are no in-flight requests for idle_ms continuously. Requests are counted from the moment the page was opened, so one that was ALREADY in flight when you call this is not mistaken for idle.", {
   idle_ms: z.number().default(500).describe("How long the network must stay quiet before returning."),
   timeout_ms: z.number().default(30000),
 }, async ({ idle_ms, timeout_ms }) => {
   const page = getPage();
-  // Track in-flight requests ourselves instead of waitForLoadState("networkidle"),
-  // whose 500ms threshold is fixed — this actually honours idle_ms.
-  let inflight = 0;
-  const onRequest = () => { inflight++; };
-  const onSettled = () => { if (inflight > 0) inflight--; };
-  page.on("request", onRequest);
-  page.on("requestfinished", onSettled);
-  page.on("requestfailed", onSettled);
   const started = Date.now();
-  try {
-    const deadline = started + timeout_ms;
-    let quietSince = inflight === 0 ? started : 0;
-    while (Date.now() < deadline) {
-      if (inflight === 0) {
-        if (!quietSince) quietSince = Date.now();
-        if (Date.now() - quietSince >= idle_ms) {
-          return { content: [{ type: "text", text: `network idle for ${idle_ms}ms (waited ${Date.now() - started}ms)` }] };
-        }
-      } else {
-        quietSince = 0;
+  const deadline = started + timeout_ms;
+  let quietSince = inflightOf(page) === 0 ? started : 0;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(100);
+    if (inflightOf(page) === 0) {
+      if (!quietSince) quietSince = Date.now();
+      if (Date.now() - quietSince >= idle_ms) {
+        return { content: [{ type: "text", text: `network idle for ${idle_ms}ms (waited ${Date.now() - started}ms)` }] };
       }
-      await page.waitForTimeout(100);
+    } else {
+      quietSince = 0;
     }
-    return { content: [{ type: "text", text: `timeout after ${timeout_ms}ms — still ${inflight} request(s) in flight (never idle for ${idle_ms}ms).` }] };
-  } finally {
-    page.off("request", onRequest);
-    page.off("requestfinished", onSettled);
-    page.off("requestfailed", onSettled);
   }
+  return { content: [{ type: "text", text: `timeout after ${timeout_ms}ms — still ${inflightOf(page)} request(s) in flight (never idle for ${idle_ms}ms).` }], isError: true };
 });
 
 regTool(
@@ -3171,14 +3236,14 @@ type Impersonate = "firefox" | "chrome";
 // impit is a native module; load it lazily so a platform without prebuilt
 // bindings still gets a working server (only these tools degrade).
 let impitMod: any = null;
-async function getImpit(impersonate: Impersonate, proxy?: string, timeoutMs = 30000): Promise<any> {
+async function getImpit(impersonate: Impersonate, proxy?: string, timeoutMs = 30000, followRedirects = true): Promise<any> {
   if (!impitMod) {
     try { impitMod = await import("impit"); }
     catch (e: any) {
       throw new Error(`impit (native HTTP client) unavailable on this platform: ${e?.message || e}. Use the browser tools instead (navigate + scrape_page).`);
     }
   }
-  const opts: any = { browser: impersonate, timeout: timeoutMs, followRedirects: true };
+  const opts: any = { browser: impersonate, timeout: timeoutMs, followRedirects };
   if (proxy) opts.proxyUrl = proxy;
   return new impitMod.Impit(opts);
 }
@@ -3215,25 +3280,58 @@ function looksBlocked(status: number | null, text: string): boolean {
 async function impitFetch(opts: {
   url: string; method?: string; headers?: Record<string, string>; body?: string;
   impersonate?: Impersonate; proxy?: string; timeoutMs?: number; useBrowserCookies?: boolean;
-}): Promise<{ status: number | null; text: string; headers: Record<string, string>; url: string; error?: string }> {
-  const headers: Record<string, string> = { ...(opts.headers || {}) };
-  if (opts.useBrowserCookies !== false) {
-    const ck = await cookieHeaderFor(opts.url);
-    if (ck && !Object.keys(headers).some(k => k.toLowerCase() === "cookie")) headers["Cookie"] = ck;
-  }
+}): Promise<{ status: number | null; text: string; headers: Record<string, string>; url: string; error?: string; redirects?: string[] }> {
+  // Redirects are followed MANUALLY. impit replays a manually-set Cookie header
+  // onto whatever host a redirect points at, so a request to a victim endpoint
+  // with an open redirect handed the victim's session cookie to the attacker
+  // host (reproduced). Following by hand lets us recompute cookies per hop and
+  // drop credential headers the moment the origin changes.
+  const MAX_HOPS = 5;
+  const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
+  const callerHeaders: Record<string, string> = { ...(opts.headers || {}) };
+  let url = opts.url;
+  let method = (opts.method || "GET").toUpperCase();
+  let body = opts.body;
+  const trail: string[] = [];
   try {
-    const client = await getImpit(opts.impersonate || "firefox", opts.proxy, opts.timeoutMs || 30000);
-    const res = await client.fetch(opts.url, {
-      method: (opts.method || "GET").toUpperCase(),
-      headers,
-      ...(opts.body ? { body: opts.body } : {}),
-    });
-    const text = await res.text().catch(() => "");
-    const hdrs: Record<string, string> = {};
-    try { for (const [k, v] of (res.headers as any).entries()) hdrs[k] = String(v); } catch {}
-    return { status: res.status, text, headers: hdrs, url: res.url || opts.url };
+    const client = await getImpit(opts.impersonate || "firefox", opts.proxy, opts.timeoutMs || 30000, false);
+    for (let hop = 0; hop <= MAX_HOPS; hop++) {
+      const headers: Record<string, string> = { ...callerHeaders };
+      const callerSetCookie = Object.keys(callerHeaders).some(k => k.toLowerCase() === "cookie");
+      if (opts.useBrowserCookies !== false && !callerSetCookie) {
+        for (const k of Object.keys(headers)) if (k.toLowerCase() === "cookie") delete headers[k];
+        const ck = await cookieHeaderFor(url);            // cookies for THIS hop only
+        if (ck) headers["Cookie"] = ck;
+      }
+      const res = await client.fetch(url, { method, headers, ...(body ? { body } : {}) });
+      const hdrs: Record<string, string> = {};
+      try { for (const [k, v] of (res.headers as any).entries()) hdrs[k] = String(v); } catch {}
+
+      if (REDIRECT_CODES.has(res.status) && hop < MAX_HOPS) {
+        const loc = hdrs["location"] || hdrs["Location"];
+        if (!loc) return { status: res.status, text: await res.text().catch(() => ""), headers: hdrs, url, redirects: trail };
+        let next: string;
+        try { next = new URL(loc, url).toString(); }
+        catch { return { status: res.status, text: "", headers: hdrs, url, error: `bad Location header: ${loc}`, redirects: trail }; }
+        let sameOrigin = false;
+        try { sameOrigin = new URL(next).origin === new URL(url).origin; } catch {}
+        if (!sameOrigin) {
+          for (const k of Object.keys(callerHeaders)) {
+            if (/^(cookie|authorization|proxy-authorization)$/i.test(k)) delete callerHeaders[k];
+          }
+        }
+        if (res.status === 303 || ((res.status === 301 || res.status === 302) && method !== "GET" && method !== "HEAD")) {
+          method = "GET"; body = undefined;
+        }
+        trail.push(`${res.status} -> ${next}${sameOrigin ? "" : " (cross-origin: credentials dropped)"}`);
+        url = next;
+        continue;
+      }
+      return { status: res.status, text: await res.text().catch(() => ""), headers: hdrs, url: res.url || url, redirects: trail };
+    }
+    return { status: null, text: "", headers: {}, url, error: `too many redirects (>${MAX_HOPS})`, redirects: trail };
   } catch (e: any) {
-    return { status: null, text: "", headers: {}, url: opts.url, error: String(e?.message || e) };
+    return { status: null, text: "", headers: {}, url, error: String(e?.message || e), redirects: trail };
   }
 }
 
@@ -3327,7 +3425,9 @@ regTool("http_request",
     return {
       content: [{ type: "text", text:
         `${method.toUpperCase()} ${r.url}\nstatus: ${r.status}${blocked ? "  ⚠ looks anti-bot blocked — retry via the browser (smart_fetch escalates automatically)" : ""}\n` +
-        `cookies sent: ${use_browser_cookies ? "browser session" : "none"}  impersonate: ${impersonate}\n\n── headers ──\n${hdrLines}\n\n── body ──\n${shown}` }],
+        `cookies sent: ${use_browser_cookies ? "browser session (recomputed per redirect hop)" : "none"}  impersonate: ${impersonate}\n` +
+        (r.redirects && r.redirects.length ? `redirects: ${r.redirects.join(" | ")}\n` : "") +
+        `\n── headers ──\n${hdrLines}\n\n── body ──\n${shown}` }],
     };
   });
 
