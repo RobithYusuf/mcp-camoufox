@@ -1,6 +1,6 @@
 {
   "name": "mcp-camoufox",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "MCP server for stealth browser automation via Camoufox — 133 tools, plus a browserless TLS-impersonating HTTP path",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,8 @@
     "test": "node scripts/test.mjs",
     "test:schema": "node scripts/tool-schema-snapshot.mjs",
     "smoke:install": "node scripts/smoke-fresh-install.mjs",
-    "audit:tools": "node scripts/audit-tools.mjs"
+    "audit:tools": "node scripts/audit-tools.mjs",
+    "smoke:real": "node scripts/smoke-real-sites.mjs"
   },
   "keywords": [
     "mcp",

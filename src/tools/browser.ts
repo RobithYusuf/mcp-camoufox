@@ -167,6 +167,29 @@ regTool(
     S.activePage = S.pages.indexOf(page);
     if (S.activePage < 0) S.activePage = 0;
 
+    // Camoufox picks the spoofed screen itself, and it is often smaller than the
+    // size a caller asks for — a 1400-wide launch landed on a spoofed 1366x768
+    // screen, leaving the viewport wider than the display it claims to be on.
+    // No real window can do that, so fit the viewport to the screen rather than
+    // hand the caller a fingerprint tell they never asked for.
+    let clampNote = "";
+    if (!no_viewport) {
+      try {
+        const scr = JSON.parse(await page.evaluate(
+          `(() => JSON.stringify({ w: screen.width, h: screen.height }))()`) as string);
+        const vp = page.viewportSize();
+        if (vp && scr.w && scr.h && (vp.width > scr.w || vp.height > scr.h)) {
+          const fitted = { width: Math.min(vp.width, scr.w), height: Math.min(vp.height, Math.max(200, scr.h - 80)) };
+          await page.setViewportSize(fitted);
+          clampNote = `\n⚠ Requested ${vp.width}x${vp.height}, but Camoufox spoofed a ${scr.w}x${scr.h} screen for this profile.`
+            + ` The viewport was reduced to ${fitted.width}x${fitted.height} — a viewport larger than its own screen is an anti-bot tell.`
+            + ` The WINDOW is still ${vp.width} wide and cannot be resized after launch, so a large request leaves its own mismatch:`
+            + ` relaunch at a size near ${scr.w}x${scr.h} for a clean fingerprint, or pass no_viewport=true to opt out of this fit.`
+            + ` Run fingerprint_audit to see what the page actually reports.`;
+        }
+      } catch {}
+    }
+
     if (url && url !== "about:blank") {
       await gotoReady(page, url, "domcontentloaded", 30000);
       await settle(page, 1500);
@@ -183,6 +206,7 @@ regTool(
       if (g.iw > g.sw || g.ih > g.sh) {
         geom += `\n⚠ Viewport is larger than the spoofed screen — a window bigger than its own display is an anti-bot tell. Shrink it with set_viewport_size, or relaunch without no_viewport.`;
       }
+      geom += clampNote;
       geom += `\n(Viewport is shorter than the window by the 80px of browser chrome.`
         + ` Dragging the window bigger will NOT reflow the page — a fixed viewport never follows the OS window,`
         + ` so you get empty space instead. Call set_viewport_size(w,h) after resizing, or relaunch with`

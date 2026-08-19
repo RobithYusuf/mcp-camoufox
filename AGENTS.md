@@ -213,19 +213,23 @@ MCPC_ONLY=snapshot npm test -- core   # only checks whose name matches — debug
 npm run test:schema      # dump every tool name/description/schema
 npm run smoke:install    # install the PUBLISHED package and drive a real browser
 npm run audit:tools      # diff docs/TOOLS.md + README counts against the live tool registry
+npm run smoke:real       # drive real sites (CSP, inline SVG, 6 tabs, interception) — run before publishing
 ```
 
 - Use evidence proportional to the risk, but a change to a shared helper means the whole suite.
-- A local fixture is not a real site. The suites passed 94/94 while navigation was broken on every
-  page with a strict `script-src`, because `page.waitForFunction` polls through `eval()` and no fixture
-  sent a CSP header. There is a `/csp` route now — drive one real site before believing a green run.
+- A local fixture is not a real site. Three bugs shipped while the local suite was green: `eval()`-based
+  polling died on every strict CSP, `browser_launch` produced a viewport no real window could have, and
+  `detect_content_pattern` threw on any inline SVG. No fixture had a CSP header, a window manager or an
+  SVG. `npm run smoke:real` drives the actual web and belongs in the release order; it found a real
+  fingerprint bug on its very first run. It is deliberately NOT part of `npm test` — the open web is not
+  deterministic and must never gate a release on someone else's outage.
 - After editing `src/`, run `npx tsc` and reconnect the MCP client — a local registration points at
   `dist/index.js`, so an unbuilt change means you are testing the old build.
 - Before a refactor, snapshot the tool surface and diff it afterwards. On its first real use this
   caught a rename leaking into English prose inside three tool descriptions — something TypeScript
   cannot see.
-- Release order: `npx tsc` → `npm test` → `npm run audit:tools` → version bump → `npm publish` →
-  `npm run smoke:install`
+- Release order: `npx tsc` → `npm test` → `npm run audit:tools` → `npm run smoke:real` → version bump →
+  `npm publish` → `npm run smoke:install`
   against the published version → commit and push.
 - The suites use `fresh_profile: true`; the shared profile may be locked by a browser the developer is
   already running.
