@@ -467,15 +467,19 @@ regTool(
     humanize: z.boolean().default(false).describe("Human-like mouse movements"),
     geoip: z.boolean().default(true).describe("Auto-detect timezone from IP"),
     locale: z.string().default("en-US").describe("Browser locale"),
-    width: z.number().default(0).describe("Window width (0 = default 1280)"),
-    height: z.number().default(0).describe("Window height (0 = default 800)"),
+    width: z.number().default(0).describe("WINDOW width (0 = default 1280). The viewport is ~80px shorter than the window because of browser chrome — use set_viewport_size for an exact viewport."),
+    height: z.number().default(0).describe("WINDOW height (0 = default 800). See width."),
+    no_viewport: z.boolean().default(false).describe(
+      "Let the content area follow the real OS window instead of a fixed viewport (Playwright viewport:null). " +
+      "WARNING: this drops the window-size cap, so the viewport can end up LARGER than the spoofed screen — " +
+      "a window wider than its own screen is an easy anti-bot tell. Prefer set_viewport_size unless you need a full-window canvas."),
     fresh_profile: z.boolean().default(false).describe(
       "Start with a clean temp profile (no carry-over cookies/cache). " +
       "Temp dir is removed when browser_close is called. " +
       "Use when switching between accounts on the same domain to avoid login session collisions."
     ),
   },
-  async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile }) => {
+  async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile, no_viewport }) => {
     if (browserUp && browserContext) {
       const page = getPage();
       if (url && url !== "about:blank") {
@@ -511,7 +515,12 @@ regTool(
         locale,
         user_data_dir: profileDir,
         disable_coop: true,
-        window: [w, h] as [number, number],
+        // no_viewport: let the content follow the real window. We also drop the
+        // fixed `window` size then — pinning both is what produced a 1280x749
+        // content area that still didn't fill the frame.
+        ...(no_viewport
+          ? { viewport: null }
+          : { window: [w, h] as [number, number] }),
         i_know_what_im_doing: true,
         firefox_user_prefs: {
           "permissions.default.desktop-notification": 2,
@@ -554,7 +563,19 @@ regTool(
     }
     const title = await page.title();
     const profileNote = isTemp ? " (fresh temp profile)" : "";
-    return { content: [{ type: "text", text: `Browser launched${profileNote}. URL: ${page.url()}\nTitle: ${title}` }] };
+    // Report window vs viewport vs screen: the 80px gap is browser chrome, and a
+    // viewport wider than the spoofed screen is a fingerprint tell worth seeing.
+    let geom = "";
+    try {
+      const g: any = await page.evaluate(
+        `(() => ({ iw: innerWidth, ih: innerHeight, ow: outerWidth, oh: outerHeight, sw: screen.width, sh: screen.height }))()`);
+      geom = `\nViewport: ${g.iw}x${g.ih}  Window: ${g.ow}x${g.oh}  Screen: ${g.sw}x${g.sh}`;
+      if (g.iw > g.sw || g.ih > g.sh) {
+        geom += `\n⚠ Viewport is larger than the spoofed screen — a window bigger than its own display is an anti-bot tell. Shrink it with set_viewport_size, or relaunch without no_viewport.`;
+      }
+      geom += `\n(Viewport is shorter than the window by the browser chrome; use set_viewport_size for an exact viewport.)`;
+    } catch {}
+    return { content: [{ type: "text", text: `Browser launched${profileNote}. URL: ${page.url()}\nTitle: ${title}${geom}` }] };
   }
 );
 
