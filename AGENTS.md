@@ -159,9 +159,15 @@ These are platform truths, not preferences. Each one cost a release.
 - `indexedDB.databases()` exists; `layout-shift` does not, so CLS is permanently unavailable.
 - There is **no CDPSession for Firefox** — perf traces, coverage, heap snapshots and CPU/network
   throttling cannot be ported from mcp-stealth-chrome.
-- `width`/`height` in `browser_launch` size the **window**; the viewport is ~80px shorter because of
-  browser chrome. `set_viewport_size` is the exact control. `no_viewport: true` lets the content follow
-  the real window but can exceed the spoofed screen, which is an anti-bot tell.
+- `width`/`height` in `browser_launch` size the window **and** the viewport (width matches, height is
+  80px shorter — the measured chrome). Passing `window` alone left Playwright's default 1280x720
+  viewport in place, so `width=1400` produced outerWidth 1400 with innerWidth 1280: 120px of horizontal
+  chrome that Firefox does not have, and any script can subtract the two. `fingerprint_audit` now flags
+  that gap.
+- A fixed viewport never follows the OS window, so dragging the frame wider adds empty space instead of
+  reflowing. That is Playwright's model, not a bug — `set_viewport_size` after the resize, or
+  `no_viewport: true` to track the window live, which then can exceed the spoofed screen (an anti-bot
+  tell the launch reply warns about).
 - `cookie_set` without `expires_days` creates a session cookie that Firefox never writes to disk — it
   dies at `browser_close` even though the profile persists.
 - npm `overrides` only apply to the root project, so ours do not reach a user's tree. Do not claim the

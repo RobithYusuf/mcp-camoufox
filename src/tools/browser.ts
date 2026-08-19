@@ -63,7 +63,7 @@ regTool(
     humanize: z.boolean().default(false).describe("Human-like mouse movements"),
     geoip: z.boolean().default(true).describe("Auto-detect timezone from IP"),
     locale: z.string().default("en-US").describe("Browser locale"),
-    width: z.number().default(0).describe("WINDOW width (0 = default 1280). The viewport is ~80px shorter than the window because of browser chrome — use set_viewport_size for an exact viewport."),
+    width: z.number().default(0).describe("WINDOW width (0 = default 1280). The viewport matches this width and is 80px shorter than the window height (browser chrome) — use set_viewport_size to set a viewport independently of the window."),
     height: z.number().default(0).describe("WINDOW height (0 = default 800). See width."),
     no_viewport: z.boolean().default(false).describe(
       "Let the content area follow the real OS window instead of a fixed viewport (Playwright viewport:null). " +
@@ -122,9 +122,15 @@ regTool(
         // no_viewport: let the content follow the real window. We also drop the
         // fixed `window` size then — pinning both is what produced a 1280x749
         // content area that still didn't fill the frame.
+        // Size the viewport WITH the window. Passing `window` alone left Playwright's
+        // default 1280x720 viewport in place, so browser_launch(width=1400) produced
+        // outerWidth 1400 with innerWidth 1280 — 120px of horizontal chrome, which no
+        // real Firefox has. Any site can subtract those two and see it. The 80px is
+        // the measured vertical chrome, so the default 1280x800 window keeps giving
+        // exactly the 1280x720 viewport it always did.
         ...(no_viewport
           ? { viewport: null }
-          : { window: [w, h] as [number, number] }),
+          : { window: [w, h] as [number, number], viewport: { width: w, height: Math.max(200, h - 80) } }),
         i_know_what_im_doing: true,
         firefox_user_prefs: {
           "permissions.default.desktop-notification": 2,
@@ -177,7 +183,10 @@ regTool(
       if (g.iw > g.sw || g.ih > g.sh) {
         geom += `\n⚠ Viewport is larger than the spoofed screen — a window bigger than its own display is an anti-bot tell. Shrink it with set_viewport_size, or relaunch without no_viewport.`;
       }
-      geom += `\n(Viewport is shorter than the window by the browser chrome; use set_viewport_size for an exact viewport.)`;
+      geom += `\n(Viewport is shorter than the window by the 80px of browser chrome.`
+        + ` Dragging the window bigger will NOT reflow the page — a fixed viewport never follows the OS window,`
+        + ` so you get empty space instead. Call set_viewport_size(w,h) after resizing, or relaunch with`
+        + ` no_viewport=true to let the content track the window live.)`;
     } catch {}
     return { content: [{ type: "text", text: `Browser launched${profileNote}. URL: ${page.url()}\nTitle: ${title}${geom}` }] };
     } finally {

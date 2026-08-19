@@ -549,6 +549,16 @@ regTool("fingerprint_audit",
     if (iw > sw || ih > sh) {
       flags.push(`The viewport (${f.inner}) is larger than the screen (${f.screen}) — impossible on a real display. This is what no_viewport=true causes; use set_viewport_size instead.`);
     }
+    // outer vs inner: Firefox has no horizontal chrome to speak of, so a wide gap
+    // means the window and the viewport were sized independently — which is what a
+    // mis-configured automation launch looks like from the page.
+    const [ow, oh] = String(f.outer || "0x0").split("x").map(Number);
+    if (ow - iw > 40) {
+      flags.push(`outerWidth ${ow} but innerWidth ${iw} — ${ow - iw}px of horizontal browser chrome, which Firefox does not have. The window and viewport were sized independently.`);
+    }
+    if (oh - ih > 200 || oh - ih < 0) {
+      flags.push(`outerHeight ${oh} vs innerHeight ${ih} — a ${oh - ih}px vertical gap is not plausible browser chrome.`);
+    }
     if (f.plugins === 0 && f.mimeTypes === 0) flags.push("navigator.plugins and mimeTypes are both empty — common in crude headless setups.");
     if (f.hardwareConcurrency === 0 || f.hardwareConcurrency === undefined) flags.push("navigator.hardwareConcurrency is missing or zero.");
 

@@ -230,6 +230,16 @@ export default async function run() {
     return [a.includes("Switched") && b.includes("Closed tab"), `select→ ${a.slice(0, 60)} | close→ ${b.slice(0, 60)}`];
   });
 
+  await check("the viewport follows a custom launch size", async () => {
+    // browser_launch passed `window` to Camoufox but never set Playwright's
+    // viewport, so width=1400 produced outerWidth 1400 with innerWidth 1280 —
+    // 120px of horizontal chrome that no real Firefox has, visible to any script
+    // that subtracts the two.
+    const g = JSON.parse(await c("evaluate", { expression:
+      "JSON.stringify({ iw: innerWidth, ih: innerHeight, ow: outerWidth, oh: outerHeight })" }));
+    const gapW = g.ow - g.iw, gapH = g.oh - g.ih;
+    return [gapW === 0 && gapH > 0 && gapH <= 120, `outer ${g.ow}x${g.oh} vs inner ${g.iw}x${g.ih} → gap ${gapW}w/${gapH}h`];
+  });
   await check("navigate works on a page with a strict CSP", async () => {
     const t = await c("navigate", { url: `${fx.url}/csp` });
     const h = await c("evaluate", { expression: "document.getElementById('c') ? document.getElementById('c').textContent : 'NO DOM'" });
