@@ -21,7 +21,8 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
 - `src/server.ts` — the `McpServer` instance and the `regTool` registry.
 - `src/tools/*.ts` — the tools, grouped by area; each registers itself on import.
 - `scripts/test/` — the regression suites; `scripts/*.mjs` — release checks.
-- `README.md` — the authoritative tool list. `docs/images/` — proof screenshots.
+- `docs/TOOLS.md` — the authoritative tool reference. `README.md` — the summary and the pitch.
+- `docs/images/` — proof screenshots.
 - Runtime data lives outside the repo: `~/.camoufox-mcp/{profile,screenshots,sessions}`.
 
 ## Hard constraints
@@ -168,11 +169,14 @@ These are platform truths, not preferences. Each one cost a release.
 
 ## Documentation on demand
 
-- `README.md` is the authoritative tool list and must be updated in the same change that adds, removes
-  or modifies a tool: hero count, comparison table, the category table, new parameters, and the
-  troubleshooting rows when a new edge case is found.
-- Audit the tool tables with a script that diffs `regTool("…")` names against the README rather than
-  counting by eye; they drift silently.
+- `docs/TOOLS.md` is the authoritative tool reference — every tool, with its parameters — and must be
+  updated in the same change that adds, removes or modifies a tool, including the `### Category (N)`
+  count in its heading. `README.md` carries the category summary, the hero count, the comparison table
+  and the troubleshooting rows; update those too when they are affected.
+- Run `npm run audit:tools` instead of counting by eye. It diffs the live `tools/list` against
+  `docs/TOOLS.md` and the README's counts, and exits non-zero on a mismatch. Both failure modes it
+  catches had already happened: a tool documented nowhere, and a heading that still said "Debug (5)"
+  while its table listed six.
 - Record a decision here when it is non-obvious and would otherwise be re-litigated or re-broken.
 
 ## Verification and debugging
@@ -184,6 +188,7 @@ npm test -- --parallel   # all three at once (~27s vs ~52s); each owns its brows
 MCPC_ONLY=snapshot npm test -- core   # only checks whose name matches — debugging aid, NOT a verification
 npm run test:schema      # dump every tool name/description/schema
 npm run smoke:install    # install the PUBLISHED package and drive a real browser
+npm run audit:tools      # diff docs/TOOLS.md + README counts against the live tool registry
 ```
 
 - Use evidence proportional to the risk, but a change to a shared helper means the whole suite.
@@ -195,7 +200,8 @@ npm run smoke:install    # install the PUBLISHED package and drive a real browse
 - Before a refactor, snapshot the tool surface and diff it afterwards. On its first real use this
   caught a rename leaking into English prose inside three tool descriptions — something TypeScript
   cannot see.
-- Release order: `npx tsc` → `npm test` → version bump → `npm publish` → `npm run smoke:install`
+- Release order: `npx tsc` → `npm test` → `npm run audit:tools` → version bump → `npm publish` →
+  `npm run smoke:install`
   against the published version → commit and push.
 - The suites use `fresh_profile: true`; the shared profile may be locked by a browser the developer is
   already running.
