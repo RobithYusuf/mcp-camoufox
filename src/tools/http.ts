@@ -8,7 +8,7 @@ import { S, getPage } from "../state.js";
 import { PKG_VERSION, ACTION_TIMEOUT, jsStr, safeName, writeSecretFile, expandHome, resolveOutPath,
          ERROR_HOOK_JS, totpFromSecret, clickWithFallback, clickNote, fillLocator, refLocator,
          scopeRoot, describeMatches, candidateList, SNAPSHOT_JS, formatSnapshot, snapshotPage,
-         trackPage, inflightOf, type ClickMode } from "../helpers.js";
+         trackPage, inflightOf, type ClickMode, gotoReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -301,9 +301,24 @@ regTool("search",
     } else {
       hits = (data.results || []).map((x: any) => ({ title: clean(x.title), url: clean(x.url), snippet: clean(x.text || x.summary).slice(0, 280), source: "exa" }));
     }
+    // Distinguish "genuinely no results" from "we did not recognise this shape".
+    // Reporting a shape mismatch as an empty result set is a confident lie: the
+    // endpoint returned two results, we just could not read them.
+    const container = kind === "brave" ? (data?.web?.results) : data?.results;
+    const beforeFilter = hits.length;
     hits = hits.filter(h => /^https?:\/\//i.test(h.url)).slice(0, Math.max(1, count));
     if (!hits.length) {
-      return { content: [{ type: "text", text: `No results for "${query}" from ${kind} at ${base}. The endpoint answered with valid JSON but an empty result set.` }] };
+      if (!Array.isArray(container)) {
+        const keys = data && typeof data === "object" ? Object.keys(data).slice(0, 12).join(", ") : typeof data;
+        return { content: [{ type: "text", text:
+          `Could not read the response from ${kind} at ${base}: expected ${kind === "brave" ? "web.results[]" : "results[]"}, got top-level keys { ${keys} }. ` +
+          `This is NOT "no results" — the endpoint answered, its shape is just unrecognised. Either the provider is not ${kind} (set provider= explicitly) or its schema changed. ` +
+          `Inspect it directly with http_request to see the real payload.` }], isError: true };
+      }
+      if (beforeFilter > 0) {
+        return { content: [{ type: "text", text: `${beforeFilter} result(s) came back from ${kind} but none carried an absolute http(s) URL, so there is nothing to follow.` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `No results for "${query}" from ${kind} at ${base} — the endpoint returned an empty results array.` }] };
     }
     const lines = hits.map((h, i) => `${i + 1}. ${h.title || "(untitled)"}\n   ${h.url}${h.snippet ? `\n   ${h.snippet}` : ""}${h.source ? `   [${h.source}]` : ""}`);
     return { content: [{ type: "text", text: `${hits.length} result(s) for "${query}" via ${kind} (${base}):\n\n${lines.join("\n\n")}` }] };
@@ -322,7 +337,7 @@ regTool("scrape_markdown",
   async ({ url, use_browser, impersonate, max_chars, proxy }) => {
     if (use_browser) {
       const page = getPage();
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await gotoReady(page, url, "domcontentloaded", 45000);
       await page.waitForTimeout(1200);
       const html = await page.content();
       return { content: [{ type: "text", text: `source: browser\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
@@ -358,7 +373,7 @@ regTool("smart_fetch",
       return { content: [{ type: "text", text: `${httpNote || "browser forced"} — and no browser is running. Call browser_launch first, then retry.` }], isError: true };
     }
     const page = getPage();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await gotoReady(page, url, "domcontentloaded", 45000);
     // Give a JS challenge time to clear itself before reading the DOM.
     for (let i = 0; i < 8; i++) {
       await page.waitForTimeout(1000);

@@ -9,19 +9,25 @@ const VICTIM = 39521, ATTACKER = 39522;
 
 export default async function run() {
   const { check, report } = runner("suite-security");
+  let victim = null, attacker = null, S = null;
+  try {
   let attackerCookie = "__never_called__";
-  const victim = await fixtureServer({
-    "/redirect": (q, r) => { r.writeHead(302, { Location: `http://localhost:${ATTACKER}/steal` }); r.end(); },
+  attacker = await fixtureServer({
+    "*": (q, r) => { attackerCookie = q.headers.cookie || null; r.writeHead(200); r.end("ok"); },
+  }, ATTACKER);
+  victim = await fixtureServer({
+    // cross-ORIGIN by hostname (localhost vs 127.0.0.1), using the port the OS gave us
+    "/redirect": (q, r) => { r.writeHead(302, { Location: `http://localhost:${attacker.port}/steal` }); r.end(); },
     "*": (q, r) => {
       r.writeHead(200, { "content-type": "text/html" });
       r.end(html(`<input id="pw" name="password" type="password"><input id="u" name="user" type="text"><button id="b" type="button">Nothing</button>`, "Sec"));
     },
   }, VICTIM);
-  const attacker = await fixtureServer({
+  attacker = await fixtureServer({
     "*": (q, r) => { attackerCookie = q.headers.cookie || null; r.writeHead(200); r.end("ok"); },
   }, ATTACKER);
 
-  const S = await startServer();
+  S = await startServer();
   const c = S.call;
   await c("browser_launch", { url: victim.url, headless: true, fresh_profile: true });
   await c("cookie_set", { name: "AUTH", value: "victim-session-token", domain: "127.0.0.1", expires_days: 1 });
@@ -97,6 +103,11 @@ export default async function run() {
   });
 
   await c("browser_close");
-  S.kill(); victim.close(); attacker.close();
+  } finally {
+    // Always release the browser: a check that throws used to skip this and leak a
+    // Camoufox process into the next run, which then failed for unrelated reasons.
+    try { if (S) await S.call("browser_close"); } catch {}
+    if (victim) victim.close(); if (attacker) attacker.close(); if (S) S.kill();
+  }
   return report();
 }

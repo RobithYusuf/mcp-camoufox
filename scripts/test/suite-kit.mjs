@@ -36,12 +36,18 @@ const PAGE = html(`
 
 export default async function run() {
   const { check, report } = runner("suite-kit");
+  let fx = null, S = null;
+  try {
   let maybeHits = 0, slowDone = false;
-  const fx = await fixtureServer({
+  fx = await fixtureServer({
     "/api.json": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end('{"msg":"hello-api"}'); },
     "/echo": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ method: q.method, headers: q.headers })); },
     "/slow": (q, r) => { setTimeout(() => { slowDone = true; r.writeHead(200); r.end("late"); }, 3000); },
     "/target": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<title>Target</title><h1>Target Page</h1>"); },
+    // degenerate shapes: unknown schema, genuinely empty, relative-only URLs
+    "/shape/search": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ ok: true, hits: [{ name: "A", link: "https://a.example" }], total: 1 })); },
+    "/empty/search": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ results: [] })); },
+    "/rel/search": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ results: [{ title: "rel", url: "/no-scheme", content: "" }] })); },
     // a self-hosted SearXNG with `formats: [html, json]` enabled
     "/search": (q, r) => {
       const u = new URL(q.url, "http://x");
@@ -61,7 +67,7 @@ export default async function run() {
     },
     "*": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end(PAGE); },
   }, PORT);
-  const S = await startServer();
+  S = await startServer();
   const c = S.call;
 
   // ── browserless HTTP (no browser_launch yet, on purpose) ──
@@ -139,6 +145,19 @@ export default async function run() {
   await check("search refuses a keyless paid provider", async () => {
     const t = await c("search", { query: "hello", endpoint: "https://api.tavily.com" });
     return [t.startsWith("IS_ERROR") && t.includes("needs an API key"), t.slice(0, 60)];
+  });
+  // an unreadable response must never be reported as "no results"
+  await check("search separates shape mismatch from empty", async () => {
+    const t = await c("search", { query: "x", endpoint: `${fx.url}/shape` });
+    return [t.startsWith("IS_ERROR") && t.includes('NOT "no results"') && t.includes("ok, hits, total"), "names the keys it got"];
+  });
+  await check("search reports a genuinely empty result set", async () => {
+    const t = await c("search", { query: "x", endpoint: `${fx.url}/empty` });
+    return [!t.startsWith("IS_ERROR") && t.includes("empty results array"), t.slice(0, 60)];
+  });
+  await check("search flags results with no absolute URL", async () => {
+    const t = await c("search", { query: "x", endpoint: `${fx.url}/rel` });
+    return [t.startsWith("IS_ERROR") && t.includes("absolute http(s) URL"), t.slice(0, 60)];
   });
   await check("search rejects bad extra_params", async () => {
     const t = await c("search", { query: "hello", endpoint: fx.url, extra_params: "{nope" });
@@ -276,6 +295,11 @@ export default async function run() {
     return [t.includes("server state reset") && st.includes('"browser_up": false'), "recovered"];
   });
 
-  S.kill(); fx.close();
+  } finally {
+    // Always release the browser: a check that throws used to skip this and leak a
+    // Camoufox process into the next run, which then failed for unrelated reasons.
+    try { if (S) await S.call("browser_close"); } catch {}
+    if (fx) fx.close(); if (S) S.kill();
+  }
   return report();
 }

@@ -623,7 +623,7 @@ regTool("browser_recover",
     S.activeProfileDir = null; S.activeProfileIsTemp = false;
     consoleMessages.length = 0; networkRequests.length = 0; S.networkSeq = 0;
     S.networkCaptureBodies = false; S.networkHandler = null; S.consoleHandler = null;
-    S.autoDialogHandler = null; S.autoDialogCfg = null; S.oneShotDialogArmed = false;
+    S.autoDialogHandler = null; S.autoDialogCfg = null; S.oneShotDialogArmed = false; S.oneShotDialogHandler = null;
     steps.push("server state reset");
     // A stale lock file means another Camoufox still owns the shared profile.
     let lockNote = "";

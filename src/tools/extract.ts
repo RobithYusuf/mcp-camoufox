@@ -6,7 +6,7 @@ import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { S, getPage } from "../state.js";
 import { jsStr, clickWithFallback, clickNote, refLocator,
-         scopeRoot, describeMatches, candidateList, snapshotPage } from "../helpers.js";
+         scopeRoot, describeMatches, candidateList, snapshotPage, waitReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Scraping / Extraction ───────────────────────────────────────────
@@ -351,7 +351,8 @@ regTool(
 
 regTool("back_and_snapshot", "Navigate back + return snapshot.", {}, async () => {
   const page = getPage();
-  await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 });
+  await page.goBack({ waitUntil: "commit", timeout: 15000 });
+  await waitReady(page, "domcontentloaded", 15000);
   await page.waitForTimeout(500);
   const snap = await snapshotPage(page);
   return { content: [{ type: "text", text: snap }] };
@@ -359,7 +360,8 @@ regTool("back_and_snapshot", "Navigate back + return snapshot.", {}, async () =>
 
 regTool("reload_and_snapshot", "Reload page + return snapshot.", {}, async () => {
   const page = getPage();
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+  await page.reload({ waitUntil: "commit", timeout: 15000 });
+  await waitReady(page, "domcontentloaded", 15000);
   await page.waitForTimeout(500);
   const snap = await snapshotPage(page);
   return { content: [{ type: "text", text: snap }] };

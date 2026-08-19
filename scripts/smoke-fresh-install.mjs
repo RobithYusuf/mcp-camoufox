@@ -10,20 +10,36 @@
 //
 //   node scripts/smoke-fresh-install.mjs [version]     (default: latest)
 import { spawn, execSync } from "child_process";
-import { mkdtempSync, writeFileSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
 const version = process.argv[2] || "latest";
+// The version this working tree intends to publish, to catch a stale install.
+const LOCAL_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version; }
+  catch { return null; }
+})();
 const dir = mkdtempSync(join(tmpdir(), "mcp-camoufox-smoke-"));
 console.log(`[smoke] installing mcp-camoufox@${version} into ${dir}`);
 writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "smoke", private: true, version: "1.0.0" }));
-execSync(`npm install mcp-camoufox@${version} --silent`, { cwd: dir, stdio: ["ignore", "ignore", "inherit"] });
+// --prefer-online: npm caches registry metadata for minutes, and a smoke run
+// right after publishing quietly installed the PREVIOUS version and passed.
+execSync(`npm install mcp-camoufox@${version} --silent --prefer-online`, { cwd: dir, stdio: ["ignore", "ignore", "inherit"] });
 
 const req = (p) => JSON.parse(execSync(`node -p "JSON.stringify(require('${p}/package.json'))"`, { cwd: dir }).toString());
 const pkg = req("./node_modules/mcp-camoufox");
 const pw = req("./node_modules/playwright-core");
 console.log(`[smoke] mcp-camoufox ${pkg.version} | playwright-core ${pw.version}`);
+// Verifying the wrong version is worse than not verifying at all: it hands a
+// release a green light it never earned. When run as `latest` from the repo,
+// demand that what npm served matches the version we are releasing.
+if (version === "latest" && LOCAL_VERSION && pkg.version !== LOCAL_VERSION) {
+  console.error(`[smoke] FAIL: npm served ${pkg.version} but this tree is ${LOCAL_VERSION}.`);
+  console.error(`[smoke] The registry has not propagated yet, or the publish did not land.`);
+  console.error(`[smoke] Wait and re-run, or pin it: node scripts/smoke-fresh-install.mjs ${LOCAL_VERSION}`);
+  process.exit(1);
+}
 if (pw.version.localeCompare("1.61.0", undefined, { numeric: true }) >= 0) {
   console.error(`[smoke] FAIL: playwright-core ${pw.version} >= 1.61 — Camoufox's Juggler rejects Browser.setDefaultViewport with isMobile.`);
   process.exit(1);

@@ -9,7 +9,7 @@ import { S, SCREENSHOT_DIR, getPage, consoleMessages, networkRequests, type NetE
 import { ACTION_TIMEOUT, resolveOutPath,
          totpFromSecret, clickWithFallback, clickNote, fillLocator, refLocator,
          snapshotPage,
-         type ClickMode } from "../helpers.js";
+         type ClickMode, gotoReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Console & Network ───────────────────────────────────────────────
@@ -319,7 +319,7 @@ regTool("navigate_and_snapshot", "Navigate to URL then return snapshot — combi
   wait_until: z.enum(["domcontentloaded", "load", "networkidle"]).default("domcontentloaded"),
 }, async ({ url, wait_until }) => {
   const page = getPage();
-  await page.goto(url, { waitUntil: wait_until, timeout: 30000 });
+  await gotoReady(page, url, wait_until, 30000);
   await page.waitForTimeout(1500);
   const text = await snapshotPage(page);
   return { content: [{ type: "text", text }] };

@@ -34,6 +34,8 @@ export const S = {
   autoDialogHandler: null as ((d: Dialog) => void) | null,
   autoDialogCfg: null as { action: "accept" | "dismiss"; promptText: string } | null,
   oneShotDialogArmed: false,
+  // The live one-shot dialog handler, so trackPage can arm tabs opened later.
+  oneShotDialogHandler: null as null | ((d: any) => any),
   networkCaptureBodies: false,
   networkSeq: 0,
 };

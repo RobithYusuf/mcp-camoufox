@@ -1,5 +1,5 @@
 // Core browser tools + the regressions that cost us real releases.
-import { startServer, fixtureServer, html, refOf, runner } from "./harness.mjs";
+import { startServer, fixtureServer, html, refOf, runner, until } from "./harness.mjs";
 
 const PORT = 39501;
 const CARDS = [1, 2, 3, 4].map(i =>
@@ -31,13 +31,15 @@ const PAGE = html(`
 
 export default async function run() {
   const { check, report } = runner("suite-core");
-  const fx = await fixtureServer({
+  let fx = null, S = null;
+  try {
+  fx = await fixtureServer({
     "/frame": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<title>F</title><div id='fd'>frame-data</div>"); },
     "/second": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<title>Second</title><h1>Second Page</h1>"); },
     "/api.json": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end('{"msg":"hello-api"}'); },
     "*": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end(PAGE); },
   }, PORT);
-  const S = await startServer();
+  S = await startServer();
   const c = S.call;
 
   await check("browser_launch (fresh profile)", async () => {
@@ -172,22 +174,23 @@ export default async function run() {
     return [l.includes("myframe") && v === "frame-data", v];
   });
   await check("get_page_errors captures the page throw", async () => {
-    await c("reload"); await new Promise(r => setTimeout(r, 700));
-    const t = await c("get_page_errors");
+    await c("reload");
+    const t = await until(async () => { const x = await c("get_page_errors"); return x.includes("page-boom") && x; }, 5000)
+      || await c("get_page_errors");
     return [t.includes("page-boom"), t.replace(/\s+/g, " ").slice(0, 70)];
   });
   await check("console capture", async () => {
     await c("console_start");
     await c("evaluate", { expression: "console.log('hello-console'); 'ok'" });
-    await new Promise(r => setTimeout(r, 400));
-    const t = await c("console_get");
+    const t = await until(async () => { const x = await c("console_get"); return x.includes("hello-console") && x; }, 5000)
+      || await c("console_get");
     return [t.includes("hello-console"), t.split("\n").pop()];
   });
   await check("network capture + detail + valid HAR", async () => {
     await c("network_start", { capture_bodies: true });
     await c("evaluate", { expression: "fetch('/api.json'); 'ok'" });
-    await new Promise(r => setTimeout(r, 1200));
-    const det = await c("network_get_detail", { url: "api.json" });
+    const det = await until(async () => { const x = await c("network_get_detail", { url: "api.json" }); return x.includes("hello-api") && x; }, 6000)
+      || await c("network_get_detail", { url: "api.json" });
     const har = await c("export_har", { path: "/tmp/mcpc-test.har" });
     const j = JSON.parse((await import("fs")).readFileSync("/tmp/mcpc-test.har", "utf8"));
     const e = j.log.entries[0];
@@ -197,6 +200,15 @@ export default async function run() {
 
   await check("tab_close keeps the SAME active tab", async () => {
     for (const q of ["B", "C", "D"]) await c("tab_new", { url: `${fx.url}/second?${q}` });
+    // Wait until every tab actually reports its URL. tab_new returns once goto
+    // resolves, but under load a tab was occasionally still uncommitted when the
+    // next check searched for it by url_contains — the failure then looked like a
+    // tab_select bug rather than a racing fixture.
+    for (let i = 0; i < 20; i++) {
+      const list = await c("tab_list");
+      if (["?B", "?C", "?D"].every(q => list.includes(q))) break;
+      await new Promise(r => setTimeout(r, 200));
+    }
     await c("tab_select", { index: 1 });
     await c("tab_close", { index: 0 });
     const list = await c("tab_list");
@@ -206,11 +218,76 @@ export default async function run() {
   await check("tab_select/close by url_contains", async () => {
     const a = await c("tab_select", { url_contains: "?D" });
     const b = await c("tab_close", { url_contains: "?C" });
-    return [a.includes("Switched") && b.includes("Closed tab"), b];
+    // report BOTH sides: a failure that only prints the second call is undiagnosable
+    return [a.includes("Switched") && b.includes("Closed tab"), `select→ ${a.slice(0, 60)} | close→ ${b.slice(0, 60)}`];
   });
 
-  // the tab block above left us on /second — come back to the fixture root
-  await c("navigate", { url: fx.url });
+  await check("navigate still works past the 5th tab", async () => {
+    // Camoufox stops delivering load/domcontentloaded to Juggler after the fifth
+    // page in a context: measured 4 successes then 8 straight 30s timeouts. Every
+    // navigation tool waited on those events, so opening five tabs broke
+    // navigate/tab_new/reload/go_back for the rest of the session.
+    const tags = ["T1", "T2", "T3", "T4", "T5", "T6"];
+    const opened = [];
+    for (const q of tags) {
+      const r = await c("tab_new", { url: `${fx.url}/second?${q}` });
+      opened.push(r.startsWith("IS_ERROR") ? `${q}:TIMEOUT` : q);
+    }
+    const nav = await c("navigate", { url: fx.url });
+    const here = await c("evaluate", { expression: "location.pathname" });
+    for (const q of tags) { try { await c("tab_close", { url_contains: `?${q}` }); } catch {} }
+    const bad = opened.filter(o => o.includes("TIMEOUT"));
+    return [!bad.length && here === "/" && !nav.startsWith("IS_ERROR"), `opened=${opened.join(",")} navigate→${here}`];
+  });
+  await check("tab_new keeps the tab reachable when the URL fails", async () => {
+    // The tab exists in the browser the moment newPage() returns. Tracking it
+    // only after a successful goto left a dead tab nobody could select or close.
+    const rowsOf = t => t.split("\n").filter(l => /^\s*\[\d+\]/.test(l));
+    const before = rowsOf(await c("tab_list")).length;
+    const r = await c("tab_new", { url: "http://127.0.0.1:1/" });   // Firefox refuses port 1 at once
+    const rows = rowsOf(await c("tab_list"));
+    const active = rows.find(l => l.includes("(active)")) || "";
+    // Don't assert the parked URL — Firefox may show about:blank or its own
+    // blocked-port page. What matters is that the tab is tracked and selected.
+    const idx = Number((active.match(/\[(\d+)\]/) || [])[1]);
+    const ok = r.startsWith("IS_ERROR") && rows.length === before + 1 && !active.includes(`${fx.url}/`) && idx === before;
+    try { await c("tab_close", { index: idx }); } catch {}
+    await c("tab_select", { index: 0 });
+    return [ok, `${r.slice(0, 34)} | tabs ${before}→${rows.length} | active=${active.trim().slice(0, 46)}`];
+  });
+  await check("dialog_handle covers a tab opened after it was armed", async () => {
+    // The one-shot armed only the tabs open at the time, but told the persistent
+    // handler to stand down globally — so a dialog on a newer tab reached no
+    // handler, and a registered listener suppresses Playwright's auto-dismiss.
+    // That page then blocked forever.
+    await c("dialog_handle", { action: "accept" });
+    await c("tab_new", { url: fx.url });
+    const s2 = await c("browser_snapshot");
+    await c("evaluate", { expression: "document.getElementById('out').textContent='none'; 'ok'" });
+    await c("click", { ref: refOf(s2, '"Ask"') });
+    const v = await c("evaluate", { expression: "document.getElementById('out').textContent" });
+    try { await c("tab_close", { index: 1 }); } catch {}
+    await c("tab_select", { index: 0 });
+    return [v === "yes", `out=${v}`];
+  });
+
+  // The tab block above left us on /second. Come back to the fixture root and
+  // PROVE we arrived — a bare navigate here raced occasionally with the tab that
+  // had just been closed, and the next two checks then failed for the wrong reason.
+  let navSays = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    navSays.push(await c("navigate", { url: fx.url }));
+    const here = await c("evaluate", { expression: "location.pathname + '|' + (document.getElementById('tbl') ? 'has-table' : 'no-table') + '|ready=' + document.readyState + '|title=' + JSON.stringify(document.title) + '|body=' + (document.body ? document.body.innerHTML.length : -1)" });
+    if (here.includes("has-table")) break;
+    if (attempt === 2) {
+      const tabs = await c("tab_list");
+      const url = await c("get_url");
+      const st = await c("server_status");
+      const probe = await fx.probe(), socks = await fx.sockets();
+      const fresh = await c("tab_new", { url: fx.url });
+      throw new Error(`could not get back to the fixture root: ${here}\n  fixture probe: ${probe} (open sockets: ${socks})\n  fresh tab said: ${String(fresh).replace(/\n/g, " ").slice(0, 140)}\n  navigate said: ${navSays.map((n, i) => `[${i}] ${n.replace(/\n/g, " ").slice(0, 160)}`).join("\n                 ")}\n  get_url: ${url.replace(/\n/g, " ")}\n  ${tabs.replace(/\n/g, "\n  ")}`);
+    }
+  }
   await check("screenshot returns the image inline", async () => {
     const t = await c("screenshot", { name: "suite-core" });
     return [t.includes("[IMAGE image/png") && t.includes("saved"), t.split("\n")[0]];
@@ -229,6 +306,14 @@ export default async function run() {
     const d = await c("assert_url_matches", { pattern: "127.0.0.1" });
     return [a.startsWith("PASS") && b.startsWith("PASS") && d.startsWith("PASS"), "3/3 PASS"];
   });
+  // a dashboard-scale page once produced a 566,000-character snapshot silently
+  await check("browser_snapshot caps a huge page and says how to continue", async () => {
+    await c("evaluate", { expression: "(() => { var f=document.createDocumentFragment(); for (var i=0;i<3000;i++){var b=document.createElement('button'); b.id='big'+i; b.setAttribute('aria-label','Action '+i+' with a fairly long accessible name'); b.textContent='Item '+i; f.appendChild(b);} document.body.appendChild(f); return 'ok'; })()" });
+    const snap = await c("browser_snapshot");
+    const ok = snap.length < 70000 && snap.includes("stopped at") && snap.includes("browser_snapshot(offset=");
+    await c("reload");
+    return [ok, `${snap.length} chars, continuation hint present`];
+  });
   await check("browser_close reports cookie fate", async () => {
     const t = await c("browser_close");
     return [t.includes("Browser closed") && (t.includes("Cookies:") || t.includes("Temp profile removed")), t.slice(0, 80)];
@@ -238,6 +323,11 @@ export default async function run() {
     return [t.startsWith("IS_ERROR") && t.includes("Browser not running"), t.slice(0, 50)];
   });
 
-  S.kill(); fx.close();
+  } finally {
+    // Always release the browser: a check that throws used to skip this and leak a
+    // Camoufox process into the next run, which then failed for unrelated reasons.
+    try { if (S) await S.call("browser_close"); } catch {}
+    if (fx) fx.close(); if (S) S.kill();
+  }
   return report();
 }

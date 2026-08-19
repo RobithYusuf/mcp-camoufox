@@ -8,7 +8,7 @@ import { join } from "path";
 import { PROFILE_PARENT, getPage } from "../state.js";
 import { ACTION_TIMEOUT, safeName, writeSecretFile, expandHome, resolveOutPath,
          refLocator,
-         inflightOf } from "../helpers.js";
+         inflightOf, gotoReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Storage State (Session Reuse) ───────────────────────────────────
@@ -50,7 +50,7 @@ regTool("storage_state_load", "Load cookies + localStorage from a JSON file (cre
   if (data.cookies && data.cookies.length) await ctx.addCookies(data.cookies);
   let lsCount = 0, ssCount = 0;
   if (navigate_to) {
-    await page.goto(navigate_to, { waitUntil: "domcontentloaded" });
+    await gotoReady(page, navigate_to);
     const origin = data.origins?.[0] || {};
     // The saved storage belongs to ONE origin. Landing somewhere else (an open
     // redirect, a login bounce) and writing it there hands those tokens to that
@@ -247,7 +247,7 @@ regTool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to b
   const per = Math.floor(duration_ms / urls.length);
   for (const url of urls) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+      await gotoReady(page, url, "domcontentloaded", 15000);
       await page.waitForTimeout(per * 0.4);
       // Random scroll — via window.scrollBy, since mouse.wheel is a no-op in Camoufox
       const dy = Math.round(200 + Math.random() * 400);

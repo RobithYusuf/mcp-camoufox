@@ -18,6 +18,11 @@ export const PKG_VERSION: string = (() => {
 // Shared default timeout for element actions (click/fill/check/etc.).
 export const ACTION_TIMEOUT = 5000;
 
+// Upper bound on one snapshot's rendered element list. 60k characters is large
+// enough for any ordinary page and small enough that a 6,000-element dashboard
+// can no longer blow up the response.
+export const MAX_SNAPSHOT_CHARS = 60000;
+
 export function ensureDirs() {
   mkdirSync(PROFILE_DIR, { recursive: true });
   mkdirSync(SCREENSHOT_DIR, { recursive: true });
@@ -261,6 +266,48 @@ export function candidateList(total: number, items: any[]): string {
 export const inflightByPage = new WeakMap<Page, { n: number }>();
 export function inflightOf(p: Page): number { return inflightByPage.get(p)?.n ?? 0; }
 
+export type WaitUntil = "domcontentloaded" | "load" | "networkidle";
+
+/** Wait for a page to be ready WITHOUT relying on Playwright's lifecycle events.
+ *
+ *  Camoufox stops delivering `load` and `domcontentloaded` to Juggler after the
+ *  fifth page in a context — measured, with a fresh browser per run: both events
+ *  succeed 4 times and then fail every time after (8/12 timing out at 30s), while
+ *  `commit` plus this poll passes 12/12 with the DOM verified present. Anything
+ *  that waited on those events burned its entire timeout on a page that had in
+ *  fact loaded fine, which is why navigate/tab_new/reload/go_back all broke for
+ *  anyone who opened five tabs.
+ *
+ *  So: commit the navigation (which does not depend on those events), then ask
+ *  the document itself. networkidle uses the same per-page in-flight counter as
+ *  wait_for_network_idle rather than the equally-dead lifecycle event. */
+export async function waitReady(page: Page, waitUntil: WaitUntil, timeout: number): Promise<void> {
+  const deadline = Date.now() + timeout;
+  // "load" wants a fully loaded document; the other two only need it parsed.
+  const cond = waitUntil === "load"
+    ? `(() => { return document.readyState === "complete"; })()`
+    : `(() => { var s = document.readyState; return s === "interactive" || s === "complete"; })()`;
+  await page.waitForFunction(cond, null, { timeout: Math.max(1000, deadline - Date.now()) });
+  if (waitUntil !== "networkidle") return;
+  // Same rule as wait_for_network_idle: quiet for 500ms continuously.
+  let quietSince = inflightOf(page) === 0 ? Date.now() : 0;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(100);
+    if (inflightOf(page) === 0) {
+      if (!quietSince) quietSince = Date.now();
+      if (Date.now() - quietSince >= 500) return;
+    } else quietSince = 0;
+  }
+}
+
+/** goto + waitReady. Every navigation in this server goes through here. */
+export async function gotoReady(
+  page: Page, url: string, waitUntil: WaitUntil = "domcontentloaded", timeout = 30000,
+): Promise<void> {
+  await page.goto(url, { waitUntil: "commit", timeout });
+  await waitReady(page, waitUntil, timeout);
+}
+
 // Track a page in the global S.pages[] list and auto-remove it on close.
 // Used for the initial page, tab_new, AND pages opened by the site itself
 // (window.open / target=_blank) via the browserContext "page" event — without
@@ -275,6 +322,9 @@ export function trackPage(p: Page): void {
   // A persistent dialog handler must cover tabs the site opens later too,
   // otherwise a popup's confirm() hangs the flow.
   if (S.autoDialogHandler) p.on("dialog", S.autoDialogHandler);
+  // A one-shot dialog_handle promises the next dialog on ANY tab — including one
+  // opened after it was armed, which would otherwise hang with no handler at all.
+  if (S.oneShotDialogHandler) p.on("dialog", S.oneShotDialogHandler);
   const inflight = { n: 0 };
   inflightByPage.set(p, inflight);
   p.on("request", () => { inflight.n++; });
@@ -378,6 +428,12 @@ export function formatSnapshot(
     `Interactive elements (${counts}${offset ? `, offset ${offset}` : ""}):`,
     "",
   ];
+  // Size guard: a dashboard-scale page produced a 566,000-character snapshot with
+  // no warning at all — hundreds of thousands of tokens, silently. Stop at a
+  // budget and say exactly how to get the rest, instead of flooding the caller.
+  let budget = MAX_SNAPSHOT_CHARS;
+  let rendered = 0;
+  let truncatedBySize = false;
   for (const el of filtered) {
     const parts = [`[${el.tag || "?"}]`];
     if (el.role) parts.push(`role=${el.role}`);
@@ -388,10 +444,17 @@ export function formatSnapshot(
     if (el.href) parts.push(`href="${el.href.slice(0, 60)}"`);
     if (el.checked) parts.push("checked");
     if (el.disabled) parts.push("disabled");
-    lines.push(`  ref=${el.ref}  ${parts.join(" ")}`);
+    const line = `  ref=${el.ref}  ${parts.join(" ")}`;
+    if (budget - line.length < 0) { truncatedBySize = true; break; }
+    budget -= line.length + 1;
+    lines.push(line);
+    rendered++;
   }
-  const shownEnd = offset + filtered.length;
-  if (matched > shownEnd) {
+  const shownEnd = offset + rendered;
+  if (truncatedBySize) {
+    lines.push("", `… stopped at ${rendered} elements (~${MAX_SNAPSHOT_CHARS / 1000}k chars) — ${matched - shownEnd} still unshown.`,
+      `Continue with browser_snapshot(offset=${shownEnd}), narrow with roles=["button","textbox"], or on a page this size prefer page_stats / extract_structured / scrape_page.`);
+  } else if (matched > shownEnd) {
     lines.push("", `… ${matched - shownEnd} more — call browser_snapshot with offset=${shownEnd}`);
   }
   return lines.join("\n");

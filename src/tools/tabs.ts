@@ -7,7 +7,7 @@ import { writeFileSync } from "fs";
 import { S, getPage } from "../state.js";
 import { ACTION_TIMEOUT, resolveOutPath,
          refLocator,
-         trackPage } from "../helpers.js";
+         trackPage, gotoReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Tab Management ──────────────────────────────────────────────────
@@ -28,13 +28,15 @@ regTool("tab_new", "Open new tab.", {
 }, async ({ url }) => {
   if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
   const page = await S.browserContext.newPage();
-  if (url && url !== "about:blank") {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-  }
-  // newPage() also fires the context "page" event → trackPage may already have
-  // added it; trackPage is idempotent, so this just guarantees it's present.
+  // Track BEFORE navigating. newPage() also fires the context "page" event, so
+  // trackPage may already have added it (it is idempotent) — but if the goto
+  // below throws, the tab still exists in the browser, and doing this afterwards
+  // left it unreachable: not active, and not returned to the caller.
   trackPage(page);
   S.activePage = S.pages.indexOf(page);
+  if (url && url !== "about:blank") {
+    await gotoReady(page, url, "domcontentloaded", 30000);
+  }
   return { content: [{ type: "text", text: `New tab [${S.activePage}]. URL: ${page.url()}` }] };
 });
 
@@ -157,7 +159,6 @@ regTool("dialog_handle", "Set handler for the next alert/confirm/prompt on ANY o
   // Arm every tab, not just the active one — a dialog can fire on a popup the
   // site opened. The first dialog disarms all tabs; later dialogs get
   // Playwright's default auto-dismiss instead of hanging the page.
-  const armed = S.pages.slice();
   let used = false;
   // Tell a persistent dialog_auto_handle to stand down for this one dialog.
   S.oneShotDialogArmed = true;
@@ -165,14 +166,20 @@ regTool("dialog_handle", "Set handler for the next alert/confirm/prompt on ANY o
     if (used) { try { await dialog.dismiss(); } catch {} return; }
     used = true;
     S.oneShotDialogArmed = false;
-    for (const p of armed) { try { p.off("dialog", handler); } catch {} }
+    S.oneShotDialogHandler = null;
+    for (const p of S.pages) { try { p.off("dialog", handler); } catch {} }
     try {
       if (action === "accept") await dialog.accept(prompt_text);
       else await dialog.dismiss();
     } catch {}
   };
-  for (const p of armed) p.on("dialog", handler);
-  return { content: [{ type: "text", text: `Next dialog will be ${action}'d (armed on ${armed.length} tab(s))` }] };
+  // Arm tabs opened LATER too. Arming only today's tabs was a silent hang: the
+  // persistent handler stands down while this one is armed, so a dialog on a new
+  // tab reached no handler at all — and a registered listener suppresses
+  // Playwright's auto-dismiss, leaving that page blocked forever.
+  S.oneShotDialogHandler = handler;
+  for (const p of S.pages) p.on("dialog", handler);
+  return { content: [{ type: "text", text: `Next dialog will be ${action}'d (armed on ${S.pages.length} tab(s); tabs opened later are armed too)` }] };
 });
 
 // ── Tools: File Upload ─────────────────────────────────────────────────────
@@ -198,7 +205,7 @@ regTool(
   async ({ prompt, output_path, image_paths, timeout_ms }) => {
     const page = getPage();
     // 1) fresh chat
-    await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+    await gotoReady(page, "https://chatgpt.com/", "domcontentloaded", 60000);
     await page.waitForSelector("#prompt-textarea", { timeout: 30000 });
     // dismiss blocking modals (e.g. subscription-failure) that intercept clicks
     try { await page.evaluate(`(() => { const m = document.getElementById('modal-subscription-failure'); if (m) m.remove(); document.querySelectorAll('div[data-state="open"].z-50').forEach(e => e.remove()); })()`); } catch {}
@@ -252,7 +259,7 @@ regTool(
     if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
     const NOTUSER = `Array.from(document.querySelectorAll('main img')).filter(i => !i.closest('[data-message-author-role="user"]'))`;
     const submit = async (page: Page, prompt: string) => {
-      await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+      await gotoReady(page, "https://chatgpt.com/", "domcontentloaded", 60000);
       await page.waitForSelector("#prompt-textarea", { timeout: 30000 });
       try { await page.evaluate(`(() => { const m=document.getElementById('modal-subscription-failure'); if(m)m.remove(); document.querySelectorAll('div[data-state="open"].z-50').forEach(e=>e.remove()); })()`); } catch {}
       if (shared_image_paths.length > 0) {

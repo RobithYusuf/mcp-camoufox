@@ -10,7 +10,7 @@ import { S, PROFILE_DIR, PROFILE_PARENT, SCREENSHOT_DIR, getPage, ensureDirs,
          consoleMessages, networkRequests, storageSnapshots } from "../state.js";
 import { ACTION_TIMEOUT, safeName, ERROR_HOOK_JS, refLocator,
          snapshotPage,
-         trackPage } from "../helpers.js";
+         trackPage, gotoReady, waitReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Browser Lifecycle ───────────────────────────────────────────────
@@ -82,7 +82,7 @@ regTool(
     if (S.browserUp && S.browserContext) {
       const page = getPage();
       if (url && url !== "about:blank") {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await gotoReady(page, url, "domcontentloaded", 30000);
         await page.waitForTimeout(1500);
       }
       return { content: [{ type: "text", text: `Already running — launch options (headless/humanize/geoip/locale/size/fresh_profile) were IGNORED; call browser_close first to relaunch with new options. Navigated to: ${page.url()}` }] };
@@ -162,7 +162,7 @@ regTool(
     if (S.activePage < 0) S.activePage = 0;
 
     if (url && url !== "about:blank") {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await gotoReady(page, url, "domcontentloaded", 30000);
       await page.waitForTimeout(1500);
     }
     const title = await page.title();
@@ -234,6 +234,7 @@ regTool(
     S.autoDialogHandler = null;
     S.autoDialogCfg = null;
     S.oneShotDialogArmed = false;
+    S.oneShotDialogHandler = null;
     storageSnapshots.clear();
     return { content: [{ type: "text", text: `Browser closed. ${note}` }] };
   }
@@ -283,7 +284,7 @@ regTool(
   },
   async ({ url, wait_until, timeout }) => {
     const page = getPage();
-    await page.goto(url, { waitUntil: wait_until, timeout });
+    await gotoReady(page, url, wait_until, timeout);
     await page.waitForTimeout(1000);
     return { content: [{ type: "text", text: `Navigated to: ${page.url()}\nTitle: ${await page.title()}` }] };
   }
@@ -291,19 +292,22 @@ regTool(
 
 regTool("go_back", "Navigate back in history.", {}, async () => {
   const page = getPage();
-  await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 });
+  await page.goBack({ waitUntil: "commit", timeout: 15000 });
+  await waitReady(page, "domcontentloaded", 15000);
   return { content: [{ type: "text", text: `Went back. URL: ${page.url()}` }] };
 });
 
 regTool("go_forward", "Navigate forward in history.", {}, async () => {
   const page = getPage();
-  await page.goForward({ waitUntil: "domcontentloaded", timeout: 15000 });
+  await page.goForward({ waitUntil: "commit", timeout: 15000 });
+  await waitReady(page, "domcontentloaded", 15000);
   return { content: [{ type: "text", text: `Went forward. URL: ${page.url()}` }] };
 });
 
 regTool("reload", "Reload the current page.", {}, async () => {
   const page = getPage();
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+  await page.reload({ waitUntil: "commit", timeout: 15000 });
+  await waitReady(page, "domcontentloaded", 15000);
   return { content: [{ type: "text", text: `Reloaded. URL: ${page.url()}` }] };
 });
 

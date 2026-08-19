@@ -79,9 +79,22 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
   `.first()` once clicked a page header's "Cancel" instead of the dialog's and destroyed a filled form.
 - Always fill through `fillLocator`. Firefox's select-all is a no-op on `input[type=email]` and
   `[type=number]`, so a plain `locator.fill()` appends to the old value.
+- `formatSnapshot` caps its element list at `MAX_SNAPSHOT_CHARS` (60k). A 6,000-element page produced a
+  566,000-character response with no warning at all; it now stops and prints the exact `offset=` call to
+  continue, plus the `roles=` and `extract_structured` alternatives.
 - Secret-looking fields (type=password, or `pass|secret|token|otp|cvv|card|pin` in name/id/autocomplete)
   are masked everywhere they could surface: `fill`, `cookie_set`, `login_classic`, `browser_snapshot`
   and `inspect_element`.
+
+### Navigation
+
+- Every navigation goes through `gotoReady` / `waitReady` in `helpers.ts` — never `page.goto` with a
+  lifecycle `waitUntil`. They commit the navigation and then poll the document, because the events
+  Playwright would otherwise wait for stop arriving (see the Camoufox facts below). `networkidle` uses
+  the same per-page in-flight counter as `wait_for_network_idle`, not the equally dead lifecycle event.
+- `tab_new` calls `trackPage` and sets the active page **before** navigating. The tab exists the moment
+  `newPage()` returns, so tracking it only after a successful `goto` left a dead tab nobody could
+  select or close.
 
 ### Tabs, capture and dialogs
 
@@ -91,6 +104,10 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
   handlers to new tabs.
 - The active tab is tracked by page **identity**, not index. Closing a lower-indexed tab must not move
   "active" to a different page.
+- A one-shot `dialog_handle` arms tabs opened later too (`S.oneShotDialogHandler`, armed by `trackPage`).
+  It tells the persistent handler to stand down globally, so arming only the tabs that existed at the
+  time left a dialog on a newer tab with no handler at all — and a registered listener suppresses
+  Playwright's auto-dismiss, blocking that page forever.
 - `console_start`/`network_start` attach to every page and detach any previous handler first, so
   re-calling never stacks listeners. `browser_close` nulls the handler refs and clears the buffers.
 - `browser_launch` claims its launch slot synchronously before the first `await`. The SDK dispatches
@@ -106,6 +123,9 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
   target, so an open redirect handed the session cookie to another host. Cookies are recomputed per hop
   and caller credentials are dropped when the origin changes.
 - `htmlToMarkdown` is regex-based on purpose — no jsdom or turndown dependency.
+- `search` never reports an unreadable response as "no results". If the provider's container is missing
+  it says so and prints the top-level keys it did get — a shape mismatch reported as an empty result set
+  is the same confident lie this project keeps removing.
 - No SERP scraping. `web_search`/`deep_research` shipped in 0.9.0 and were removed in 0.9.2: Bing
   answers any "how does …" query with dictionary pages for the word "does", DuckDuckGo is
   TLS-intercepted on some ISPs, and every alternative needs its own fragile parser. `search` is the
@@ -121,6 +141,12 @@ These are platform truths, not preferences. Each one cost a release.
   `const`/`let` inside evaluate strings.
 - Every value spliced into an evaluate string goes through `jsStr()` (`JSON.stringify`). A selector or
   key containing a quote, backslash or newline otherwise breaks the whole expression.
+- Camoufox stops delivering the `load` and `domcontentloaded` lifecycle events after the **fifth page**
+  in a context. Measured with a fresh browser per run: both events succeed 4 times, then time out every
+  time after (8/12 at 30s), while `commit` plus a `document.readyState` poll passes 12/12 with the DOM
+  verified present. Anything waiting on those events burns its whole timeout on a page that loaded
+  fine — this silently broke `navigate`, `tab_new`, `reload` and `go_back` for anyone who opened five
+  tabs. Never pass `waitUntil: "domcontentloaded"`/`"load"` to Playwright here; go through `gotoReady`.
 - `page.url()` is a function, not a property.
 - `mouse.wheel()` silently no-ops; scroll with `window.scrollBy` via evaluate.
 - `page.pdf()` is Chromium-only and always throws here; `save_pdf` catches it and points at
@@ -152,8 +178,10 @@ These are platform truths, not preferences. Each one cost a release.
 ## Verification and debugging
 
 ```bash
-npm test                 # 76 checks, three suites, real browser over MCP stdio
+npm test                 # 89 checks, three suites, real browser over MCP stdio
 npm test -- core         # one suite
+npm test -- --parallel   # all three at once (~27s vs ~52s); each owns its browser and port
+MCPC_ONLY=snapshot npm test -- core   # only checks whose name matches — debugging aid, NOT a verification
 npm run test:schema      # dump every tool name/description/schema
 npm run smoke:install    # install the PUBLISHED package and drive a real browser
 ```
@@ -168,6 +196,13 @@ npm run smoke:install    # install the PUBLISHED package and drive a real browse
   against the published version → commit and push.
 - The suites use `fresh_profile: true`; the shared profile may be locked by a browser the developer is
   already running.
+- Every suite cleans up in a `finally` (browser closed, fixture closed, server killed) and takes an
+  OS-assigned port. Both were added after crashed runs leaked Camoufox processes and left a fixed port
+  bound, so the *next* run died on `EADDRINUSE` and the real failure was never visible.
+- Prefer `until(fn)` from the harness over a fixed sleep: a hard-coded delay both wastes time when the
+  event is instant and still fails on a slow machine.
+- A hunt for an intermittent failure is over when the isolated repro is deterministic. The tab bug above
+  looked like a 1-in-5 test flake for days; a 12-iteration script pinned it at 8/12 in under a minute.
 
 ## Maintaining this guide
 

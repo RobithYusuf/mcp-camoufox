@@ -37,10 +37,12 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | --------------------------------------------------------------- | ------- | ------- | ----------- | ------------------ |
 | Chrome DevTools MCP                                             | 30+     | No      | Built-in    | Yes                |
 | whit3rabbit/camoufox-mcp                                        | 1       | Yes     | Yes         | No                 |
-| redf0x1/camofox-mcp                                             | 45      | Yes     | No (clone)  | Yes                |
+| redf0x1/camofox-mcp                                             | 47      | Yes     | Yes         | Yes                |
 | Sekinal/camoufox-mcp                                            | 49      | Yes     | No (clone)  | Yes                |
 | Playwright CLI                                                  | 60+     | No      | Yes         | Yes                |
 | [**mcp-camoufox**](https://github.com/RobithYusuf/mcp-camoufox) | **128** | **Yes** | **Yes**     | **Yes**            |
+
+<sub>Competitor figures checked 19 Aug 2026: camofox-mcp counted by running `tools/list` against v1.15.0 from npm (it is npx-installable — an earlier version of this table wrongly said otherwise); the others are taken from their own READMEs.</sub>
 
 
 ## Proven on Real Sites
@@ -616,6 +618,8 @@ The default profile persists across `browser_close` calls, so the next login on 
 | `npm audit` flags adm-zip in your project | It comes from `camoufox-js`, which pins `adm-zip ^0.5.16`. Our own overrides can't reach your tree (npm applies overrides only from the root project), so add `"overrides": { "adm-zip": "0.6.0" }` to YOUR package.json if your scanner requires it. |
 | Field value looks concatenated                      | Fixed — `fill`/`fill_form`/`batch_actions`/`login_classic` now clear `email`/`number` inputs before typing. Upgrade if you're on ≤0.7.2.                                                                                                                                                     |
 | `humanize_click` did nothing                        | Fixed — it now scrolls the element into view and errors if the element is outside the viewport.                                                                                                                                                                                              |
+| `navigate`, `tab_new` or `reload` hangs ~30s and times out | Camoufox stops delivering the `load`/`domcontentloaded` events after the **5th page** in a context, so every navigation waited out its full timeout on a page that had in fact loaded. Opening five tabs broke navigation for the rest of the session. Fixed in 0.9.11 — navigation now commits and polls `document.readyState` instead. Upgrade if you're on ≤0.9.10. |
+| A tab opened after `dialog_handle` froze on a `confirm()` | The one-shot handler armed only the tabs that were open at the time, but told the persistent handler to stand down globally — so the dialog reached no handler, and a registered listener suppresses Playwright's auto-dismiss. Fixed in 0.9.11: tabs opened later are armed too. |
 | MCP server silently dies                            | If you ran `pkill -f camoufox`, you killed the MCP node process too (its argv contains "camoufox"). Target the binary specifically — e.g. `pkill -f "Camoufox.app/Contents/MacOS"` — or use `pkill -f camoufox-js`.                                                                          |
 
 
