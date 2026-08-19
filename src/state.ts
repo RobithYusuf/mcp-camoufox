@@ -38,7 +38,15 @@ export const S = {
   oneShotDialogHandler: null as null | ((d: any) => any),
   networkCaptureBodies: false,
   networkSeq: 0,
+  // Request interception. Routed on the CONTEXT, so tabs opened later are covered
+  // without re-arming — and so a handler is never left attached per page.
+  interceptHandler: null as null | ((route: any, request: any) => any),
+  interceptBlocked: 0,
+  interceptAllowed: 0,
 };
+
+export interface InterceptEntry { action: "block" | "allow"; type: string; url: string; why: string; }
+export const interceptLog: InterceptEntry[] = [];
 
 export function getPage(): Page {
   if (!S.browserUp || S.pages.length === 0) {

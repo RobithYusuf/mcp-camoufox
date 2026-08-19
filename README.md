@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **128 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **133 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -40,7 +40,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp                                             | 47      | Yes     | Yes         | Yes                |
 | Sekinal/camoufox-mcp                                            | 49      | Yes     | No (clone)  | Yes                |
 | Playwright CLI                                                  | 60+     | No      | Yes         | Yes                |
-| [**mcp-camoufox**](https://github.com/RobithYusuf/mcp-camoufox) | **128** | **Yes** | **Yes**     | **Yes**            |
+| [**mcp-camoufox**](https://github.com/RobithYusuf/mcp-camoufox) | **133** | **Yes** | **Yes**     | **Yes**            |
 
 <sub>Competitor figures checked 19 Aug 2026: camofox-mcp counted by running `tools/list` against v1.15.0 from npm (it is npx-installable — an earlier version of this table wrongly said otherwise); the others are taken from their own READMEs.</sub>
 
@@ -132,7 +132,7 @@ The browser lands in `%LOCALAPPDATA%\camoufox`, profile/screenshots/sessions in
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 128 Tools
+## All 133 Tools
 
 ### Browser Lifecycle (4)
 
@@ -341,7 +341,7 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `accessibility_snapshot` | Accessibility tree for LLM understanding |
 
 
-### Console &amp; Network (5)
+### Console &amp; Network (9)
 
 
 | Tool                            | Description                                                                                                                                                                                                                                          |
@@ -349,6 +349,9 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `console_start` / `console_get` | Capture and retrieve browser console messages. Capture spans **all tabs** and follows newly opened tabs/popups (re-calling `console_start` resets cleanly — no listener stacking).                                                                   |
 | `network_start` / `network_get` | Capture network requests across **all tabs** (follows tab switches + popups). `network_start(capture_bodies=true)` also records request/response headers + text bodies. `network_get(filter=...)` narrows by URL substring; each row shows an `#id`. |
 | `network_get_detail`            | Full request + response (headers + text body) for one captured request by `#id` or `url` substring. Needs `capture_bodies=true`. Replaces the `evaluate()`+`fetch()` workaround for inspecting API payloads.                                         |
+| `intercept_start` / `intercept_stop` | Abort requests before they leave the browser, by resource type (`image`, `media`, `font`, `stylesheet`, `script`, `xhr`, `fetch`, `websocket`) and/or URL pattern (`*doubleclick.net*`). Blocking images and stylesheets removes most of a typical page's bytes — the biggest single speed-up for scraping. Routed on the **context**, so tabs opened later are covered too. `document` cannot be blocked: that would abort the navigation itself. |
+| `intercept_log`                 | What interception actually blocked and allowed, with the rule that matched each decision — so a "blocked" claim can be checked rather than trusted.                                                                                                 |
+| `export_curl`                   | Rebuild a captured request as a runnable `curl` command (method, headers, body) to replay or share an API call. Needs `capture_bodies=true`. Warns when the command carries live credentials; `redact=true` produces a shareable version.           |
 
 
 ### Compound (reduce round-trips) (4)
@@ -475,6 +478,7 @@ The browser is the expensive path. `impit` (already shipped with camoufox-js) sp
 | `export_har`           | Export captured traffic as a valid **HAR 1.2** file (opens in DevTools). Needs `network_start` first; headers/bodies included only with `capture_bodies=true`.           |
 | `page_stats`           | Element count, page size, load metrics + extraction strategy recommendation                                                                                              |
 | `performance_timeline` | TTFB, DOMContentLoaded, load, FCP, LCP + the 5 slowest resources (CLS is unavailable — Firefox has no layout-shift API)                                                  |
+| `fingerprint_audit`    | The fingerprint a site actually sees (user-agent, platform, languages, timezone, screen vs window, cores, WebGL, `navigator.webdriver`), and flags **contradictions between those values** — a viewport larger than the screen, a Chrome object on a Firefox UA, a platform that disagrees with the user-agent. Self-consistency only: it cannot tell you whether a given site's detector passes you. |
 
 
 ### Site Automation (2)

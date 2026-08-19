@@ -487,3 +487,89 @@ regTool("export_har",
   const bodyNote = S.networkCaptureBodies ? "" : " (no headers/bodies — restart with network_start capture_bodies=true)";
   return { content: [{ type: "text", text: `HAR exported: ${target} (${entries.length} entries)${bodyNote}` }] };
 });
+
+// ── Tool: Fingerprint audit ────────────────────────────────────────────────
+
+regTool("fingerprint_audit",
+  "Report the fingerprint a site actually sees from this browser, and flag internal contradictions — the mismatches that get an " +
+  "automated browser detected are far more revealing than any single value. Read-only: it inspects, it does not change anything.",
+  {},
+  async () => {
+    const page = getPage();
+    // IIFE + var: Camoufox does not reliably auto-invoke string arrow functions.
+    const raw = await page.evaluate(`(function () {
+      var out = {};
+      var n = navigator, s = screen;
+      out.userAgent = n.userAgent;
+      out.platform = n.platform;
+      out.languages = (n.languages || []).join(",");
+      out.language = n.language;
+      out.hardwareConcurrency = n.hardwareConcurrency;
+      out.deviceMemory = n.deviceMemory === undefined ? null : n.deviceMemory;
+      out.maxTouchPoints = n.maxTouchPoints;
+      out.webdriver = n.webdriver === undefined ? null : n.webdriver;
+      out.plugins = n.plugins ? n.plugins.length : -1;
+      out.mimeTypes = n.mimeTypes ? n.mimeTypes.length : -1;
+      out.pdfViewerEnabled = n.pdfViewerEnabled === undefined ? null : n.pdfViewerEnabled;
+      out.screen = s.width + "x" + s.height;
+      out.availScreen = s.availWidth + "x" + s.availHeight;
+      out.colorDepth = s.colorDepth;
+      out.pixelRatio = window.devicePixelRatio;
+      out.inner = window.innerWidth + "x" + window.innerHeight;
+      out.outer = window.outerWidth + "x" + window.outerHeight;
+      out.hasChromeObject = typeof window.chrome !== "undefined";
+      try { var dtf = Intl.DateTimeFormat().resolvedOptions(); out.timezone = dtf.timeZone; out.locale = dtf.locale; } catch (e) { out.timezone = "?"; out.locale = "?"; }
+      out.tzOffsetMin = new Date().getTimezoneOffset();
+      try {
+        var cv = document.createElement("canvas");
+        var gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
+        if (gl) {
+          var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+          out.webglVendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+          out.webglRenderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+        } else { out.webglVendor = null; out.webglRenderer = null; }
+      } catch (e) { out.webglVendor = "error"; out.webglRenderer = String(e).slice(0, 60); }
+      return JSON.stringify(out);
+    })()`) as string;
+    const f = JSON.parse(raw);
+
+    // Contradictions. Each one is a real detection signal, not a style note.
+    const flags: string[] = [];
+    if (f.webdriver === true) flags.push("navigator.webdriver is TRUE — this is the single most checked automation tell.");
+    if (f.hasChromeObject) flags.push("window.chrome exists on a Firefox user-agent — a Chrome-only object on a Firefox UA is a contradiction.");
+    const ua = String(f.userAgent || "");
+    if (/Headless/i.test(ua)) flags.push("The user-agent contains 'Headless'.");
+    const uaSaysMac = /Macintosh/i.test(ua), uaSaysWin = /Windows/i.test(ua), uaSaysLinux = /Linux|X11/i.test(ua);
+    const plat = String(f.platform || "");
+    if ((uaSaysMac && !/Mac/i.test(plat)) || (uaSaysWin && !/Win/i.test(plat)) || (uaSaysLinux && !/Linux|arm|x86/i.test(plat))) {
+      flags.push(`navigator.platform "${plat}" does not match the OS in the user-agent.`);
+    }
+    const [sw, sh] = String(f.screen || "0x0").split("x").map(Number);
+    const [iw, ih] = String(f.inner || "0x0").split("x").map(Number);
+    if (iw > sw || ih > sh) {
+      flags.push(`The viewport (${f.inner}) is larger than the screen (${f.screen}) — impossible on a real display. This is what no_viewport=true causes; use set_viewport_size instead.`);
+    }
+    if (f.plugins === 0 && f.mimeTypes === 0) flags.push("navigator.plugins and mimeTypes are both empty — common in crude headless setups.");
+    if (f.hardwareConcurrency === 0 || f.hardwareConcurrency === undefined) flags.push("navigator.hardwareConcurrency is missing or zero.");
+
+    const lines = [
+      `Fingerprint as the page sees it`,
+      ``,
+      `  user-agent   ${f.userAgent}`,
+      `  platform     ${f.platform}          languages  ${f.languages}`,
+      `  timezone     ${f.timezone} (offset ${f.tzOffsetMin}m)   locale  ${f.locale}`,
+      `  screen       ${f.screen} (avail ${f.availScreen}, depth ${f.colorDepth}, dpr ${f.pixelRatio})`,
+      `  window       inner ${f.inner} / outer ${f.outer}`,
+      `  cores        ${f.hardwareConcurrency}      memory ${f.deviceMemory ?? "not exposed"}      touch ${f.maxTouchPoints}`,
+      `  webdriver    ${f.webdriver === null ? "undefined (good)" : f.webdriver}`,
+      `  plugins      ${f.plugins}   mimeTypes ${f.mimeTypes}   pdfViewer ${f.pdfViewerEnabled}`,
+      `  webgl        ${f.webglVendor ?? "unavailable"} / ${f.webglRenderer ?? "unavailable"}`,
+      ``,
+      flags.length ? `⚠ ${flags.length} contradiction(s) a detector could use:` : `No internal contradictions found in the values above.`,
+      ...flags.map(x => `  • ${x}`),
+      ``,
+      `This checks self-consistency only. It cannot tell you whether a specific site's detector`,
+      `passes you — for that, drive a real challenge page and read the outcome.`,
+    ];
+    return { content: [{ type: "text", text: lines.filter(l => l !== undefined).join("\n") }] };
+  });

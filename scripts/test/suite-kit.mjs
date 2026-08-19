@@ -39,11 +39,17 @@ export default async function run() {
   let fx = null, S = null;
   try {
   let maybeHits = 0, slowDone = false;
+  const hits = { img: 0, css: 0 };
   fx = await fixtureServer({
     "/api.json": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end('{"msg":"hello-api"}'); },
     "/echo": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ method: q.method, headers: q.headers })); },
     "/slow": (q, r) => { setTimeout(() => { slowDone = true; r.writeHead(200); r.end("late"); }, 3000); },
     "/target": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<title>Target</title><h1>Target Page</h1>"); },
+    // subresources for intercept_*: counted server-side, so a "blocked" claim is
+    // checked against what actually left the browser, not against our own log.
+    "/pic.png": (q, r) => { hits.img++; r.writeHead(200, { "content-type": "image/png" }); r.end(Buffer.from("89504e470d0a1a0a", "hex")); },
+    "/s.css": (q, r) => { hits.css++; r.writeHead(200, { "content-type": "text/css" }); r.end("body{color:red}"); },
+    "/rich": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end('<!doctype html><title>Rich</title><link rel=stylesheet href="/s.css"><img src="/pic.png"><h1 id=h>Rich Page</h1>'); },
     // degenerate shapes: unknown schema, genuinely empty, relative-only URLs
     "/shape/search": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ ok: true, hits: [{ name: "A", link: "https://a.example" }], total: 1 })); },
     "/empty/search": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ results: [] })); },
@@ -289,6 +295,51 @@ export default async function run() {
     const t = await c("workflow_run", { steps: [{ tool: "get_url", args: {} }, { tool: "nope_tool", args: {} }] });
     return [t.startsWith("IS_ERROR") && t.includes("UNKNOWN TOOL") && t.includes("start_at=1"), "resume hint present"];
   });
+  await check("intercept_start blocks by type and by url pattern", async () => {
+    hits.img = 0; hits.css = 0;
+    await c("navigate", { url: `${fx.url}/rich` });
+    const base = `${hits.img}/${hits.css}`;
+    hits.img = 0; hits.css = 0;
+    await c("intercept_start", { block_types: ["image"], block_urls: ["*s.css*"] });
+    await c("navigate", { url: `${fx.url}/rich` });
+    const blocked = `${hits.img}/${hits.css}`;
+    const usable = await c("evaluate", { expression: "document.getElementById('h') ? document.getElementById('h').textContent : 'NO DOM'" });
+    await c("intercept_stop");
+    hits.img = 0; hits.css = 0;
+    await c("navigate", { url: `${fx.url}/rich` });
+    const after = `${hits.img}/${hits.css}`;
+    // the document itself must still load — blocking must not break the page
+    // Assert the property, not exact counts: Firefox may re-request a subresource.
+    const n = t => t.split("/").map(Number).reduce((a, b) => a + b, 0);
+    return [n(base) > 0 && blocked === "0/0" && n(after) > 0 && usable === "Rich Page",
+            `baseline ${base} → blocked ${blocked} → after stop ${after}, page=${usable}`];
+  });
+  await check("intercept_log reports what it blocked", async () => {
+    await c("intercept_start", { block_types: ["image"] });
+    await c("navigate", { url: `${fx.url}/rich` });
+    const log = await c("intercept_log", { action: "block" });
+    await c("intercept_stop");
+    return [log.includes("pic.png") && log.includes("type=image"), log.split("\n")[0]];
+  });
+  await check("export_curl says so when headers were never captured", async () => {
+    const t = await c("export_curl", { url_contains: "definitely-not-captured" });
+    return [t.startsWith("IS_ERROR") && /No captured request matches/.test(t), t.slice(0, 70)];
+  });
+  await check("export_curl rebuilds a captured request and warns about credentials", async () => {
+    await c("network_start", { capture_bodies: true });
+    await c("cookie_set", { name: "sid", value: "secret-session", url: fx.url });
+    await c("navigate", { url: `${fx.url}/target` });
+    const t = await c("export_curl", { url_contains: "/target" });
+    const red = await c("export_curl", { url_contains: "/target", redact: true });
+    return [t.includes("curl -X GET") && t.includes("⚠") && red.includes("<REDACTED>") && !red.includes("secret-session"),
+            `warned=${t.includes("⚠")} redacted=${red.includes("<REDACTED>")}`];
+  });
+  await check("fingerprint_audit finds no contradiction in a normal launch", async () => {
+    const t = await c("fingerprint_audit");
+    return [t.includes("No internal contradictions") && t.includes("user-agent") && t.includes("webgl"),
+            t.split("\n").find(l => l.includes("contradiction")) || "?"];
+  });
+
   await check("browser_recover resets a live session", async () => {
     const t = await c("browser_recover");
     const st = await c("server_status");

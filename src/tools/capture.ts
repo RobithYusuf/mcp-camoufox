@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { join } from "path";
-import { S, SCREENSHOT_DIR, getPage, consoleMessages, networkRequests, type NetEntry } from "../state.js";
+import { S, SCREENSHOT_DIR, getPage, consoleMessages, networkRequests, interceptLog, type NetEntry } from "../state.js";
 import { ACTION_TIMEOUT, resolveOutPath,
          totpFromSecret, clickWithFallback, clickNote, fillLocator, refLocator,
          snapshotPage,
@@ -324,3 +324,123 @@ regTool("navigate_and_snapshot", "Navigate to URL then return snapshot — combi
   const text = await snapshotPage(page);
   return { content: [{ type: "text", text }] };
 });
+
+
+// ── Tools: Request interception ────────────────────────────────────────────
+//
+// Routing lives on the BrowserContext, not the page: a per-page route would miss
+// every tab the site opens, and would have to be re-attached by trackPage.
+
+/** Substring match, or glob-ish when the pattern contains `*`. */
+function urlMatches(url: string, pattern: string): boolean {
+  if (!pattern) return false;
+  if (!pattern.includes("*")) return url.includes(pattern);
+  const rx = new RegExp("^" + pattern.split("*").map(p => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
+  return rx.test(url);
+}
+
+regTool("intercept_start",
+  "Block requests before they leave the browser. Blocking image/media/font/stylesheet typically removes most of a page's bytes — " +
+  "the single biggest speed-up for scraping — and block_urls kills trackers and ad frames. Routed on the context, so tabs opened " +
+  "later are covered too. Re-calling replaces the previous rules; intercept_stop removes them. 'document' cannot be blocked: it " +
+  "would abort the navigation itself.",
+  {
+    block_types: z.array(z.enum(["image", "media", "font", "stylesheet", "script", "xhr", "fetch", "websocket", "other"]))
+      .default([]).describe("Resource types to abort."),
+    block_urls: z.array(z.string()).default([])
+      .describe("URL patterns to abort — plain substring, or use * as a wildcard (e.g. *doubleclick.net*)."),
+    log_limit: z.number().default(300).describe("How many decisions to keep for intercept_log."),
+  },
+  async ({ block_types, block_urls, log_limit }) => {
+    if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
+    if (!block_types.length && !block_urls.length) {
+      throw new Error("Nothing to block: pass block_types and/or block_urls. Use intercept_stop to remove existing rules.");
+    }
+    if (S.interceptHandler) { try { await S.browserContext.unroute("**/*", S.interceptHandler); } catch {} }
+    interceptLog.length = 0;
+    S.interceptBlocked = 0; S.interceptAllowed = 0;
+    S.interceptHandler = async (route: any, request: any) => {
+      // A route handler that neither continues nor aborts hangs that request
+      // forever, so every path below ends in exactly one of the two.
+      let type = "other", url = "";
+      try { type = request.resourceType(); url = request.url(); } catch {}
+      try {
+        const byType = block_types.includes(type as any);
+        const pattern = block_urls.find(p => urlMatches(url, p));
+        if (byType || pattern) {
+          S.interceptBlocked++;
+          if (interceptLog.length < log_limit) {
+            interceptLog.push({ action: "block", type, url, why: byType ? `type=${type}` : `url~${pattern}` });
+          }
+          await route.abort();
+          return;
+        }
+        S.interceptAllowed++;
+        if (interceptLog.length < log_limit) interceptLog.push({ action: "allow", type, url, why: "" });
+        await route.continue();
+      } catch {
+        // Never leave the request dangling because our own bookkeeping threw.
+        try { await route.continue(); } catch {}
+      }
+    };
+    await S.browserContext.route("**/*", S.interceptHandler);
+    const rules = [block_types.length ? `types: ${block_types.join(", ")}` : "", block_urls.length ? `urls: ${block_urls.join(", ")}` : ""].filter(Boolean).join(" | ");
+    return { content: [{ type: "text", text: `Interception ON — blocking ${rules}. Applies to every tab, including ones opened later. Check intercept_log for what it actually did.` }] };
+  });
+
+regTool("intercept_stop", "Remove interception rules and report what they blocked.", {}, async () => {
+  if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
+  if (!S.interceptHandler) return { content: [{ type: "text", text: "Interception was not active." }] };
+  try { await S.browserContext.unroute("**/*", S.interceptHandler); } catch {}
+  S.interceptHandler = null;
+  const t = `Interception OFF. Blocked ${S.interceptBlocked}, allowed ${S.interceptAllowed}.`;
+  return { content: [{ type: "text", text: t }] };
+});
+
+regTool("intercept_log", "Show what interception blocked and allowed.", {
+  action: z.enum(["block", "allow", "all"]).default("block"),
+  limit: z.number().default(50),
+}, async ({ action, limit }) => {
+  if (!S.interceptHandler && !interceptLog.length) {
+    return { content: [{ type: "text", text: "Interception is not active and nothing was logged. Start it with intercept_start." }] };
+  }
+  const rows = interceptLog.filter(e => action === "all" || e.action === action).slice(-limit);
+  const head = `Interception ${S.interceptHandler ? "ON" : "OFF"} — blocked ${S.interceptBlocked}, allowed ${S.interceptAllowed}. Showing last ${rows.length} (${action}).`;
+  if (!rows.length) return { content: [{ type: "text", text: `${head}\nNo matching entries.` }] };
+  const body = rows.map(e => `${e.action === "block" ? "✗" : "·"} [${e.type}] ${e.url.slice(0, 110)}${e.why ? `  (${e.why})` : ""}`).join("\n");
+  return { content: [{ type: "text", text: `${head}\n${body}` }] };
+});
+
+regTool("export_curl",
+  "Rebuild a captured request as a runnable curl command, so you can replay or share an API call without re-deriving its headers. " +
+  "Needs network_start(capture_bodies=true) — headers are not recorded otherwise.",
+  {
+    url_contains: z.string().default("").describe("Pick the most recent captured request whose URL contains this."),
+    id: z.number().default(-1).describe("Or pick by the id shown in network_get."),
+    redact: z.boolean().default(false).describe("Replace Cookie/Authorization values with placeholders."),
+  },
+  async ({ url_contains, id, redact }) => {
+    const pool = networkRequests.filter(e => (id >= 0 ? e.id === id : (!url_contains || e.url.includes(url_contains))));
+    const entry = pool[pool.length - 1];
+    if (!entry) {
+      return { content: [{ type: "text", text: `No captured request matches${id >= 0 ? ` id=${id}` : url_contains ? ` "${url_contains}"` : ""}. ${networkRequests.length} request(s) captured — call network_start first, then reload the page.` }], isError: true };
+    }
+    if (!entry.reqHeaders) {
+      return { content: [{ type: "text", text: `Request ${entry.id} was captured without headers, so a curl built from it would not reproduce the call. Re-run network_start(capture_bodies=true) and repeat the request.` }], isError: true };
+    }
+    const q = (v: string) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+    const secret = /^(cookie|authorization|proxy-authorization|x-api-key|x-auth-token)$/i;
+    const parts = [`curl -X ${entry.method} ${q(entry.url)}`];
+    const carried: string[] = [];
+    for (const [k, v] of Object.entries(entry.reqHeaders)) {
+      if (k.startsWith(":")) continue;                       // pseudo-headers are not curl's business
+      const isSecret = secret.test(k);
+      if (isSecret) carried.push(k);
+      parts.push(`  -H ${q(`${k}: ${isSecret && redact ? "<REDACTED>" : v}`)}`);
+    }
+    if (entry.reqBody) parts.push(`  --data-raw ${q(entry.reqBody)}`);
+    const warn = carried.length && !redact
+      ? `\n\n⚠ This command carries live credentials (${carried.join(", ")}). Treat it as a secret — do not paste it into an issue or a shared doc. Pass redact=true for a shareable version.`
+      : carried.length ? `\n\nNote: ${carried.join(", ")} redacted — replace the placeholders before running.` : "";
+    return { content: [{ type: "text", text: `# ${entry.method} ${entry.status} — captured id=${entry.id}\n${parts.join(" \\\n")}${warn}` }] };
+  });

@@ -7,7 +7,7 @@ defaults; hard constraints may only be overridden when the developer explicitly 
 
 ## Product and repository map
 
-An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 128 tools over Camoufox, a
+An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 133 tools over Camoufox, a
 Firefox build with C++-level anti-fingerprinting. Published on npm as `mcp-camoufox`.
 
 ```
@@ -178,7 +178,7 @@ These are platform truths, not preferences. Each one cost a release.
 ## Verification and debugging
 
 ```bash
-npm test                 # 89 checks, three suites, real browser over MCP stdio
+npm test                 # 94 checks, three suites, real browser over MCP stdio
 npm test -- core         # one suite
 npm test -- --parallel   # all three at once (~27s vs ~52s); each owns its browser and port
 MCPC_ONLY=snapshot npm test -- core   # only checks whose name matches — debugging aid, NOT a verification

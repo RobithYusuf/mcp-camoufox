@@ -235,6 +235,7 @@ regTool(
     S.autoDialogCfg = null;
     S.oneShotDialogArmed = false;
     S.oneShotDialogHandler = null;
+    S.interceptHandler = null; S.interceptBlocked = 0; S.interceptAllowed = 0;
     storageSnapshots.clear();
     return { content: [{ type: "text", text: `Browser closed. ${note}` }] };
   }
