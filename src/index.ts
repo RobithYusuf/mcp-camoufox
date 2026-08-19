@@ -42,7 +42,7 @@ function getPage(): Page {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-import { mkdirSync, writeFileSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { join } from "path";
 import { createHmac } from "crypto";
 import { createRequire } from "module";
@@ -66,6 +66,27 @@ function ensureDirs() {
 // quote-escaping breaks on backslashes/newlines/quotes; JSON.stringify doesn't.
 function jsStr(s: string): string {
   return JSON.stringify(s ?? "");
+}
+
+// A user-supplied *name* must never escape its directory. `screenshot` and
+// `auth_capture` join a name into a fixed folder, so "../../../../etc/x" used to
+// write anywhere the process could reach — an arbitrary-write primitive for an
+// agent that has only this MCP server and no shell.
+function safeName(name: string, fallback = "file"): string {
+  const cleaned = String(name || "")
+    .replace(/[\\/]/g, "_")      // no path separators
+    .replace(/^\.+/, "")          // no leading dots ("..", ".hidden")
+    .replace(/[\x00-\x1f]/g, "")  // no control chars
+    .trim()
+    .slice(0, 100);
+  return cleaned || fallback;
+}
+
+// Cookies and storage states ARE credentials. Default 0644 let any other local
+// user read a captured login; write them 0600.
+function writeSecretFile(target: string, data: string): void {
+  writeFileSync(target, data, { mode: 0o600 });
+  try { chmodSync(target, 0o600); } catch {}   // pre-existing file keeps its old mode otherwise
 }
 
 // Expand a leading ~ only (a bare .replace("~", HOME) would rewrite a tilde
@@ -731,7 +752,7 @@ regTool(
   },
   async ({ name, full_page, ref, selector, return_image }) => {
     const page = getPage();
-    const path = join(SCREENSHOT_DIR, `${name}.png`);
+    const path = join(SCREENSHOT_DIR, `${safeName(name, "page")}.png`);
     let buf: Buffer;
     let what = full_page ? "full page" : "viewport";
     if (ref || selector) {
@@ -873,8 +894,17 @@ regTool("fill", "Fill input/textarea by ref ID. Always replaces existing content
   value: z.string().describe("Text to fill"),
 }, async ({ ref, value }) => {
   const page = getPage();
-  await fillLocator(refLocator(page, ref), value);
-  return { content: [{ type: "text", text: `Filled ref=${ref} with '${value.slice(0, 50)}'` }] };
+  const loc = refLocator(page, ref);
+  await fillLocator(loc, value);
+  // Never echo a password back into the agent transcript / logs.
+  const secret = await loc.evaluate((el: any) => {
+    const t = String(el.type || "").toLowerCase();
+    const hint = `${el.name || ""} ${el.id || ""} ${el.getAttribute("autocomplete") || ""}`.toLowerCase();
+    return t === "password" || /pass|secret|token|otp|cvv|card|pin/.test(hint);
+  }).catch(() => false);
+  return { content: [{ type: "text", text: secret
+    ? `Filled ref=${ref} (${value.length} chars, value masked — looks like a secret field)`
+    : `Filled ref=${ref} with '${value.slice(0, 50)}'` }] };
 });
 
 regTool("select_option", "Select option from <select> dropdown.", {
@@ -1161,7 +1191,7 @@ regTool("cookie_set",
     const life = expires_days > 0
       ? `expires in ${expires_days}d (survives browser_close)`
       : "SESSION cookie — will be LOST on browser_close; pass expires_days to persist";
-    return { content: [{ type: "text", text: `Cookie set: ${name}=${value.slice(0, 40)} domain=${domain} — ${life}` }] };
+    return { content: [{ type: "text", text: `Cookie set: ${name}=${value.slice(0, 4)}…(${value.length} chars, masked) domain=${domain} — ${life}` }] };
   });
 
 regTool("cookie_delete", "Delete cookies. Both empty = clear all.", {
@@ -1388,6 +1418,9 @@ regTool("console_start", "Start capturing console messages from all tabs.", {}, 
   if (consoleHandler) for (const p of pages) { try { p.off("console", consoleHandler); } catch {} }
   consoleHandler = (msg: any) => {
     consoleMessages.push({ type: msg.type(), text: msg.text().slice(0, 200) });
+    // Bounded like networkRequests — a chatty (or hostile) page must not grow
+    // this without limit for the life of the server.
+    if (consoleMessages.length > 1000) consoleMessages.shift();
   };
   // Attach to every current page; trackPage() attaches it to future tabs/popups,
   // so capture follows the user across tab switches instead of dying on tab 0.
@@ -1664,7 +1697,7 @@ regTool("login_classic",
         const tf = page.locator(TOTP_SEL).first();
         await tf.waitFor({ state: "visible", timeout: 4000 });
         await fillLocator(tf, code);
-        log.push(`2FA code filled (${code})`);
+        log.push("2FA code filled (value masked)");
         const sb = page.locator(NEXT_SEL).first();
         if (await sb.count() && await sb.isVisible()) await clickWithFallback(sb);
         else await page.keyboard.press("Enter");
@@ -2727,7 +2760,7 @@ regTool("storage_state_save", "Save cookies + localStorage to a JSON file. Reloa
     return { url: location.href, origin: location.origin, ...data };
   })()`);
   const target = resolveOutPath(path);
-  writeFileSync(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
+  writeSecretFile(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
   return { content: [{ type: "text", text: `Saved storage state: ${target} (${cookies.length} cookies, ${Object.keys((origins as any).local || {}).length} localStorage, ${Object.keys((origins as any).session || {}).length} sessionStorage)` }] };
 });
 
@@ -2773,8 +2806,11 @@ regTool("auth_capture", "Save current session as named auth state (e.g. logged-i
     for (var j = 0; j < sessionStorage.length; j++) { var k = sessionStorage.key(j); data.session[k] = sessionStorage.getItem(k); }
     return { url: location.href, origin: location.origin, ...data };
   })()`);
-  const target = resolveOutPath(`${PROFILE_PARENT}/sessions/${name}.json`);
-  writeFileSync(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
+  const dir = `${PROFILE_PARENT}/sessions`;
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { chmodSync(dir, 0o700); } catch {}
+  const target = `${dir}/${safeName(name, "session")}.json`;
+  writeSecretFile(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
   return { content: [{ type: "text", text: `auth_capture saved: ${target}` }] };
 });
 
@@ -2786,7 +2822,7 @@ regTool("cookie_export_file", "Export all cookies to a JSON file (Playwright for
   const page = getPage();
   const cookies = await page.context().cookies();
   const target = resolveOutPath(path);
-  writeFileSync(target, JSON.stringify(cookies, null, 2));
+  writeSecretFile(target, JSON.stringify(cookies, null, 2));
   return { content: [{ type: "text", text: `Exported ${cookies.length} cookies to ${target}` }] };
 });
 
