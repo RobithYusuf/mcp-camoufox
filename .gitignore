@@ -13,3 +13,6 @@ PLAN-CHROMIUM-STEALTH.md
 
 # experimental local build (project-scoped, not published)
 dist-exp/
+
+# npm pack artifacts — never commit these
+*.tgz
