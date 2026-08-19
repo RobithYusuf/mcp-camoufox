@@ -311,6 +311,27 @@ export async function waitReady(page: Page, waitUntil: WaitUntil, timeout: numbe
   }
 }
 
+/** Let a just-loaded page settle, but stop as soon as it actually has.
+ *
+ *  Every navigation used to be followed by a blind `waitForTimeout(1000)` (1500
+ *  in launch and navigate_and_snapshot) — a guess made back when nothing here
+ *  could tell when a page was ready. Measured on a local fixture, that guess was
+ *  85% of navigate's total time: 1113ms, against 166ms for tab_new doing the same
+ *  work without it. This waits for the same per-page in-flight counter the rest of
+ *  the server uses and returns the moment the page is quiet, keeping the old
+ *  duration only as the worst case for a page that really is still busy. */
+export async function settle(page: Page, capMs: number, quietMs = 200): Promise<void> {
+  const deadline = Date.now() + capMs;
+  let quietSince = inflightOf(page) === 0 ? Date.now() : 0;
+  while (Date.now() < deadline) {
+    if (inflightOf(page) === 0) {
+      if (!quietSince) quietSince = Date.now();
+      if (Date.now() - quietSince >= quietMs) return;
+    } else quietSince = 0;
+    await page.waitForTimeout(25);
+  }
+}
+
 /** goto + waitReady. Every navigation in this server goes through here. */
 export async function gotoReady(
   page: Page, url: string, waitUntil: WaitUntil = "domcontentloaded", timeout = 30000,

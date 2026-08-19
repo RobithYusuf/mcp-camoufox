@@ -10,7 +10,7 @@ import { S, PROFILE_DIR, PROFILE_PARENT, SCREENSHOT_DIR, getPage, ensureDirs,
          consoleMessages, networkRequests, storageSnapshots } from "../state.js";
 import { ACTION_TIMEOUT, safeName, ERROR_HOOK_JS, refLocator,
          snapshotPage,
-         trackPage, gotoReady, waitReady } from "../helpers.js";
+         trackPage, gotoReady, waitReady, settle } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Browser Lifecycle ───────────────────────────────────────────────
@@ -83,7 +83,7 @@ regTool(
       const page = getPage();
       if (url && url !== "about:blank") {
         await gotoReady(page, url, "domcontentloaded", 30000);
-        await page.waitForTimeout(1500);
+        await settle(page, 1500);
       }
       return { content: [{ type: "text", text: `Already running — launch options (headless/humanize/geoip/locale/size/fresh_profile) were IGNORED; call browser_close first to relaunch with new options. Navigated to: ${page.url()}` }] };
     }
@@ -169,7 +169,7 @@ regTool(
 
     if (url && url !== "about:blank") {
       await gotoReady(page, url, "domcontentloaded", 30000);
-      await page.waitForTimeout(1500);
+      await settle(page, 1500);
     }
     const title = await page.title();
     const profileNote = isTemp ? " (fresh temp profile)" : "";
@@ -295,7 +295,7 @@ regTool(
   async ({ url, wait_until, timeout }) => {
     const page = getPage();
     await gotoReady(page, url, wait_until, timeout);
-    await page.waitForTimeout(1000);
+    await settle(page, 1000);
     return { content: [{ type: "text", text: `Navigated to: ${page.url()}\nTitle: ${await page.title()}` }] };
   }
 );

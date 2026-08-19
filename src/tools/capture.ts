@@ -9,7 +9,7 @@ import { S, SCREENSHOT_DIR, getPage, consoleMessages, networkRequests, intercept
 import { ACTION_TIMEOUT, resolveOutPath,
          totpFromSecret, clickWithFallback, clickNote, fillLocator, refLocator,
          snapshotPage,
-         type ClickMode, gotoReady } from "../helpers.js";
+         type ClickMode, gotoReady, settle } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Console & Network ───────────────────────────────────────────────
@@ -320,7 +320,7 @@ regTool("navigate_and_snapshot", "Navigate to URL then return snapshot — combi
 }, async ({ url, wait_until }) => {
   const page = getPage();
   await gotoReady(page, url, wait_until, 30000);
-  await page.waitForTimeout(1500);
+  await settle(page, 1500);
   const text = await snapshotPage(page);
   return { content: [{ type: "text", text }] };
 });

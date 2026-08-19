@@ -93,6 +93,15 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
   lifecycle `waitUntil`. They commit the navigation and then poll the document, because the events
   Playwright would otherwise wait for stop arriving (see the Camoufox facts below). `networkidle` uses
   the same per-page in-flight counter as `wait_for_network_idle`, not the equally dead lifecycle event.
+- A navigation is followed by `settle(page, capMs)`, never a blind `waitForTimeout`. Each navigation
+  used to sleep a flat 1000ms (1500 in launch and navigate_and_snapshot) — a guess from when nothing
+  here could tell whether a page was ready. Measured against a local fixture that was 85% of the whole
+  call: 1113ms for `navigate` versus 166ms for `tab_new` doing the same work without it. `settle`
+  watches the same in-flight counter and returns as soon as the page is quiet, keeping the old duration
+  only as the worst case. `navigate` now costs ~315ms locally and ~545ms on a real site.
+- Do NOT use `settle` after a click or a form submit. It measures network quiet, and right after a
+  click the request often has not left yet — it would return before the thing it is meant to wait for
+  even starts. The fixed sleeps in `fill_form` and `login_classic` are deliberate for that reason.
 - `tab_new` calls `trackPage` and sets the active page **before** navigating. The tab exists the moment
   `newPage()` returns, so tracking it only after a successful `goto` left a dead tab nobody could
   select or close.

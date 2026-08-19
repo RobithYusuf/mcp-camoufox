@@ -8,7 +8,7 @@ import { S, getPage } from "../state.js";
 import { PKG_VERSION, ACTION_TIMEOUT, jsStr, safeName, writeSecretFile, expandHome, resolveOutPath,
          ERROR_HOOK_JS, totpFromSecret, clickWithFallback, clickNote, fillLocator, refLocator,
          scopeRoot, describeMatches, candidateList, SNAPSHOT_JS, formatSnapshot, snapshotPage,
-         trackPage, inflightOf, type ClickMode, gotoReady } from "../helpers.js";
+         trackPage, inflightOf, type ClickMode, gotoReady, settle } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -338,7 +338,7 @@ regTool("scrape_markdown",
     if (use_browser) {
       const page = getPage();
       await gotoReady(page, url, "domcontentloaded", 45000);
-      await page.waitForTimeout(1200);
+      await settle(page, 1200);
       const html = await page.content();
       return { content: [{ type: "text", text: `source: browser\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
     }
