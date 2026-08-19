@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **127 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **128 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -40,7 +40,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp                                             | 45      | Yes     | No (clone)  | Yes                |
 | Sekinal/camoufox-mcp                                            | 49      | Yes     | No (clone)  | Yes                |
 | Playwright CLI                                                  | 60+     | No      | Yes         | Yes                |
-| [**mcp-camoufox**](https://github.com/RobithYusuf/mcp-camoufox) | **127** | **Yes** | **Yes**     | **Yes**            |
+| [**mcp-camoufox**](https://github.com/RobithYusuf/mcp-camoufox) | **128** | **Yes** | **Yes**     | **Yes**            |
 
 
 ## Proven on Real Sites
@@ -75,204 +75,53 @@ WebDriver, User-Agent, CDP, Navigator — every detection category returns **"No
 
 ## Setup
 
-<details>
-<summary><b>Claude Code</b></summary>
-
-**Global** (available in all projects):
-```bash
-claude mcp add camoufox --scope user -- npx -y mcp-camoufox@latest
-```
-
-**Project only** (current project):
-```bash
-claude mcp add camoufox -- npx -y mcp-camoufox@latest
-```
-</details>
-
-<details>
-<summary><b>Claude Desktop</b></summary>
-
-**Global** — add to config file:
-- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-- **Linux:** `~/.config/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "camoufox": {
-      "command": "npx",
-      "args": ["-y", "mcp-camoufox@latest"]
-    }
-  }
-}
-```
-
-> Claude Desktop is always global — no project-level config.
-</details>
-
-<details>
-<summary><b>Cursor</b></summary>
-
-**Global** — Preferences > Features > MCP, or `~/.cursor/mcp.json`:
-
-**Project** — `.cursor/mcp.json` in project root:
-
-```json
-{
-  "mcpServers": {
-    "camoufox": {
-      "command": "npx",
-      "args": ["-y", "mcp-camoufox@latest"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Windsurf</b></summary>
-
-**Global** — `~/.windsurf/mcp.json`:
-
-**Project** — `.windsurf/mcp.json` in project root:
-
-```json
-{
-  "servers": {
-    "camoufox": {
-      "command": "npx",
-      "args": ["-y", "mcp-camoufox@latest"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>VS Code (Continue / Cline / Kilo Code)</b></summary>
-
-**Global** — VS Code settings or `~/.continue/config.json`:
-
-**Project** — `.vscode/mcp.json` in project root:
-
-```json
-{
-  "mcpServers": {
-    "camoufox": {
-      "command": "npx",
-      "args": ["-y", "mcp-camoufox@latest"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Factory (Droid)</b></summary>
-
-**Global** — `~/.factory/mcp.json`:
-
-**Project** — `.factory/mcp.json` in project root:
-
-```json
-{
-  "mcpServers": {
-    "camoufox": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "mcp-camoufox@latest"],
-      "disabled": false
-    }
-  }
-}
-```
-
-Or via CLI:
-```bash
-droid mcp add camoufox "npx -y mcp-camoufox@latest"
-```
-</details>
-
-<details>
-<summary><b>OpenCode</b></summary>
-
-**Global** — `~/.config/opencode/opencode.json`:
-
-**Project** — `opencode.json` in project root:
-
-```json
-{
-  "mcp": {
-    "camoufox": {
-      "type": "local",
-      "command": ["npx", "-y", "mcp-camoufox@latest"],
-      "enabled": true
-    }
-  }
-}
-```
-
-> Note: OpenCode uses `"type": "local"` (not `"stdio"`) and `command` as a single array.
-</details>
-
-<details>
-<summary><b>Trae (ByteDance)</b></summary>
-
-**Global** — `~/.trae/mcp.json`:
-
-**Project** — `.trae/mcp.json` in project root:
-
-```json
-{
-  "mcpServers": [
-    {
-      "name": "camoufox",
-      "command": ["npx", "-y", "mcp-camoufox@latest"]
-    }
-  ]
-}
-```
-
-> Note: Trae uses an **array** format for `mcpServers`, not an object.
-</details>
-
-<details>
-<summary><b>Antigravity (Google)</b></summary>
-
-**Global** — `~/.gemini/antigravity/mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "camoufox": {
-      "command": "npx",
-      "args": ["-y", "mcp-camoufox@latest"]
-    }
-  }
-}
-```
-
-Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw config.
-
-> Antigravity is global only — no project-level MCP config.
-</details>
-
-### Windows
-
-Fully supported — same one-liner, no extra steps:
+One command for Claude Code:
 
 ```bash
 claude mcp add camoufox -- npx -y mcp-camoufox@latest
 ```
 
-- **Node.js 18+ is the only prerequisite.** There is no standalone `.exe`; the server is a Node package, so it runs wherever Node runs.
-- The Camoufox browser binary downloads automatically on first launch into `%LOCALAPPDATA%\camoufox`.
-- Profile, screenshots and sessions live under `%USERPROFILE%\.camoufox-mcp\`.
-- Paths you pass to `save_pdf`, `export_har`, `storage_state_save` and `cookie_export_file` may use either `C:\path\file.json` or `C:/path/file.json`.
+Every other client takes the same server block — only the config file differs:
+
+```json
+{
+  "mcpServers": {
+    "camoufox": {
+      "command": "npx",
+      "args": ["-y", "mcp-camoufox@latest"]
+    }
+  }
+}
+```
+
+| Client | Config file |
+| --- | --- |
+| Claude Code | `claude mcp add camoufox --scope user -- npx -y mcp-camoufox@latest` (drop `--scope user` for project-only) |
+| Claude Desktop | macOS `~/Library/Application Support/Claude/claude_desktop_config.json` · Windows `%APPDATA%\Claude\claude_desktop_config.json` · Linux `~/.config/Claude/claude_desktop_config.json` |
+| Cursor | `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project) |
+| Windsurf | `~/.windsurf/mcp.json` or `.windsurf/mcp.json` — uses `"servers"` instead of `"mcpServers"` |
+| VS Code (Continue / Cline / Kilo) | `~/.continue/config.json` or `.vscode/mcp.json` |
+| Factory (Droid) | `~/.factory/mcp.json` or `.factory/mcp.json`, with `"type": "stdio"` — or `droid mcp add camoufox "npx -y mcp-camoufox@latest"` |
+| Antigravity | `~/.gemini/antigravity/mcp_config.json` (global only) |
+
+Two clients need a different shape:
+
+```jsonc
+// OpenCode — ~/.config/opencode/opencode.json ("local", not "stdio"; command is one array)
+{ "mcp": { "camoufox": { "type": "local", "command": ["npx", "-y", "mcp-camoufox@latest"], "enabled": true } } }
+
+// Trae — ~/.trae/mcp.json (mcpServers is an ARRAY)
+{ "mcpServers": [ { "name": "camoufox", "command": ["npx", "-y", "mcp-camoufox@latest"] } ] }
+```
 
 ### Requirements
 
+**Node.js 18+ is the only prerequisite** (`node --version`). The Camoufox browser binary (~80 MB)
+downloads itself on first launch — nothing else to install.
+
+On **Windows** the same one-liner works; there is no standalone `.exe` because this is a Node package.
+The browser lands in `%LOCALAPPDATA%\camoufox`, profile/screenshots/sessions in
+`%USERPROFILE%\.camoufox-mcp\`, and output paths accept either `C:\path\file.json` or `C:/path/file.json`.
 
 | Requirement | Version | Check            |
 | ----------- | ------- | ---------------- |
@@ -281,7 +130,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 127 Tools
+## All 128 Tools
 
 ### Browser Lifecycle (4)
 
@@ -587,11 +436,11 @@ That's all. Camoufox browser binary (~80MB) downloads automatically on first lau
 | `scrape_page`            | Smart scraper: auto-extract main content (strips nav/footer), links, meta, headings. Smart truncation at paragraph boundary.     |
 
 
-### Browserless HTTP (4)
+### Browserless HTTP (5)
 
 The browser is the expensive path. `impit` (already shipped with camoufox-js) speaks a real **Firefox** TLS/HTTP2 fingerprint, so these tools fetch without launching anything — and the fingerprint matches the browser this server actually drives. Verified against a Cloudflare-protected site that these tools cleared **without opening a browser at all**.
 
-> No `web_search`/`deep_research` here by design: scraping a SERP without an API key returns confidently wrong results for whole classes of query (Bing answers any "how does …" question with dictionary pages) and one major engine is TLS-blocked by some ISPs. A search tool that fails silently is worse than none — use your client's own search (WebSearch/Exa/Tavily) and feed the URLs to `scrape_markdown`.
+> No SERP scraping here by design: scraping a search page without an API returns confidently wrong results for whole classes of query (Bing answers any "how does …" question with dictionary pages) and one major engine is TLS-blocked by some ISPs. `search` exists instead — it talks to a real search API you control, which has no such failure mode. Feed its URLs to `scrape_markdown` to read the sources.
 
 
 | Tool                   | Description                                                                                                                                                |
@@ -600,6 +449,7 @@ The browser is the expensive path. `impit` (already shipped with camoufox-js) sp
 | `http_session_cookies` | Show which browser cookies would be sent to a URL (verify session sharing before relying on it)                                                            |
 | `scrape_markdown`      | One URL → clean LLM-ready markdown (headings/links/lists kept, nav/footer/scripts stripped). Browserless by default, `use_browser=true` for JS-heavy pages |
 | `smart_fetch`          | Tries HTTP first, escalates to the stealth browser **only** when the response looks anti-bot blocked. The efficiency core                                  |
+| `search` | Search through an API **you** control — self-hosted SearXNG, or Brave/Tavily/Exa with a key — returning a normalised title/url/snippet list. Set `MCP_SEARCH_ENDPOINT` once. Never scrapes a result page. |
 
 
 ### Storage Inspection (4)
@@ -636,116 +486,57 @@ The browser is the expensive path. `impit` (already shipped with camoufox-js) sp
 
 ## Examples
 
-### Login to a website
+**Read a page without launching anything.** The browser costs seconds and ~400 MB; most fetches don't
+need a DOM. `smart_fetch` only starts one if the response looks anti-bot blocked.
 
 ```
-browser_launch(url="https://accounts.google.com", headless=false)
-browser_snapshot()                              # see email input
-fill(ref="e1", value="user@gmail.com")          # fill email
-click(ref="e4")                                 # click Next
-wait_for(selector='input[type="password"]')     # wait for password page
-browser_snapshot()
-fill(ref="e2", value="mypassword")              # fill password
-click(ref="e4")                                 # click Next
+scrape_markdown(url="https://example.com/docs")     # clean markdown, no browser
+smart_fetch(url="https://shop.example.com/item/42") # escalates only if blocked
+http_request(url="https://api.example.com/v1/me")   # reuses the browser's cookies
 ```
 
-### Fill a form in one call
+**Log in, then hit the API cheaply.** Log in once with the browser, then stay browserless.
 
 ```
-fill_form(
-  fields=[
-    {ref: "e3", value: "John Doe"},
-    {ref: "e5", value: "john@example.com"},
-    {ref: "e7", value: "Hello world"}
-  ],
-  submit_ref="e10"
-)
+browser_launch(url="https://app.example.com/login")
+smart_fill(fields_json='{"Email":"me@x.com","Password":"secret"}', submit_label="Sign in")
+wait_for_change()                                   # returns when the page really reacts
+http_request(url="https://app.example.com/api/orders")   # same session, no browser work
 ```
 
-### Batch multiple actions
+**Fill a form without a snapshot.** `smart_fill` matches by label; `form_introspect` tells you what a
+form wants and why it is rejecting a submit.
 
 ```
-batch_actions(actions=[
-  {type: "click", ref: "e5"},
-  {type: "wait", timeout: 1000},
-  {type: "fill", ref: "e8", value: "search query"},
-  {type: "press", key: "Enter"}
+form_introspect()                                   # labels, types, required, validation state
+smart_fill(fields_json='{"Customer name":"Rina","E-mail address":"rina@x.com"}')
+```
+
+**Find out why a click did nothing** — before spending the click.
+
+```
+assert_clickable(selector="#submit")
+# FAIL: covered by div.overlay — that element would receive the click
+```
+
+**Run a whole sequence in one call.** Resumable: a failure tells you the index to restart from.
+
+```
+workflow_run(steps=[
+  {tool: "navigate", args: {url: "https://example.com"}},
+  {tool: "smart_fill", args: {fields_json: '{"Search":"camoufox"}'}},
+  {tool: "click_text", args: {text: "Search", within: "@dialog"}},
+  {tool: "wait_for_change", args: {}}
 ])
 ```
 
-### Search Google
+**Search through an engine you control** (self-hosted SearXNG, or Brave/Tavily/Exa with a key).
 
 ```
-browser_launch(url="https://google.com")
-browser_snapshot()
-click(ref="e5")                               # search box
-type_text(text="mcp-camoufox npm")
-press_key(key="Enter")
+search(query="firefox tls fingerprint", endpoint="http://127.0.0.1:8899")
+scrape_markdown(url="<a url from the results>")
 ```
 
-### Multi-tab research
-
-```
-browser_launch(url="https://github.com")
-tab_new(url="https://stackoverflow.com")
-tab_list()
-tab_select(index=0)
-```
-
-### Wait for API response
-
-```
-click(ref="e10")
-wait_for_response(url_pattern="/api/data")
-browser_snapshot()
-```
-
-### Inspect elements
-
-```
-inspect_element(ref="e5")
-get_links(filter="github.com")
-query_selector_all(selector=".product-card")
-```
-
-### Work with iframes
-
-```
-list_frames()
-frame_evaluate(frame_index=1, expression="document.title")
-```
-
-### Scrape job listings (structured)
-
-```
-browser_launch(url="https://glints.com/id/opportunities/jobs/explore")
-detect_content_pattern()                      # auto-suggest selectors
-extract_structured(
-  container_selector=".job-card",             # from detect_content_pattern
-  fields=[
-    {name: "title", selector: "h3"},
-    {name: "company", selector: ".company-name"},
-    {name: "location", selector: ".location"},
-    {name: "url", selector: "a", attribute: "href"}
-  ]
-)
-```
-
-### Scrape page content (smart)
-
-```
-scrape_page(only_main_content=true, max_text_length=8000)
-# Returns: title, url, meta, text (truncated at paragraph boundary),
-#          links, headings, truncated flag, total_text_length
-```
-
-### Manage storage
-
-```
-localstorage_get()
-localstorage_set(key="token", value="abc123")
-cookie_list(domain="example.com")
-```
 
 ## How It Works
 

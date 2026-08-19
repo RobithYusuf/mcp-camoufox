@@ -225,6 +225,90 @@ regTool("http_session_cookies",
     return { content: [{ type: "text", text: `${cookies.length} cookie(s) for ${url}:\n${lines.join("\n")}` }] };
   });
 
+regTool("search",
+  "Search the web through a search API YOU control — a self-hosted SearXNG, or Brave/Tavily/Exa with a key — and get back a normalised title/url/snippet list. " +
+  "This never scrapes a SERP: that shipped in 0.9.0 and was removed in 0.9.2 because engines answer some queries with confidently wrong results. " +
+  "A real API contract does not have that failure mode. Set MCP_SEARCH_ENDPOINT (and MCP_SEARCH_API_KEY when the provider needs one) to avoid passing them every call.",
+  {
+    query: z.string(),
+    endpoint: z.string().default("").describe("Search API base or full URL, e.g. http://127.0.0.1:8899 for a self-hosted SearXNG. Defaults to $MCP_SEARCH_ENDPOINT."),
+    provider: z.enum(["auto", "searxng", "brave", "tavily", "exa"]).default("auto").describe("auto infers from the endpoint host and falls back to searxng."),
+    count: z.number().default(8),
+    api_key: z.string().default("").describe("Defaults to $MCP_SEARCH_API_KEY. A self-hosted SearXNG needs none."),
+    extra_params: z.string().default("").describe('Extra query params as JSON, e.g. {"engines":"google,brave","language":"en"} (SearXNG).'),
+    timeout_ms: z.number().default(20000),
+  },
+  async ({ query, endpoint, provider, count, api_key, extra_params, timeout_ms }) => {
+    const base = (endpoint || process.env.MCP_SEARCH_ENDPOINT || "").replace(/\/+$/, "");
+    if (!base) {
+      return { content: [{ type: "text", text: "No search endpoint. Pass endpoint=… or set MCP_SEARCH_ENDPOINT. Examples: http://127.0.0.1:8899 (self-hosted SearXNG), https://api.search.brave.com, https://api.tavily.com, https://api.exa.ai." }], isError: true };
+    }
+    const key = api_key || process.env.MCP_SEARCH_API_KEY || "";
+    let kind = provider;
+    if (kind === "auto") {
+      if (/api\.search\.brave\.com/i.test(base)) kind = "brave";
+      else if (/api\.tavily\.com/i.test(base)) kind = "tavily";
+      else if (/api\.exa\.ai/i.test(base)) kind = "exa";
+      else kind = "searxng";
+    }
+    let extra: Record<string, string> = {};
+    if (extra_params) {
+      try { extra = JSON.parse(extra_params); }
+      catch (e: any) { return { content: [{ type: "text", text: `Invalid extra_params: ${e?.message || e}` }], isError: true }; }
+    }
+    if ((kind === "brave" || kind === "tavily" || kind === "exa") && !key) {
+      return { content: [{ type: "text", text: `provider=${kind} needs an API key — pass api_key or set MCP_SEARCH_API_KEY.` }], isError: true };
+    }
+
+    let req: { url: string; method?: string; headers?: Record<string, string>; body?: string };
+    if (kind === "searxng") {
+      const qs = new URLSearchParams({ q: query, format: "json", ...extra });
+      req = { url: `${base}${/\/search$/.test(base) ? "" : "/search"}?${qs}` };
+    } else if (kind === "brave") {
+      const qs = new URLSearchParams({ q: query, count: String(count), ...extra });
+      req = { url: `${base}/res/v1/web/search?${qs}`, headers: { Accept: "application/json", "X-Subscription-Token": key } };
+    } else if (kind === "tavily") {
+      req = { url: `${base}/search`, method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ api_key: key, query, max_results: count, ...extra }) };
+    } else {
+      req = { url: `${base}/search`, method: "POST", headers: { "Content-Type": "application/json", "x-api-key": key },
+              body: JSON.stringify({ query, numResults: count, contents: { text: false }, ...extra }) };
+    }
+
+    const r = await impitFetch({ ...req, useBrowserCookies: false, timeoutMs: timeout_ms });
+    if (r.error) return { content: [{ type: "text", text: `Search request failed: ${r.error}` }], isError: true };
+    if (r.status !== 200) {
+      return { content: [{ type: "text", text: `Search endpoint returned ${r.status}.\n${r.text.slice(0, 300)}` }], isError: true };
+    }
+    // A SearXNG that hasn't enabled the json format answers with its HTML UI.
+    if (/^\s*<(!doctype|html)/i.test(r.text)) {
+      return { content: [{ type: "text", text: kind === "searxng"
+        ? `That endpoint returned HTML, not JSON. A SearXNG instance only serves format=json when its settings.yml has:\n\n  search:\n    formats:\n      - html\n      - json\n\nMost PUBLIC instances leave json off, so this normally means you need your own instance.`
+        : `Expected JSON, got HTML from ${r.url}.` }], isError: true };
+    }
+    let data: any;
+    try { data = JSON.parse(r.text); }
+    catch (e: any) { return { content: [{ type: "text", text: `Endpoint did not return JSON: ${e?.message || e}\n${r.text.slice(0, 200)}` }], isError: true }; }
+
+    let hits: { title: string; url: string; snippet: string; source: string }[] = [];
+    const clean = (v: any) => String(v ?? "").replace(/\s+/g, " ").trim();
+    if (kind === "searxng") {
+      hits = (data.results || []).map((x: any) => ({ title: clean(x.title), url: clean(x.url), snippet: clean(x.content).slice(0, 280), source: clean(x.engine) }));
+    } else if (kind === "brave") {
+      hits = ((data.web && data.web.results) || []).map((x: any) => ({ title: clean(x.title), url: clean(x.url), snippet: clean(x.description).slice(0, 280), source: "brave" }));
+    } else if (kind === "tavily") {
+      hits = (data.results || []).map((x: any) => ({ title: clean(x.title), url: clean(x.url), snippet: clean(x.content).slice(0, 280), source: "tavily" }));
+    } else {
+      hits = (data.results || []).map((x: any) => ({ title: clean(x.title), url: clean(x.url), snippet: clean(x.text || x.summary).slice(0, 280), source: "exa" }));
+    }
+    hits = hits.filter(h => /^https?:\/\//i.test(h.url)).slice(0, Math.max(1, count));
+    if (!hits.length) {
+      return { content: [{ type: "text", text: `No results for "${query}" from ${kind} at ${base}. The endpoint answered with valid JSON but an empty result set.` }] };
+    }
+    const lines = hits.map((h, i) => `${i + 1}. ${h.title || "(untitled)"}\n   ${h.url}${h.snippet ? `\n   ${h.snippet}` : ""}${h.source ? `   [${h.source}]` : ""}`);
+    return { content: [{ type: "text", text: `${hits.length} result(s) for "${query}" via ${kind} (${base}):\n\n${lines.join("\n\n")}` }] };
+  });
+
 regTool("scrape_markdown",
   "Fetch a URL and return clean, LLM-ready markdown (headings, links, lists preserved; nav/footer/scripts stripped). " +
   "Default path is browserless (impit) — fast and cheap. Set use_browser=true for JS-rendered pages (needs browser_launch).",

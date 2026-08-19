@@ -42,6 +42,17 @@ export default async function run() {
     "/echo": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify({ method: q.method, headers: q.headers })); },
     "/slow": (q, r) => { setTimeout(() => { slowDone = true; r.writeHead(200); r.end("late"); }, 3000); },
     "/target": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<title>Target</title><h1>Target Page</h1>"); },
+    // a self-hosted SearXNG with `formats: [html, json]` enabled
+    "/search": (q, r) => {
+      const u = new URL(q.url, "http://x");
+      if (u.searchParams.get("format") !== "json") { r.writeHead(200, { "content-type": "text/html" }); return r.end("<!doctype html><html>SearXNG UI</html>"); }
+      r.writeHead(200, { "content-type": "application/json" });
+      r.end(JSON.stringify({ query: u.searchParams.get("q"), results: [
+        { title: "First hit", url: "https://example.com/a", content: "Snippet A", engine: "brave" },
+        { title: "Second hit", url: "https://example.com/b", content: "Snippet B", engine: "google" },
+        { title: "relative — dropped", url: "/not-absolute", content: "", engine: "x" },
+      ] }));
+    },
     "/maybe": (q, r) => {
       // first hit looks like a CF challenge, later hits are real: exercises escalation
       if (++maybeHits === 1) { r.writeHead(403, { "content-type": "text/html" }); return r.end("<title>Just a moment...</title>Checking your browser before accessing"); }
@@ -106,6 +117,32 @@ export default async function run() {
     maybeHits = 0;
     const t = await c("smart_fetch", { url: `${fx.url}/maybe` });
     return [t.includes("path: browser (escalated") && t.includes("Escalated OK"), t.split("\n")[0]];
+  });
+
+  await check("search normalises a SearXNG JSON response", async () => {
+    const t = await c("search", { query: "hello", endpoint: fx.url, count: 5 });
+    return [t.includes("2 result(s)") && t.includes("First hit") && t.includes("https://example.com/a")
+      && t.includes("[brave]") && !t.includes("/not-absolute"), t.split("\n")[0]];
+  });
+  await check("search respects count", async () => {
+    const t = await c("search", { query: "hello", endpoint: fx.url, count: 1 });
+    return [t.includes("1 result(s)") && !t.includes("Second hit"), t.split("\n")[0]];
+  });
+  await check("search explains an HTML-only endpoint", async () => {
+    const t = await c("search", { query: "hello", endpoint: `${fx.url}/search?format=html`, provider: "searxng" });
+    return [t.startsWith("IS_ERROR") && t.includes("formats:") && t.includes("json"), "tells you the settings.yml fix"];
+  });
+  await check("search needs an endpoint", async () => {
+    const t = await c("search", { query: "hello" });
+    return [t.startsWith("IS_ERROR") && t.includes("MCP_SEARCH_ENDPOINT"), t.slice(0, 60)];
+  });
+  await check("search refuses a keyless paid provider", async () => {
+    const t = await c("search", { query: "hello", endpoint: "https://api.tavily.com" });
+    return [t.startsWith("IS_ERROR") && t.includes("needs an API key"), t.slice(0, 60)];
+  });
+  await check("search rejects bad extra_params", async () => {
+    const t = await c("search", { query: "hello", endpoint: fx.url, extra_params: "{nope" });
+    return [t.startsWith("IS_ERROR") && t.includes("Invalid extra_params"), t.slice(0, 50)];
   });
 
   // ── ergonomics ──

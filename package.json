@@ -1,7 +1,7 @@
 {
   "name": "mcp-camoufox",
-  "version": "0.9.8",
-  "description": "MCP server for stealth browser automation via Camoufox — 104 tools, Chrome DevTools MCP-level power with anti-bot stealth",
+  "version": "0.9.10",
+  "description": "MCP server for stealth browser automation via Camoufox — 128 tools, plus a browserless TLS-impersonating HTTP path",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

@@ -7,7 +7,7 @@ defaults; hard constraints may only be overridden when the developer explicitly 
 
 ## Product and repository map
 
-An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 127 tools over Camoufox, a
+An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 128 tools over Camoufox, a
 Firefox build with C++-level anti-fingerprinting. Published on npm as `mcp-camoufox`.
 
 ```
@@ -108,8 +108,10 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
 - `htmlToMarkdown` is regex-based on purpose — no jsdom or turndown dependency.
 - No SERP scraping. `web_search`/`deep_research` shipped in 0.9.0 and were removed in 0.9.2: Bing
   answers any "how does …" query with dictionary pages for the word "does", DuckDuckGo is
-  TLS-intercepted on some ISPs, and every alternative needs its own fragile parser. Do not re-add
-  without a real API key behind it.
+  TLS-intercepted on some ISPs, and every alternative needs its own fragile parser. `search` is the
+  sanctioned replacement — it requires an endpoint the user controls (self-hosted SearXNG, or
+  Brave/Tavily/Exa with a key) and parses a documented JSON contract, never a result page. A new
+  provider is welcome there; a new HTML scraper is not.
 
 ## Firefox and Camoufox facts
 
