@@ -258,6 +258,19 @@ Or via UI: Agent Panel > `...` > MCP Servers > Manage MCP Servers > View raw con
 > Antigravity is global only — no project-level MCP config.
 </details>
 
+### Windows
+
+Fully supported — same one-liner, no extra steps:
+
+```bash
+claude mcp add camoufox -- npx -y mcp-camoufox@latest
+```
+
+- **Node.js 18+ is the only prerequisite.** There is no standalone `.exe`; the server is a Node package, so it runs wherever Node runs.
+- The Camoufox browser binary downloads automatically on first launch into `%LOCALAPPDATA%\camoufox`.
+- Profile, screenshots and sessions live under `%USERPROFILE%\.camoufox-mcp\`.
+- Paths you pass to `save_pdf`, `export_har`, `storage_state_save` and `cookie_export_file` may use either `C:\path\file.json` or `C:/path/file.json`.
+
 ### Requirements
 
 

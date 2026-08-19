@@ -19,9 +19,9 @@ import type { BrowserContext, Page, Dialog } from "playwright-core";
 // ── Global State ───────────────────────────────────────────────────────────
 
 const HOME_DIR = process.env.HOME || process.env.USERPROFILE || "";
-const PROFILE_DIR = `${HOME_DIR}/.camoufox-mcp/profile`;
-const PROFILE_PARENT = `${HOME_DIR}/.camoufox-mcp`;
-const SCREENSHOT_DIR = `${HOME_DIR}/.camoufox-mcp/screenshots`;
+const PROFILE_PARENT = join(HOME_DIR, ".camoufox-mcp");
+const PROFILE_DIR = join(PROFILE_PARENT, "profile");
+const SCREENSHOT_DIR = join(PROFILE_PARENT, "screenshots");
 
 let browserContext: BrowserContext | null = null;
 let pages: Page[] = [];
@@ -47,7 +47,7 @@ function getPage(): Page {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
 import { createHmac } from "crypto";
 import { createRequire } from "module";
 
@@ -104,8 +104,12 @@ function expandHome(p: string): string {
 // Expand ~, create the parent directory, return the absolute target path.
 function resolveOutPath(p: string): string {
   const target = expandHome(p);
-  const dir = target.substring(0, target.lastIndexOf("/"));
-  if (dir) mkdirSync(dir, { recursive: true });
+  // dirname(), not a manual lastIndexOf("/") — on Windows a path like
+  // C:\Users\bob\out\state.json has no forward slash at all, so the old
+  // version computed an empty directory, skipped mkdir, and the write failed
+  // whenever the folder didn't already exist (issue #5).
+  const dir = dirname(target);
+  if (dir && dir !== "." && dir !== target) mkdirSync(dir, { recursive: true });
   return target;
 }
 
@@ -554,7 +558,7 @@ regTool(
     if (fresh_profile) {
       const ts = Date.now();
       const rand = Math.random().toString(36).slice(2, 8);
-      profileDir = `${PROFILE_PARENT}/profile-fresh-${ts}-${rand}`;
+      profileDir = join(PROFILE_PARENT, `profile-fresh-${ts}-${rand}`);
       mkdirSync(profileDir, { recursive: true });
       isTemp = true;
     }
@@ -2861,10 +2865,10 @@ regTool("auth_capture", "Save current session as named auth state (e.g. logged-i
     for (var j = 0; j < sessionStorage.length; j++) { var k = sessionStorage.key(j); data.session[k] = sessionStorage.getItem(k); }
     return { url: location.href, origin: location.origin, ...data };
   })()`);
-  const dir = `${PROFILE_PARENT}/sessions`;
+  const dir = join(PROFILE_PARENT, "sessions");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { chmodSync(dir, 0o700); } catch {}
-  const target = `${dir}/${safeName(name, "session")}.json`;
+  const target = join(dir, `${safeName(name, "session")}.json`);
   writeSecretFile(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
   return { content: [{ type: "text", text: `auth_capture saved: ${target}` }] };
 });
