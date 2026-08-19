@@ -36,6 +36,14 @@ export default async function run() {
   fx = await fixtureServer({
     "/frame": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<title>F</title><div id='fd'>frame-data</div>"); },
     "/second": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<title>Second</title><h1>Second Page</h1>"); },
+    // A strict CSP, because every fixture here used to allow eval and so never
+    // represented a real site. waitReady polled with page.waitForFunction, whose
+    // predicate runs through eval() — 94 checks passed while navigation was in
+    // fact broken on news.ycombinator.com, github.com and MDN.
+    "/csp": (q, r) => {
+      r.writeHead(200, { "content-type": "text/html", "content-security-policy": "default-src 'self'; script-src 'self'" });
+      r.end("<title>CSP</title><h1 id='c'>CSP Page</h1>");
+    },
     "/api.json": (q, r) => { r.writeHead(200, { "content-type": "application/json" }); r.end('{"msg":"hello-api"}'); },
     "*": (q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end(PAGE); },
   }, PORT);
@@ -222,6 +230,12 @@ export default async function run() {
     return [a.includes("Switched") && b.includes("Closed tab"), `select→ ${a.slice(0, 60)} | close→ ${b.slice(0, 60)}`];
   });
 
+  await check("navigate works on a page with a strict CSP", async () => {
+    const t = await c("navigate", { url: `${fx.url}/csp` });
+    const h = await c("evaluate", { expression: "document.getElementById('c') ? document.getElementById('c').textContent : 'NO DOM'" });
+    await c("navigate", { url: fx.url });
+    return [!t.startsWith("IS_ERROR") && h === "CSP Page", `${t.split("\n")[0].slice(0, 44)} | ${h}`];
+  });
   await check("navigate still works past the 5th tab", async () => {
     // Camoufox stops delivering load/domcontentloaded to Juggler after the fifth
     // page in a context: measured 4 successes then 8 straight 30s timeouts. Every
@@ -231,12 +245,15 @@ export default async function run() {
     const opened = [];
     for (const q of tags) {
       const r = await c("tab_new", { url: `${fx.url}/second?${q}` });
-      opened.push(r.startsWith("IS_ERROR") ? `${q}:TIMEOUT` : q);
+      // Distinct marker: the previous one was the word TIMEOUT, and swapping in the
+      // real error text made the filter below stop matching — the check then passed
+      // while a tab_new had in fact failed.
+      opened.push(r.startsWith("IS_ERROR") ? `${q}:FAILED[${r.replace(/\s+/g, " ").slice(10, 80)}]` : q);
     }
     const nav = await c("navigate", { url: fx.url });
     const here = await c("evaluate", { expression: "location.pathname" });
     for (const q of tags) { try { await c("tab_close", { url_contains: `?${q}` }); } catch {} }
-    const bad = opened.filter(o => o.includes("TIMEOUT"));
+    const bad = opened.filter(o => o.includes(":FAILED["));
     return [!bad.length && here === "/" && !nav.startsWith("IS_ERROR"), `opened=${opened.join(",")} navigate→${here}`];
   });
   await check("tab_new keeps the tab reachable when the URL fails", async () => {

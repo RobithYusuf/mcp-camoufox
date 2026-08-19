@@ -187,6 +187,9 @@ npm run smoke:install    # install the PUBLISHED package and drive a real browse
 ```
 
 - Use evidence proportional to the risk, but a change to a shared helper means the whole suite.
+- A local fixture is not a real site. The suites passed 94/94 while navigation was broken on every
+  page with a strict `script-src`, because `page.waitForFunction` polls through `eval()` and no fixture
+  sent a CSP header. There is a `/csp` route now — drive one real site before believing a green run.
 - After editing `src/`, run `npx tsc` and reconnect the MCP client — a local registration points at
   `dist/index.js`, so an unbuilt change means you are testing the old build.
 - Before a refactor, snapshot the tool surface and diff it afterwards. On its first real use this

@@ -283,11 +283,22 @@ export type WaitUntil = "domcontentloaded" | "load" | "networkidle";
  *  wait_for_network_idle rather than the equally-dead lifecycle event. */
 export async function waitReady(page: Page, waitUntil: WaitUntil, timeout: number): Promise<void> {
   const deadline = Date.now() + timeout;
-  // "load" wants a fully loaded document; the other two only need it parsed.
-  const cond = waitUntil === "load"
-    ? `(() => { return document.readyState === "complete"; })()`
-    : `(() => { var s = document.readyState; return s === "interactive" || s === "complete"; })()`;
-  await page.waitForFunction(cond, null, { timeout: Math.max(1000, deadline - Date.now()) });
+  // Poll by hand rather than with page.waitForFunction: Playwright's polling
+  // predicate runs through eval(), which a site with a strict script-src CSP
+  // blocks outright ("call to eval() blocked by CSP" on the very first real site
+  // this was tried on). page.evaluate of a plain expression is not affected.
+  const want = waitUntil === "load" ? ["complete"] : ["interactive", "complete"];
+  let state = "";
+  for (;;) {
+    // Mid-navigation the execution context is torn down; that is not a failure,
+    // it just means the answer is not available yet.
+    try { state = String(await page.evaluate(`document.readyState`)); } catch { state = ""; }
+    if (want.indexOf(state) >= 0) break;
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out after ${timeout}ms waiting for the document to reach "${want[0]}" (last readyState: ${state || "unavailable"}). The page may still be loading — retry, or pass a larger timeout.`);
+    }
+    await page.waitForTimeout(50);
+  }
   if (waitUntil !== "networkidle") return;
   // Same rule as wait_for_network_idle: quiet for 500ms continuously.
   let quietSince = inflightOf(page) === 0 ? Date.now() : 0;
