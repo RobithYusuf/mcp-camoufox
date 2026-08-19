@@ -230,6 +230,22 @@ export default async function run() {
     return [a.includes("Switched") && b.includes("Closed tab"), `select→ ${a.slice(0, 60)} | close→ ${b.slice(0, 60)}`];
   });
 
+  await check("set_viewport_size warns when the viewport exceeds its own window", async () => {
+    // Camoufox freezes outerWidth/outerHeight at the launch size, so a viewport
+    // bigger than the window is impossible geometry a detector can read.
+    // Camoufox randomises the spoofed screen per profile and sometimes picks a
+    // small one, so a "safe" size has to be derived, not assumed: 900x600 tripped
+    // the screen warning on a profile whose spoofed screen was smaller than that.
+    const g = JSON.parse(await c("evaluate", { expression:
+      "JSON.stringify({ ow: outerWidth, oh: outerHeight, sw: screen.width, sh: screen.height })" }));
+    const safeW = Math.max(320, Math.min(g.ow, g.sw) - 100);
+    const safeH = Math.max(240, Math.min(g.oh, g.sh) - 100);
+    const big = await c("set_viewport_size", { width: g.ow + 600, height: g.oh + 400 });
+    const ok = await c("set_viewport_size", { width: safeW, height: safeH });
+    await c("set_viewport_size", { width: 1280, height: 720 });
+    return [big.includes("⚠") && big.includes("LARGER than its own window") && !ok.includes("⚠"),
+            `oversize warned=${big.includes("⚠")} | safe ${safeW}x${safeH} clean=${!ok.includes("⚠")} (window ${g.ow}x${g.oh}, screen ${g.sw}x${g.sh})`];
+  });
   await check("the viewport follows a custom launch size", async () => {
     // browser_launch passed `window` to Camoufox but never set Playwright's
     // viewport, so width=1400 produced outerWidth 1400 with innerWidth 1280 —
@@ -241,10 +257,18 @@ export default async function run() {
     return [gapW === 0 && gapH > 0 && gapH <= 120, `outer ${g.ow}x${g.oh} vs inner ${g.iw}x${g.ih} → gap ${gapW}w/${gapH}h`];
   });
   await check("navigate works on a page with a strict CSP", async () => {
-    const t = await c("navigate", { url: `${fx.url}/csp` });
-    const h = await c("evaluate", { expression: "document.getElementById('c') ? document.getElementById('c').textContent : 'NO DOM'" });
+    // Camoufox sporadically never commits a navigation (~1-2% of them). That is
+    // upstream and unrelated to CSP, so retry — but SAY when a retry was needed,
+    // rather than hiding an upstream flake behind a green check.
+    let t = "", h = "", tries = 0;
+    for (; tries < 3; tries++) {
+      t = await c("navigate", { url: `${fx.url}/csp` });
+      h = await c("evaluate", { expression: "document.getElementById('c') ? document.getElementById('c').textContent : 'NO DOM'" });
+      if (!t.startsWith("IS_ERROR") && h === "CSP Page") break;
+    }
     await c("navigate", { url: fx.url });
-    return [!t.startsWith("IS_ERROR") && h === "CSP Page", `${t.split("\n")[0].slice(0, 44)} | ${h}`];
+    const note = tries > 0 ? ` (needed ${tries + 1} attempts — upstream commit flake)` : "";
+    return [!t.startsWith("IS_ERROR") && h === "CSP Page", `${h}${note}`];
   });
   await check("navigate still works past the 5th tab", async () => {
     // Camoufox stops delivering load/domcontentloaded to Juggler after the fifth

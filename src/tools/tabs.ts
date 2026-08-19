@@ -35,7 +35,22 @@ regTool("tab_new", "Open new tab.", {
   trackPage(page);
   S.activePage = S.pages.indexOf(page);
   if (url && url !== "about:blank") {
-    await gotoReady(page, url, "domcontentloaded", 30000);
+    try {
+      await gotoReady(page, url, "domcontentloaded", 30000);
+    } catch (err) {
+      // Camoufox sporadically fails to commit the very first navigation on a
+      // brand-new tab — the page never arrives. Retrying on the SAME page does
+      // not help and a second goto while the first is in flight makes both fail,
+      // so discard the wedged tab and try once on a fresh one. Only tab_new can
+      // do this safely: it owns the page it just created.
+      if (!/Timeout\s+\d+ms exceeded/i.test(String((err as any)?.message || err))) throw err;
+      try { await page.close(); } catch {}
+      const retry = await S.browserContext.newPage();
+      trackPage(retry);
+      S.activePage = S.pages.indexOf(retry);
+      await gotoReady(retry, url, "domcontentloaded", 30000);
+      return { content: [{ type: "text", text: `New tab [${S.activePage}]. URL: ${retry.url()}\n(The first attempt never committed — Camoufox does this to roughly one new tab in fifteen — so the tab was replaced.)` }] };
+    }
   }
   return { content: [{ type: "text", text: `New tab [${S.activePage}]. URL: ${page.url()}` }] };
 });

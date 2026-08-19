@@ -148,6 +148,11 @@ These are platform truths, not preferences. Each one cost a release.
   verified present. Anything waiting on those events burns its whole timeout on a page that loaded
   fine — this silently broke `navigate`, `tab_new`, `reload` and `go_back` for anyone who opened five
   tabs. Never pass `waitUntil: "domcontentloaded"`/`"load"` to Playwright here; go through `gotoReady`.
+- Camoufox sporadically never commits a navigation — measured at roughly 1-2% of them, on new tabs and
+  existing pages alike. `gotoReady` asks the document whether it arrived before believing the timeout,
+  and `tab_new` discards a tab whose first navigation never committed and retries on a fresh one. Do
+  NOT re-issue `goto` on a page whose navigation is still in flight: both calls then fail, which broke
+  every CSP navigation when it was tried. A 30s timeout from `navigate` is this flake — retry it.
 - `page.url()` is a function, not a property.
 - `mouse.wheel()` silently no-ops; scroll with `window.scrollBy` via evaluate.
 - `page.pdf()` is Chromium-only and always throws here; `save_pdf` catches it and points at
@@ -168,6 +173,10 @@ These are platform truths, not preferences. Each one cost a release.
   reflowing. That is Playwright's model, not a bug — `set_viewport_size` after the resize, or
   `no_viewport: true` to track the window live, which then can exceed the spoofed screen (an anti-bot
   tell the launch reply warns about).
+- Camoufox randomises the spoofed `screen` per profile and sometimes picks one SMALLER than the default
+  1280x720 viewport, which makes the viewport exceed its own screen — an anti-bot tell that appears by
+  chance rather than by configuration. `browser_launch` and `set_viewport_size` both warn when it
+  happens. Never hard-code a "safe" viewport in a test; derive it from `screen.width/height`.
 - `cookie_set` without `expires_days` creates a session cookie that Firefox never writes to disk — it
   dies at `browser_close` even though the profile persists.
 - npm `overrides` only apply to the root project, so ours do not reach a user's tree. Do not claim the

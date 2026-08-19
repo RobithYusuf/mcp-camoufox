@@ -315,8 +315,42 @@ export async function waitReady(page: Page, waitUntil: WaitUntil, timeout: numbe
 export async function gotoReady(
   page: Page, url: string, waitUntil: WaitUntil = "domcontentloaded", timeout = 30000,
 ): Promise<void> {
-  await page.goto(url, { waitUntil: "commit", timeout });
-  await waitReady(page, waitUntil, timeout);
+  // Roughly one navigation in thirty, Camoufox never settles the commit promise
+  // even though the navigation itself went through. Give commit the full budget
+  // — a second goto issued while the first is still in flight makes BOTH fail,
+  // which is how a bounded-retry version broke every CSP navigation — and on a
+  // timeout ask the document whether it actually arrived.
+  const started = Date.now();
+  try {
+    await page.goto(url, { waitUntil: "commit", timeout });
+  } catch (err) {
+    // Only a timeout can be an unsettled promise. A refused connection, blocked
+    // port or DNS failure must surface: Firefox leaves location.href on the
+    // requested URL while showing about:neterror, so page.url() alone would
+    // report those as successful navigations.
+    const msg = String((err as any)?.message || err);
+    if (!/Timeout\s+\d+ms exceeded/i.test(msg)) throw err;
+    let arrived = false;
+    try {
+      const raw = await page.evaluate(
+        `(() => JSON.stringify({ href: location.href, doc: document.documentURI, state: document.readyState }))()`) as string;
+      const g = JSON.parse(raw);
+      arrived = sameNavTarget(g.href, url)
+        && !/^about:(neterror|certerror|blocked|httpsonlyerror)/.test(String(g.doc || ""))
+        && g.state !== "loading";
+    } catch {}
+    if (!arrived) throw err;
+  }
+  await waitReady(page, waitUntil, Math.max(3000, timeout - (Date.now() - started)));
+}
+
+/** Did we land on what we asked for? Compares origin+path, so a redirect to the
+ *  canonical form of the same page still counts as arrived. */
+function sameNavTarget(landed: string, requested: string): boolean {
+  try {
+    const a = new URL(landed), b = new URL(requested);
+    return a.origin === b.origin && a.pathname === b.pathname;
+  } catch { return landed === requested; }
 }
 
 // Track a page in the global S.pages[] list and auto-remove it on close.

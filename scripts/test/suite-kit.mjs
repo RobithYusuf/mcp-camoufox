@@ -336,8 +336,10 @@ export default async function run() {
   });
   await check("fingerprint_audit finds no contradiction in a normal launch", async () => {
     const t = await c("fingerprint_audit");
+    const flags = t.split("\n").filter(l => l.trim().startsWith("•")).map(l => l.trim());
+    const geom = t.split("\n").filter(l => /window |screen /.test(l)).map(l => l.trim().replace(/\s+/g, " ")).join(" | ");
     return [t.includes("No internal contradictions") && t.includes("user-agent") && t.includes("webgl"),
-            t.split("\n").find(l => l.includes("contradiction")) || "?"];
+            flags.length ? `${flags.join(" ")} [${geom}]` : "clean"];
   });
 
   await check("browser_recover resets a live session", async () => {

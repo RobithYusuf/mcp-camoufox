@@ -347,12 +347,31 @@ regTool("get_viewport_size", "Get current viewport dimensions.", {}, async () =>
   return { content: [{ type: "text", text: `Viewport: ${size?.width || "?"}x${size?.height || "?"}` }] };
 });
 
-regTool("set_viewport_size", "Set viewport width and height.", {
-  width: z.number(), height: z.number(),
-}, async ({ width, height }) => {
+regTool("set_viewport_size",
+  "Set the viewport width and height. This is the exact control over what the page renders and what a " +
+  "screenshot captures. It does NOT resize the OS window: Camoufox reports a frozen outerWidth/outerHeight, " +
+  "so asking for a viewport larger than the launch window makes the content bigger than its own window — " +
+  "impossible geometry that a detector can read. The reply says so when that happens.",
+  {
+    width: z.number(), height: z.number(),
+  }, async ({ width, height }) => {
   const page = getPage();
   await page.setViewportSize({ width, height });
-  return { content: [{ type: "text", text: `Viewport set to ${width}x${height}` }] };
+  // Report the resulting geometry rather than just echoing the request: the
+  // window dimensions the page sees do not move with the viewport.
+  let note = "";
+  try {
+    const g = JSON.parse(await page.evaluate(
+      `(() => JSON.stringify({ ow: outerWidth, oh: outerHeight, sw: screen.width, sh: screen.height }))()`) as string);
+    if (width > g.ow || height > g.oh) {
+      note = `\n⚠ The window still reports ${g.ow}x${g.oh}, so the viewport is now LARGER than its own window.`
+        + ` No real browser can do that — it is a fingerprint contradiction. Keep the viewport within the launch`
+        + ` size (browser_launch width/height), or relaunch at the size you need.`;
+    } else if (width > g.sw || height > g.sh) {
+      note = `\n⚠ The viewport is larger than the spoofed screen (${g.sw}x${g.sh}) — an anti-bot tell.`;
+    }
+  } catch {}
+  return { content: [{ type: "text", text: `Viewport set to ${width}x${height}${note}` }] };
 });
 
 // ── Tools: Accessibility ───────────────────────────────────────────────────
