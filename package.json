@@ -16,7 +16,10 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "node scripts/test.mjs",
+    "test:schema": "node scripts/tool-schema-snapshot.mjs",
+    "smoke:install": "node scripts/smoke-fresh-install.mjs"
   },
   "keywords": [
     "mcp",
