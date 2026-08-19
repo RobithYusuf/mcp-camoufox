@@ -3,7 +3,11 @@ import { startServer, fixtureServer, html, refOf, runner, until } from "./harnes
 
 const PORT = 39501;
 const CARDS = [1, 2, 3, 4].map(i =>
-  `<li class="card"><h3>Card ${i}</h3><span class="price">${i}00</span><a href="/c${i}">link${i}</a></li>`).join("");
+  // The inline SVG is deliberate: on an SVG element className is an
+  // SVGAnimatedString, not a string, and detect_content_pattern called .split()
+  // on it — it crashed on the first real news site it was ever pointed at.
+  `<li class="card"><svg class="icon" viewBox="0 0 8 8"><rect class="r" width="8" height="8"/></svg>` +
+  `<h3>Card ${i}</h3><span class="price">${i}00</span><a href="/c${i}">link${i}</a></li>`).join("");
 
 const PAGE = html(`
 <header><nav><a href="/nav">NavNoise</a></nav></header>
@@ -142,6 +146,10 @@ export default async function run() {
     return [first === "yes" && second === "yes", `${first}/${second}`];
   });
 
+  await check("detect_content_pattern survives inline SVG", async () => {
+    const t = await c("detect_content_pattern", { min_items: 3 });
+    return [!t.startsWith("IS_ERROR") && /pattern/i.test(t), t.split("\n")[0].slice(0, 70)];
+  });
   await check("extract_table", async () => {
     const j = JSON.parse(await c("extract_table", { selector: "#tbl" }));
     return [j.rows.length === 2 && j.rows[0].Name === "Apple", JSON.stringify(j.rows[0])];

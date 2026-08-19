@@ -16,6 +16,14 @@ regTool("detect_content_pattern", "Auto-detect repeated content patterns (cards,
 }, async ({ min_items }) => {
   const page = getPage();
   const patterns = await page.evaluate(`(() => {
+    // On an SVG element className is an SVGAnimatedString, not a string, so
+    // .split() throws and takes the whole detection down — which is exactly what
+    // happened on the first real news site this was pointed at.
+    function clsOf(el) {
+      var c = el && el.className;
+      if (typeof c === 'string') return c;
+      return (el && el.getAttribute && el.getAttribute('class')) || '';
+    }
     // Count children with same tag+class per parent
     var candidates = [];
     var parents = document.querySelectorAll('main, [role="main"], section, div, ul, ol, tbody');
@@ -25,8 +33,9 @@ regTool("detect_content_pattern", "Auto-detect repeated content patterns (cards,
       for (var c = 0; c < parent.children.length; c++) {
         var child = parent.children[c];
         var key = child.tagName;
-        if (child.className) key += '.' + child.className.split(' ').filter(function(c){return c.length>0}).slice(0,2).join('.');
-        if (!childMap[key]) childMap[key] = { count: 0, tag: child.tagName.toLowerCase(), cls: child.className, sample: '' };
+        var childCls = clsOf(child);
+        if (childCls) key += '.' + childCls.split(' ').filter(function(c){return c.length>0}).slice(0,2).join('.');
+        if (!childMap[key]) childMap[key] = { count: 0, tag: child.tagName.toLowerCase(), cls: childCls, sample: '' };
         childMap[key].count++;
         if (!childMap[key].sample) childMap[key].sample = (child.innerText || '').trim().slice(0, 150);
       }
@@ -57,7 +66,8 @@ regTool("detect_content_pattern", "Auto-detect repeated content patterns (cards,
               var txt = texts[t].innerText.trim();
               if (txt.length > 5 && txt.length < 100 && texts[t].children.length === 0) {
                 var tSel = texts[t].tagName.toLowerCase();
-                if (texts[t].className) tSel += '.' + texts[t].className.split(' ').filter(function(c){return c.length>0&&c.length<40}).slice(0,1).join('.');
+                var tCls = clsOf(texts[t]);
+                if (tCls) tSel += '.' + tCls.split(' ').filter(function(c){return c.length>0&&c.length<40}).slice(0,1).join('.');
                 textItems.push({ selector: tSel, sample: txt.slice(0, 60) });
               }
             }

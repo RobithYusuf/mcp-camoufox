@@ -22,7 +22,8 @@ regTool("inspect_element", "Get detailed info about an element (tag, attributes,
     const attrs: Record<string, string> = {};
     for (const a of el.attributes) attrs[a.name] = a.value;
     return {
-      tag: el.tagName.toLowerCase(), id: el.id, className: el.className,
+      tag: el.tagName.toLowerCase(), id: el.id,
+      className: (typeof el.className === 'string') ? el.className : (el.getAttribute('class') || ''),
       text: (el.innerText || "").slice(0, 200),
       value: (function () {
         var v = el.value || "";
