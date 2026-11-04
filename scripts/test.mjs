@@ -10,6 +10,7 @@ const suites = [
   ["core", "./test/suite-core.mjs"],
   ["kit", "./test/suite-kit.mjs"],
   ["security", "./test/suite-security.mjs"],
+  ["docs", "./test/suite-docs.mjs"],
 ].filter(([name]) => !only.length || only.includes(name));
 
 if (process.env.MCPC_ONLY) {

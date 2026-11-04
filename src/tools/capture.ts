@@ -7,9 +7,9 @@ import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { join } from "path";
 import { S, SCREENSHOT_DIR, getPage, consoleMessages, networkRequests, interceptLog, type NetEntry } from "../state.js";
 import { ACTION_TIMEOUT, resolveOutPath,
-         totpFromSecret, clickWithFallback, clickNote, fillLocator, refLocator,
-         snapshotPage,
-         type ClickMode, gotoReady, settle } from "../helpers.js";
+         totpFromSecret, clickWithFallback, clickReply, fillLocator, refLocator,
+         snapshotPage, urlMatches, gotoReady, settle } from "../helpers.js";
+import { maskUrl, maskHeaders, maskHeaderValue, maskBody, isSecretName, scrubErrorText } from "../redact.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Console & Network ───────────────────────────────────────────────
@@ -35,7 +35,9 @@ regTool("console_start", "Start capturing console messages from all tabs.", {}, 
 });
 
 regTool("console_get", "Get captured console messages.", {}, async () => {
-  if (!consoleMessages.length) return { content: [{ type: "text", text: "No messages." }] };
+  // "No messages" with no capture running would read like a quiet page.
+  if (!S.consoleHandler) return { content: [{ type: "text", text: "Console capture is not running, so nothing was measured. Call console_start first." }] };
+  if (!consoleMessages.length) return { content: [{ type: "text", text: "Console capture is running; no messages yet." }] };
   const lines = consoleMessages.slice(-50).map(m => `  [${m.type}] ${m.text}`);
   return { content: [{ type: "text", text: `Console (${consoleMessages.length}):\n${lines.join("\n")}` }] };
 });
@@ -102,13 +104,15 @@ regTool("network_get",
   {
     filter: z.string().default("").describe("Only show requests whose URL contains this substring."),
     limit: z.number().default(50).describe("Max rows to return."),
+    reveal_values: z.boolean().default(false).describe("Show credentials in URLs (access_token and similar). Masked by default."),
   },
-  async ({ filter, limit }) => {
+  async ({ filter, limit, reveal_values }) => {
     let rows = networkRequests;
     if (filter) rows = rows.filter(r => r.url.includes(filter));
-    if (!rows.length) return { content: [{ type: "text", text: filter ? `No requests match "${filter}".` : "No requests." }] };
+    if (!S.networkHandler && !networkRequests.length) return { content: [{ type: "text", text: "Network capture is not running, so nothing was measured. Call network_start first." }] };
+    if (!rows.length) return { content: [{ type: "text", text: filter ? `No requests match "${filter}".` : "Network capture is running; no requests yet." }] };
     const slice = rows.slice(-limit);
-    const lines = slice.map(r => `  #${r.id} ${r.method} ${r.status} ${r.url.slice(0, 120)}`);
+    const lines = slice.map(r => `  #${r.id} ${r.method} ${r.status} ${(reveal_values ? r.url : maskUrl(r.url)).slice(0, 160)}`);
     const hint = S.networkCaptureBodies
       ? "\n(bodies captured — network_get_detail(id) for full request/response)"
       : "\n(headers/bodies NOT captured — restart with network_start capture_bodies=true)";
@@ -122,24 +126,26 @@ regTool("network_get_detail",
   {
     id: z.number().default(-1).describe("Request #id from network_get. -1 = match by url instead."),
     url: z.string().default("").describe("When id=-1, match the newest request whose URL contains this substring."),
+    reveal_values: z.boolean().default(false).describe("Show Cookie, Authorization, Set-Cookie, tokens and passwords. Masked by default."),
   },
-  async ({ id, url }) => {
+  async ({ id, url, reveal_values }) => {
     let entry: NetEntry | undefined;
     if (id >= 0) entry = networkRequests.find(r => r.id === id);
     else if (url) { const m = networkRequests.filter(r => r.url.includes(url)); entry = m[m.length - 1]; }
-    if (!entry) return { content: [{ type: "text", text: "No matching request. Run network_get to list ids." }] };
+    if (!entry) return { content: [{ type: "text", text: "No matching request. Run network_get to list ids." }], isError: true };
     if (!S.networkCaptureBodies && !entry.reqHeaders && !entry.resBody) {
       return { content: [{ type: "text", text: `Request #${entry.id} found, but bodies weren't captured. Run network_start(capture_bodies=true), replay the action, then retry.` }] };
     }
-    const fmtH = (h?: Record<string, string>) => h ? Object.entries(h).map(([k, v]) => `    ${k}: ${v}`).join("\n") : "    (none)";
+    const show = (b: string) => reveal_values ? b : maskBody(b);
+    const fmtH = (h?: Record<string, string>) => h ? Object.entries(reveal_values ? h : maskHeaders(h)!).map(([k, v]) => `    ${k}: ${v}`).join("\n") : "    (none)";
     const out = [
-      `#${entry.id} ${entry.method} ${entry.status}  ${entry.url}`,
+      `#${entry.id} ${entry.method} ${entry.status}  ${reveal_values ? entry.url : maskUrl(entry.url)}`,
       `resourceType: ${entry.resourceType || "?"}  mime: ${entry.mimeType || "?"}`,
       "", "── Request headers ──", fmtH(entry.reqHeaders),
-      ...(entry.reqBody ? ["", "── Request body ──", entry.reqBody] : []),
+      ...(entry.reqBody ? ["", "── Request body ──", show(entry.reqBody)] : []),
       "", "── Response headers ──", fmtH(entry.resHeaders),
       "", "── Response body ──",
-      entry.resBody ? (entry.resBody + (entry.resBodyTruncated ? "\n…(truncated)" : "")) : "(empty / binary / not captured)",
+      entry.resBody ? (show(entry.resBody) + (entry.resBodyTruncated ? "\n…(truncated)" : "")) : "(empty / binary / not captured)",
     ];
     return { content: [{ type: "text", text: out.join("\n") }] };
   });
@@ -171,7 +177,7 @@ regTool("save_pdf",
 
 // ── Tools: Batch Operations ────────────────────────────────────────────────
 
-regTool("batch_actions", "Execute multiple actions in one call. Each action: {type, ref?, value?, text?, key?, url?}.", {
+regTool("batch_actions", "Execute multiple actions in one call. Each action: {type, ref?, value?, text?, key?, timeout?}. Stops at the first failure by default, so a click meant to follow a fill does not run after that fill failed. A failed action makes the whole reply an error.", {
   actions: z.array(z.object({
     type: z.enum(["click", "fill", "type", "press", "select", "check", "uncheck", "wait"]),
     ref: z.string().optional(),
@@ -180,31 +186,43 @@ regTool("batch_actions", "Execute multiple actions in one call. Each action: {ty
     key: z.string().optional(),
     timeout: z.number().optional(),
   })).describe("List of actions to execute sequentially"),
-}, async ({ actions }) => {
+  stop_on_error: z.boolean().default(true).describe("Stop at the first failed action. false runs the rest anyway."),
+}, async ({ actions, stop_on_error }) => {
   const page = getPage();
   const results: string[] = [];
+  let failed = 0, ran = 0;
+  const needs = (a: any): string | null => {
+    if (["click", "fill", "select", "check", "uncheck"].includes(a.type) && !a.ref) return "needs ref";
+    if ((a.type === "fill" || a.type === "select") && a.value === undefined) return "needs value";
+    if (a.type === "type" && a.text === undefined) return "needs text";
+    if (a.type === "press" && !a.key) return "needs key";
+    return null;
+  };
   for (const action of actions) {
+    ran++;
     try {
-      if (action.type === "click" && action.ref) {
-        const mode = await clickWithFallback(refLocator(page, action.ref));
-        results.push(`click ${action.ref}: OK${mode === "fallback" ? " (⚠ synthetic fallback — verify effect)" : ""}`);
-      } else if (action.type === "fill" && action.ref && action.value !== undefined) {
-        await fillLocator(refLocator(page, action.ref), action.value);
+      const missing = needs(action);
+      if (missing) throw new Error(missing);
+      if (action.type === "click") {
+        const res = await clickWithFallback(refLocator(page, action.ref!));
+        results.push(`click ${action.ref}: OK${res.mode === "fallback" ? " (⚠ synthetic fallback — verify effect)" : ""}`);
+      } else if (action.type === "fill") {
+        await fillLocator(refLocator(page, action.ref!), action.value!);
         results.push(`fill ${action.ref}: OK`);
-      } else if (action.type === "type" && action.text) {
-        await page.keyboard.type(action.text, { delay: 50 });
+      } else if (action.type === "type") {
+        await page.keyboard.type(action.text!, { delay: 50 });
         results.push(`type: OK`);
-      } else if (action.type === "press" && action.key) {
-        await page.keyboard.press(action.key);
+      } else if (action.type === "press") {
+        await page.keyboard.press(action.key!);
         results.push(`press ${action.key}: OK`);
-      } else if (action.type === "select" && action.ref && action.value) {
-        await refLocator(page, action.ref).selectOption(action.value, { timeout: ACTION_TIMEOUT });
+      } else if (action.type === "select") {
+        await refLocator(page, action.ref!).selectOption(action.value!, { timeout: ACTION_TIMEOUT });
         results.push(`select ${action.ref}: OK`);
-      } else if (action.type === "check" && action.ref) {
-        await refLocator(page, action.ref).check({ timeout: ACTION_TIMEOUT });
+      } else if (action.type === "check") {
+        await refLocator(page, action.ref!).check({ timeout: ACTION_TIMEOUT });
         results.push(`check ${action.ref}: OK`);
-      } else if (action.type === "uncheck" && action.ref) {
-        await refLocator(page, action.ref).uncheck({ timeout: ACTION_TIMEOUT });
+      } else if (action.type === "uncheck") {
+        await refLocator(page, action.ref!).uncheck({ timeout: ACTION_TIMEOUT });
         results.push(`uncheck ${action.ref}: OK`);
       } else if (action.type === "wait") {
         await page.waitForTimeout(action.timeout || 1000);
@@ -212,13 +230,19 @@ regTool("batch_actions", "Execute multiple actions in one call. Each action: {ty
       }
       await page.waitForTimeout(300);
     } catch (e: any) {
-      results.push(`${action.type} ${action.ref || ""}: FAIL — ${e.message?.slice(0, 60)}`);
+      failed++;
+      results.push(`${action.type} ${action.ref || ""}: FAIL — ${scrubErrorText(String(e?.message || e)).split("\n")[0].slice(0, 160)}`);
+      if (stop_on_error) break;
     }
   }
-  return { content: [{ type: "text", text: `Batch (${actions.length} actions):\n${results.map(r => "  " + r).join("\n")}` }] };
+  const notRun = actions.length - ran;
+  return {
+    content: [{ type: "text", text: `Batch: ${ran - failed} OK, ${failed} failed, ${notRun} not run (of ${actions.length}).\n${results.map(r => "  " + r).join("\n")}` }],
+    ...(failed ? { isError: true } : {}),
+  };
 });
 
-regTool("fill_form", "Fill multiple form fields and optionally submit.", {
+regTool("fill_form", "Fill multiple form fields and optionally submit. If any field fails, the reply is an error naming it and nothing is submitted.", {
   fields: z.array(z.object({
     ref: z.string().describe("Element ref from snapshot"),
     value: z.string().describe("Value to fill"),
@@ -226,13 +250,20 @@ regTool("fill_form", "Fill multiple form fields and optionally submit.", {
   submit_ref: z.string().optional().describe("Ref of submit button to click after filling"),
 }, async ({ fields, submit_ref }) => {
   const page = getPage();
-  for (const f of fields) {
-    await fillLocator(refLocator(page, f.ref), f.value);
+  for (let i = 0; i < fields.length; i++) {
+    try {
+      await fillLocator(refLocator(page, fields[i].ref), fields[i].value);
+    } catch (e: any) {
+      return {
+        content: [{ type: "text", text: `Filled ${i} of ${fields.length} fields, then ref=${fields[i].ref} failed, so nothing was submitted: ${String(e?.message || e)}` }],
+        isError: true,
+      };
+    }
   }
-  let mode: ClickMode = "real";
-  if (submit_ref) mode = await clickWithFallback(refLocator(page, submit_ref));
-  await page.waitForTimeout(1000);
-  return { content: [{ type: "text", text: `Filled ${fields.length} fields${submit_ref ? " + submitted" : ""}. URL: ${page.url()}${clickNote(mode)}` }] };
+  if (submit_ref) {
+    return clickReply(page, `Filled ${fields.length} fields + submitted`, () => clickWithFallback(refLocator(page, submit_ref)));
+  }
+  return { content: [{ type: "text", text: `Filled ${fields.length} fields. URL: ${page.url()}` }] };
 });
 
 regTool("login_classic",
@@ -258,7 +289,10 @@ regTool("login_classic",
 
     const finish = async (note: string) => {
       const snap = await snapshotPage(page);
-      return { content: [{ type: "text" as const, text: `login_classic: ${note}\nsteps: ${log.join(" → ") || "(none)"}\n\n${snap}` }] };
+      return {
+        content: [{ type: "text" as const, text: `login_classic: ${note}\nsteps: ${log.join(" → ") || "(none)"}\n\n${snap}` }],
+        ...(note.startsWith("FAILED") ? { isError: true } : {}),
+      };
     };
 
     // 1. Email field
@@ -331,14 +365,6 @@ regTool("navigate_and_snapshot", "Navigate to URL then return snapshot — combi
 // Routing lives on the BrowserContext, not the page: a per-page route would miss
 // every tab the site opens, and would have to be re-attached by trackPage.
 
-/** Substring match, or glob-ish when the pattern contains `*`. */
-function urlMatches(url: string, pattern: string): boolean {
-  if (!pattern) return false;
-  if (!pattern.includes("*")) return url.includes(pattern);
-  const rx = new RegExp("^" + pattern.split("*").map(p => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
-  return rx.test(url);
-}
-
 regTool("intercept_start",
   "Block requests before they leave the browser. Blocking image/media/font/stylesheet typically removes most of a page's bytes — " +
   "the single biggest speed-up for scraping — and block_urls kills trackers and ad frames. Routed on the context, so tabs opened " +
@@ -400,14 +426,15 @@ regTool("intercept_stop", "Remove interception rules and report what they blocke
 regTool("intercept_log", "Show what interception blocked and allowed.", {
   action: z.enum(["block", "allow", "all"]).default("block"),
   limit: z.number().default(50),
-}, async ({ action, limit }) => {
+  reveal_values: z.boolean().default(false).describe("Show credentials in URLs. Masked by default."),
+}, async ({ action, limit, reveal_values }) => {
   if (!S.interceptHandler && !interceptLog.length) {
     return { content: [{ type: "text", text: "Interception is not active and nothing was logged. Start it with intercept_start." }] };
   }
   const rows = interceptLog.filter(e => action === "all" || e.action === action).slice(-limit);
   const head = `Interception ${S.interceptHandler ? "ON" : "OFF"} — blocked ${S.interceptBlocked}, allowed ${S.interceptAllowed}. Showing last ${rows.length} (${action}).`;
   if (!rows.length) return { content: [{ type: "text", text: `${head}\nNo matching entries.` }] };
-  const body = rows.map(e => `${e.action === "block" ? "✗" : "·"} [${e.type}] ${e.url.slice(0, 110)}${e.why ? `  (${e.why})` : ""}`).join("\n");
+  const body = rows.map(e => `${e.action === "block" ? "✗" : "·"} [${e.type}] ${(reveal_values ? e.url : maskUrl(e.url)).slice(0, 140)}${e.why ? `  (${e.why})` : ""}`).join("\n");
   return { content: [{ type: "text", text: `${head}\n${body}` }] };
 });
 
@@ -417,9 +444,9 @@ regTool("export_curl",
   {
     url_contains: z.string().default("").describe("Pick the most recent captured request whose URL contains this."),
     id: z.number().default(-1).describe("Or pick by the id shown in network_get."),
-    redact: z.boolean().default(false).describe("Replace Cookie/Authorization values with placeholders."),
+    reveal_values: z.boolean().default(false).describe("Build a runnable command with the real Cookie, Authorization, tokens and passwords. By default they are placeholders."),
   },
-  async ({ url_contains, id, redact }) => {
+  async ({ url_contains, id, reveal_values }) => {
     const pool = networkRequests.filter(e => (id >= 0 ? e.id === id : (!url_contains || e.url.includes(url_contains))));
     const entry = pool[pool.length - 1];
     if (!entry) {
@@ -429,18 +456,18 @@ regTool("export_curl",
       return { content: [{ type: "text", text: `Request ${entry.id} was captured without headers, so a curl built from it would not reproduce the call. Re-run network_start(capture_bodies=true) and repeat the request.` }], isError: true };
     }
     const q = (v: string) => `'${String(v).replace(/'/g, `'\\''`)}'`;
-    const secret = /^(cookie|authorization|proxy-authorization|x-api-key|x-auth-token)$/i;
-    const parts = [`curl -X ${entry.method} ${q(entry.url)}`];
+    const parts = [`curl -X ${entry.method} ${q(reveal_values ? entry.url : maskUrl(entry.url))}`];
     const carried: string[] = [];
     for (const [k, v] of Object.entries(entry.reqHeaders)) {
       if (k.startsWith(":")) continue;                       // pseudo-headers are not curl's business
-      const isSecret = secret.test(k);
-      if (isSecret) carried.push(k);
-      parts.push(`  -H ${q(`${k}: ${isSecret && redact ? "<REDACTED>" : v}`)}`);
+      const shown = reveal_values ? v : maskHeaderValue(k, v);
+      if (shown !== v || (reveal_values && (isSecretName(k) || /^(cookie|set-cookie)$/i.test(k)))) carried.push(k);
+      parts.push(`  -H ${q(`${k}: ${shown}`)}`);
     }
-    if (entry.reqBody) parts.push(`  --data-raw ${q(entry.reqBody)}`);
-    const warn = carried.length && !redact
-      ? `\n\n⚠ This command carries live credentials (${carried.join(", ")}). Treat it as a secret — do not paste it into an issue or a shared doc. Pass redact=true for a shareable version.`
-      : carried.length ? `\n\nNote: ${carried.join(", ")} redacted — replace the placeholders before running.` : "";
+    if (entry.reqBody) parts.push(`  --data-raw ${q(reveal_values ? entry.reqBody : maskBody(entry.reqBody))}`);
+    const warn = carried.length && reveal_values
+      ? `\n\n⚠ This command carries live credentials (${carried.join(", ")}). Treat it as a secret — do not paste it into an issue or a shared doc.`
+      : (!reveal_values && (carried.length || maskUrl(entry.url) !== entry.url || (entry.reqBody && maskBody(entry.reqBody) !== entry.reqBody)))
+        ? `\n\nNote: credentials were masked${carried.length ? ` (${carried.join(", ")})` : ""}, so this will not reproduce the call as is. Pass reveal_values=true for the real values.` : "";
     return { content: [{ type: "text", text: `# ${entry.method} ${entry.status} — captured id=${entry.id}\n${parts.join(" \\\n")}${warn}` }] };
   });

@@ -1,18 +1,41 @@
 // Shared test harness: drives dist/index.js over real MCP stdio, serves local
 // fixtures, and reports PASS/FAIL. No dependencies beyond Node.
 import { spawn } from "child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "fs";
 import http from "http";
+import { homedir, platform, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const DIST = join(ROOT, "dist", "index.js");
 
+function camoufoxCache(home) {
+  if (platform() === "darwin") return join(home, "Library", "Caches", "camoufox");
+  if (platform() === "win32") return join(home, "AppData", "Local", "camoufox");
+  return join(home, ".cache", "camoufox");
+}
+
+/** A throwaway HOME that shares only the Camoufox binary with the real one, so no test
+ *  can reach ~/.camoufox-mcp and the real logins in it. */
+export function sandboxHome() {
+  const home = mkdtempSync(join(tmpdir(), "mcp-camoufox-home-"));
+  const real = camoufoxCache(homedir());
+  if (existsSync(real)) {
+    const link = camoufoxCache(home);
+    mkdirSync(dirname(link), { recursive: true });
+    symlinkSync(real, link);
+  }
+  return home;
+}
+
 /** Spawn the MCP server and return a client. `call` returns the flattened text
  *  of a tool result, prefixed with "IS_ERROR: " when the tool reported one, and
  *  "[IMAGE …]" when it returned image content. */
 export async function startServer(distPath = DIST) {
-  const proc = spawn("node", [distPath], { stdio: ["pipe", "pipe", "pipe"] });
+  const home = sandboxHome();
+  const proc = spawn("node", [distPath], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, USERPROFILE: home } });
+  proc.on("exit", () => { try { rmSync(home, { recursive: true, force: true }); } catch {} });
   let buf = "", stderr = "";
   const pending = new Map();
   proc.stderr.on("data", d => { stderr += d.toString(); });

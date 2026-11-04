@@ -5,9 +5,11 @@ import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { writeFileSync } from "fs";
 import { join } from "path";
-import { S, PROFILE_DIR, SCREENSHOT_DIR, getPage, networkRequests } from "../state.js";
-import { PKG_VERSION, ACTION_TIMEOUT, jsStr, resolveOutPath,
-         refLocator } from "../helpers.js";
+import { readdirSync } from "fs";
+import { S, PROFILE_DIR, PROFILE_PARENT, SCREENSHOT_DIR, getPage, networkRequests } from "../state.js";
+import { PKG_VERSION, ACTION_TIMEOUT, jsStr, resolveOutPath, writeSecretFile, SECRET_FIELD_FN, maskedField,
+         isSecretLocator, refLocator, observeClick, pointerMove, pointerClick, viewportOf, waitForUrl, urlMatches } from "../helpers.js";
+import { isSecretName, maskUrl, maskHeaders, maskBody, maskedValue } from "../redact.js";
 import { regTool } from "../server.js";
 import { osClickViewport, osInputError } from "../os-input.js";
 
@@ -21,7 +23,10 @@ regTool("inspect_element", "Get detailed info about an element (tag, attributes,
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
     const attrs: Record<string, string> = {};
-    for (const a of el.attributes) attrs[a.name] = a.value;
+    const ty0 = String(el.type || "").toLowerCase();
+    const hint0 = `${el.name || ""} ${el.id || ""} ${el.getAttribute("autocomplete") || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
+    const secret0 = ty0 === "password" || /pass|secret|token|otp|cvv|card|pin/.test(hint0);
+    for (const a of el.attributes) attrs[a.name] = secret0 && a.name === "value" ? "••• masked" : a.value;
     return {
       tag: el.tagName.toLowerCase(), id: el.id,
       className: (typeof el.className === 'string') ? el.className : (el.getAttribute('class') || ''),
@@ -37,7 +42,7 @@ regTool("inspect_element", "Get detailed info about an element (tag, attributes,
       visible: cs.display !== "none" && cs.visibility !== "hidden",
       fontSize: cs.fontSize, color: cs.color, bg: cs.backgroundColor,
     };
-  });
+  }, undefined, { timeout: ACTION_TIMEOUT });
   return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
 });
 
@@ -45,7 +50,11 @@ regTool("get_attribute", "Get a specific attribute value from an element.", {
   ref: z.string(), attribute: z.string(),
 }, async ({ ref, attribute }) => {
   const page = getPage();
-  const val = await refLocator(page, ref).getAttribute(attribute);
+  const loc = refLocator(page, ref);
+  const val = await loc.getAttribute(attribute, { timeout: ACTION_TIMEOUT });
+  if (attribute.toLowerCase() === "value" && val && await isSecretLocator(loc)) {
+    return { content: [{ type: "text", text: `${attribute}=${maskedField(val.length)}` }] };
+  }
   return { content: [{ type: "text", text: `${attribute}=${val}` }] };
 });
 
@@ -63,7 +72,7 @@ regTool("query_selector_all", "Query elements by CSS selector, return text/attri
       out.push({
         i: i,
         text: (els[i].innerText || '').trim().slice(0, 100),
-        attr: attrName ? (els[i].getAttribute(attrName) || '') : '',
+        attr: !attrName ? '' : (attrName.toLowerCase() === 'value' && (${SECRET_FIELD_FN})(els[i])) ? '••• masked' : (els[i].getAttribute(attrName) || ''),
         tag: els[i].tagName.toLowerCase()
       });
     }
@@ -96,16 +105,22 @@ regTool("get_links", "Get all links on the page with URL and text.", {
 
 // ── Tools: Storage ─────────────────────────────────────────────────────────
 
-regTool("localstorage_get", "Get all localStorage data or a specific key.", {
+// A key named like a credential holds one, so its value stays out of the reply.
+function storageReply(all: Record<string, string>, reveal: boolean): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(all || {}).map(([k, v]) => [k, !reveal && isSecretName(k) ? maskedValue(v) : v])), null, 2);
+}
+
+regTool("localstorage_get", "Get all localStorage data or a specific key. Keys named like a credential (token, secret, session and so on) are masked unless reveal_values=true.", {
   key: z.string().default("").describe("Key to get (empty = all)"),
-}, async ({ key }) => {
+  reveal_values: z.boolean().default(false),
+}, async ({ key, reveal_values }) => {
   const page = getPage();
   if (key) {
     const val = await page.evaluate(`localStorage.getItem(${jsStr(key)})`);
-    return { content: [{ type: "text", text: `${key}=${val}` }] };
+    return { content: [{ type: "text", text: `${key}=${val !== null && !reveal_values && isSecretName(key) ? maskedValue(val) : val}` }] };
   }
-  const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); o[k] = localStorage.getItem(k); } return o; })()`);
-  return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
+  const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); o[k] = localStorage.getItem(k); } return o; })()`) as Record<string, string>;
+  return { content: [{ type: "text", text: storageReply(all, reveal_values) }] };
 });
 
 regTool("localstorage_set", "Set a localStorage item.", {
@@ -122,16 +137,17 @@ regTool("localstorage_clear", "Clear all localStorage.", {}, async () => {
   return { content: [{ type: "text", text: "localStorage cleared." }] };
 });
 
-regTool("sessionstorage_get", "Get all sessionStorage data or a specific key.", {
+regTool("sessionstorage_get", "Get all sessionStorage data or a specific key. Keys named like a credential are masked unless reveal_values=true.", {
   key: z.string().default(""),
-}, async ({ key }) => {
+  reveal_values: z.boolean().default(false),
+}, async ({ key, reveal_values }) => {
   const page = getPage();
   if (key) {
     const val = await page.evaluate(`sessionStorage.getItem(${jsStr(key)})`);
-    return { content: [{ type: "text", text: `${key}=${val}` }] };
+    return { content: [{ type: "text", text: `${key}=${val !== null && !reveal_values && isSecretName(key) ? maskedValue(val) : val}` }] };
   }
-  const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < sessionStorage.length; i++) { var k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; })()`);
-  return { content: [{ type: "text", text: JSON.stringify(all, null, 2) }] };
+  const all = await page.evaluate(`(() => { var o = {}; for (var i = 0; i < sessionStorage.length; i++) { var k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; })()`) as Record<string, string>;
+  return { content: [{ type: "text", text: storageReply(all, reveal_values) }] };
 });
 
 regTool("sessionstorage_set", "Set a sessionStorage item.", {
@@ -150,13 +166,18 @@ regTool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpol
   steps: z.number().default(0).describe("Interpolation steps for pre-click movement (0=instant, 15-30=human-like)"),
 }, async ({ x, y, button, steps }) => {
   const page = getPage();
-  if (steps > 0) {
-    await page.mouse.move(x, y, { steps });
-    await page.waitForTimeout(80 + Math.random() * 60);
+  const vp = await viewportOf(page);
+  if (x < 0 || y < 0 || x >= vp.width || y >= vp.height) {
+    return { content: [{ type: "text", text: `Not clicked: (${x}, ${y}) is outside the ${vp.width}x${vp.height} viewport, so nothing could receive it.` }], isError: true };
   }
-  await page.mouse.click(x, y, { button });
-  await page.waitForTimeout(500);
-  return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button} steps=${steps}` }] };
+  const outcome = await observeClick(page, async () => {
+    if (steps > 0) {
+      await pointerMove(page, x, y, { steps });
+      await page.waitForTimeout(80 + Math.random() * 60);
+    }
+    await pointerClick(page, x, y, { button });
+  });
+  return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button} steps=${steps}.\n${outcome.note}` }] };
 });
 
 regTool("mouse_move", "Move mouse to x,y. steps>0 interpolates the path (curved, not teleported). The move is still a Playwright-synthesized event, not a hardware-origin one.", {
@@ -164,7 +185,7 @@ regTool("mouse_move", "Move mouse to x,y. steps>0 interpolates the path (curved,
   steps: z.number().default(0).describe("Interpolation steps (0=instant jump, 15-30=smooth)"),
 }, async ({ x, y, steps }) => {
   const page = getPage();
-  await page.mouse.move(x, y, steps > 0 ? { steps } : undefined);
+  await pointerMove(page, x, y, steps > 0 ? { steps } : undefined);
   return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y}) steps=${steps}` }] };
 });
 
@@ -265,7 +286,7 @@ regTool("click_turnstile", "Click a Cloudflare Interactive Turnstile checkbox. L
     const hint = st.challenged
       ? ` The page is still a challenge interstitial (title "${st.title}") — the checkbox usually sits in a cross-origin, closed-shadow iframe this tool cannot always reach. A Playwright click often will not pass it regardless; a cf_clearance from one manual/real-device solve, reused via storage_state_save/load, is the reliable path.`
       : " Retry with wait_render_ms=3000 if the widget simply had not rendered yet.";
-    return { content: [{ type: "text", text: `IS_ERROR: Turnstile widget not found — selector + frame-API both missed.${hint}` }], isError: true };
+    return { content: [{ type: "text", text: `Turnstile widget not found — selector + frame-API both missed.${hint}` }], isError: true };
   }
 
   // Click with retries. Each attempt re-locates (widget can shift), applies a tiny
@@ -285,9 +306,9 @@ regTool("click_turnstile", "Click a Cloudflare Interactive Turnstile checkbox. L
 
     // Single pre-drift from off-target, then direct Playwright click. Camoufox's
     // humanize layer handles path curvature + timing; extra Bezier hops are redundant.
-    await page.mouse.move(targetX + 180, targetY - 80, { steps: 15 });
+    await pointerMove(page, targetX + 180, targetY - 80, { steps: 15 });
     await page.waitForTimeout(150);
-    await page.mouse.click(targetX, targetY);
+    await pointerClick(page, targetX, targetY);
 
     for (let j = 0; j < 8 && !solved; j++) {
       await page.waitForTimeout(500);
@@ -312,7 +333,7 @@ regTool("click_turnstile", "Click a Cloudflare Interactive Turnstile checkbox. L
   // No usable token means the click did not achieve a pass — a failed outcome,
   // surfaced as an error so a caller cannot read it as success.
   const isError = !solved;
-  return { content: [{ type: "text", text: (isError ? "IS_ERROR: " : "") + lines.join("\n") }], ...(isError ? { isError: true } : {}) };
+  return { content: [{ type: "text", text: lines.join("\n") }], ...(isError ? { isError: true } : {}) };
 });
 
 regTool("turnstile_coords", "Locate a Cloudflare Turnstile checkbox and return its VIEWPORT x,y (JSON {found,x,y,width,height}) WITHOUT clicking. Pair with os_click_xy in a SEPARATE call: the frame-API locate here touches the challenge iframe, which Turnstile rejects if it happens next to the click — so locating and clicking must be different MCP calls.", {
@@ -346,7 +367,7 @@ regTool("turnstile_coords", "Locate a Cloudflare Turnstile checkbox and return i
       if (b && b.width >= 50 && b.height >= 20) { box = { found: `frame:${n || u.slice(0, 40)}`, left: Math.round(b.x), top: Math.round(b.y), width: Math.round(b.width), height: Math.round(b.height) }; break; }
     }
   }
-  if (!box) return { content: [{ type: "text", text: "IS_ERROR: Turnstile widget not found." }], isError: true };
+  if (!box) return { content: [{ type: "text", text: "Turnstile widget not found." }], isError: true };
   // Checkbox sits ~30px from the widget's left edge, vertically centered.
   const x = box.left + 30, y = box.top + Math.floor(box.height / 2);
   return { content: [{ type: "text", text: JSON.stringify({ found: box.found, x, y, width: box.width, height: box.height }) }] };
@@ -357,12 +378,12 @@ regTool("os_click_xy", "Headed desktop: deliver a REAL OS cursor click at the gi
   y: z.number().describe("Viewport Y (e.g. from turnstile_coords)"),
 }, async ({ x, y }) => {
   const err = osInputError();
-  if (err) return { content: [{ type: "text", text: "IS_ERROR: " + err }], isError: true };
+  if (err) return { content: [{ type: "text", text: err }], isError: true };
   const page = getPage();
   const vp = page.viewportSize() || { width: 1280, height: 720 };
   const res = await osClickViewport(S.activeProfileDir || "", x, y, vp.height);
   // humanHandoff is not a hard failure: the cursor is parked and a person can finish.
-  const prefix = res.ok ? "" : (res.humanHandoff ? "HUMAN_CLICK_NEEDED: " : "IS_ERROR: ");
+  const prefix = res.ok ? "" : (res.humanHandoff ? "HUMAN_CLICK_NEEDED: " : "");
   return { content: [{ type: "text", text: prefix + res.detail }], ...(res.ok ? {} : { isError: true }) };
 });
 
@@ -417,25 +438,29 @@ regTool("wait_for_url", "Wait for URL to match a pattern.", {
   // leading slash like "/mail" is a path substring, not a regex — slicing both
   // ends off it used to silently drop the last char ("/mail" → "mai").
   const isRegexLiteral = pattern.length > 1 && pattern.startsWith("/") && pattern.endsWith("/");
-  await page.waitForURL(isRegexLiteral ? new RegExp(pattern.slice(1, -1)) : `**/*${pattern}*`, { timeout });
+  const rx = isRegexLiteral ? new RegExp(pattern.slice(1, -1)) : null;
+  const hit = await waitForUrl(page, u => rx ? rx.test(u) : urlMatches(u, pattern), timeout);
+  if (!hit) return { content: [{ type: "text", text: `URL did not match '${pattern}' within ${timeout}ms. Current: ${page.url()}` }], isError: true };
   return { content: [{ type: "text", text: `URL matched pattern '${pattern}'. Current: ${page.url()}` }] };
 });
 
 regTool("wait_for_response", "Wait for a network response matching a URL pattern.", {
   url_pattern: z.string().describe("URL substring to match"),
   timeout: z.number().default(15000),
-}, async ({ url_pattern, timeout }) => {
+  reveal_values: z.boolean().default(false).describe("Show credentials in the URL. Masked by default."),
+}, async ({ url_pattern, timeout, reveal_values }) => {
   const page = getPage();
   const resp = await page.waitForResponse(r => r.url().includes(url_pattern), { timeout });
-  return { content: [{ type: "text", text: `Response: ${resp.status()} ${resp.url().slice(0, 120)}` }] };
+  return { content: [{ type: "text", text: `Response: ${resp.status()} ${(reveal_values ? resp.url() : maskUrl(resp.url())).slice(0, 200)}` }] };
 });
 
 // ── Tools: Viewport ────────────────────────────────────────────────────────
 
 regTool("get_viewport_size", "Get current viewport dimensions.", {}, async () => {
   const page = getPage();
-  const size = page.viewportSize();
-  return { content: [{ type: "text", text: `Viewport: ${size?.width || "?"}x${size?.height || "?"}` }] };
+  // Read from the page when launched with no_viewport, where Playwright has no size.
+  const size = await viewportOf(page);
+  return { content: [{ type: "text", text: `Viewport: ${size.width}x${size.height}${page.viewportSize() ? "" : " (follows the window, no_viewport)"}` }] };
 });
 
 regTool("set_viewport_size",
@@ -447,6 +472,12 @@ regTool("set_viewport_size",
     width: z.number(), height: z.number(),
   }, async ({ width, height }) => {
   const page = getPage();
+  // Checked here because Playwright passes these straight to Juggler: width=-5 hung the
+  // call and left the page with no usable viewport, so every later click fell back to
+  // synthetic events.
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > 16384 || height > 16384) {
+    return { content: [{ type: "text", text: `Invalid viewport ${width}x${height}: width and height must be whole numbers from 1 to 16384.` }], isError: true };
+  }
   await page.setViewportSize({ width, height });
   // Report the resulting geometry rather than just echoing the request: the
   // window dimensions the page sees do not move with the viewport.
@@ -462,7 +493,9 @@ regTool("set_viewport_size",
       note = `\n⚠ The viewport is larger than the spoofed screen (${g.sw}x${g.sh}) — an anti-bot tell.`;
     }
   } catch {}
-  return { content: [{ type: "text", text: `Viewport set to ${width}x${height}${note}` }] };
+  const real = JSON.parse(await page.evaluate(`JSON.stringify([innerWidth, innerHeight])`) as string);
+  const off = real[0] !== width || real[1] !== height;
+  return { content: [{ type: "text", text: `Viewport set to ${width}x${height}${off ? `, but the page reports ${real[0]}x${real[1]}` : ""}${note}` }], ...(off ? { isError: true } : {}) };
 });
 
 // ── Tools: Accessibility ───────────────────────────────────────────────────
@@ -495,13 +528,21 @@ regTool("accessibility_snapshot", "Get accessibility tree snapshot — compact v
 // ── Tools: Debug & Health ──────────────────────────────────────────────────
 
 regTool("server_status", "Health check — verify server, browser status, active tabs.", {}, async () => {
+  // Temp profiles from before folder names carried a PID have no owner to check, so
+  // nothing removes them on its own. They can hold logins, so the count is worth seeing.
+  let oldTemp = 0;
+  try { oldTemp = readdirSync(PROFILE_PARENT).filter(n => /^profile-fresh-\d/.test(n)).length; } catch {}
   return { content: [{ type: "text", text: JSON.stringify({
     browser_up: S.browserUp,
     active_tabs: S.pages.length,
     active_page: S.activePage,
-    current_url: S.browserUp && S.pages.length > 0 ? S.pages[S.activePage]?.url() : null,
-    profile_dir: PROFILE_DIR,
+    current_url: S.browserUp && S.pages.length > 0 ? maskUrl(S.pages[S.activePage]?.url()) : null,
+    // The profile in use right now, which is a temp one under fresh_profile.
+    profile_dir: S.activeProfileDir || PROFILE_DIR,
+    profile_is_temp: S.browserUp ? S.activeProfileIsTemp : false,
     screenshot_dir: SCREENSHOT_DIR,
+    ...(S.lastExitNote ? { last_exit: S.lastExitNote } : {}),
+    ...(oldTemp ? { old_temp_profiles: oldTemp } : {}),
   }, null, 2) }] };
 });
 
@@ -538,46 +579,55 @@ regTool("export_har",
   {
     path: z.string().default(""),
     limit: z.number().default(200).describe("Max (most recent) requests to include."),
-  }, async ({ path: harPath, limit }) => {
+    reveal_values: z.boolean().default(false).describe("Write real Cookie, Authorization, tokens and passwords. Masked by default, because HAR files get shared. The file is mode 0600 either way."),
+  }, async ({ path: harPath, limit, reveal_values }) => {
   const page = getPage();
+  if (!networkRequests.length) {
+    return { content: [{ type: "text", text: "Nothing to export: no requests were captured. Call network_start first, then repeat the action." }], isError: true };
+  }
   const target = harPath ? resolveOutPath(harPath) : join(SCREENSHOT_DIR, "network.har");
   // HAR wants [{name, value}] pairs, not an object map.
   const harHeaders = (h?: Record<string, string>) =>
     h ? Object.entries(h).map(([name, value]) => ({ name, value: String(value) })) : [];
   const rows = networkRequests.slice(-Math.max(1, limit));
+  const shown = (b?: string) => (b && !reveal_values ? maskBody(b) : b);
+  const heads = (h?: Record<string, string>) => harHeaders(reveal_values ? h : maskHeaders(h));
+  const queryOf = (url: string) => {
+    try { return [...new URL(url).searchParams].map(([name, value]) => ({ name, value })); } catch { return []; }
+  };
   const entries = rows.map(r => ({
     startedDateTime: new Date(r.ts).toISOString(),
     time: 0,                                    // per-request timings aren't captured
     request: {
       method: r.method,
-      url: r.url,
+      url: reveal_values ? r.url : maskUrl(r.url),
       httpVersion: "HTTP/1.1",
-      headers: harHeaders(r.reqHeaders),
-      queryString: [],
+      headers: heads(r.reqHeaders),
+      queryString: queryOf(reveal_values ? r.url : maskUrl(r.url)),
       cookies: [],
       headersSize: -1,
       bodySize: r.reqBody ? Buffer.byteLength(r.reqBody) : -1,
       ...(r.reqBody
-        ? { postData: { mimeType: r.reqHeaders?.["content-type"] || "", text: r.reqBody } }
+        ? { postData: { mimeType: r.reqHeaders?.["content-type"] || "", text: shown(r.reqBody) } }
         : {}),
     },
     response: {
       status: r.status,
       statusText: "",
       httpVersion: "HTTP/1.1",
-      headers: harHeaders(r.resHeaders),
+      headers: heads(r.resHeaders),
       cookies: [],
       content: {
         size: r.resBody ? Buffer.byteLength(r.resBody) : 0,
         mimeType: r.mimeType || "",
-        ...(r.resBody ? { text: r.resBody } : {}),
+        ...(r.resBody ? { text: shown(r.resBody) } : {}),
       },
       redirectURL: "",
       headersSize: -1,
       bodySize: -1,
     },
     cache: {},
-    timings: { send: -1, wait: -1, receive: -1 },
+    timings: { send: 0, wait: 0, receive: 0 },   // required and non-negative in HAR 1.2
     _resourceType: r.resourceType || "",
   }));
   const har = {
@@ -593,7 +643,8 @@ regTool("export_har",
       entries: entries.map(e => ({ ...e, pageref: "page_1" })),
     },
   };
-  writeFileSync(target, JSON.stringify(har, null, 2));
+  // Headers and bodies are credentials even when masked fields are the common case.
+  writeSecretFile(target, JSON.stringify(har, null, 2));
   const bodyNote = S.networkCaptureBodies ? "" : " (no headers/bodies — restart with network_start capture_bodies=true)";
   return { content: [{ type: "text", text: `HAR exported: ${target} (${entries.length} entries)${bodyNote}` }] };
 });

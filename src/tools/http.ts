@@ -10,6 +10,7 @@ import { PKG_VERSION, ACTION_TIMEOUT, jsStr, safeName, writeSecretFile, expandHo
          scopeRoot, describeMatches, candidateList, SNAPSHOT_JS, formatSnapshot, snapshotPage,
          trackPage, inflightOf, type ClickMode, gotoReady, settle } from "../helpers.js";
 import { regTool } from "../server.js";
+import { maskUrl, maskHeaderValue, maskBody, maskedValue } from "../redact.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -53,10 +54,16 @@ function looksBlocked(status: number | null, text: string): boolean {
   if (status === null) return true;
   if (BLOCK_STATUS.has(status)) return true;
   const low = (text || "").slice(0, 6000).toLowerCase();
-  if (BLOCK_MARKERS.some(m => low.includes(m))) return true;
-  // A 200 with an almost-empty body is usually a JS-challenge shell.
-  if (status === 200 && (text || "").length < 512 && (low.includes("<html") || low.trim() === "")) return true;
-  return false;
+  return BLOCK_MARKERS.some(m => low.includes(m));
+}
+
+// A 200 with an almost-empty body MAY be a JS-challenge shell, and may just be a short
+// page. That justifies a look through a browser when one is running. It does not justify
+// saying "blocked".
+function looksThin(status: number | null, text: string): boolean {
+  if (status !== 200) return false;
+  const low = (text || "").toLowerCase();
+  return low.length < 512 && (low.includes("<html") || low.trim() === "");
 }
 
 async function impitFetch(opts: {
@@ -192,36 +199,43 @@ regTool("http_request",
     proxy: z.string().default("").describe("Proxy URL, e.g. http://user:pass@host:port"),
     timeout_ms: z.number().default(30000),
     max_chars: z.number().default(20000).describe("Max response body characters returned."),
+    reveal_values: z.boolean().default(false).describe("Show Set-Cookie, tokens in the JSON body and tokens in URLs. Masked by default."),
   },
-  async ({ url, method, body, headers_json, impersonate, use_browser_cookies, proxy, timeout_ms, max_chars }) => {
+  async ({ url, method, body, headers_json, impersonate, use_browser_cookies, proxy, timeout_ms, max_chars, reveal_values }) => {
     let headers: Record<string, string> = {};
     if (headers_json) {
       try { headers = JSON.parse(headers_json); }
       catch (e: any) { return { content: [{ type: "text", text: `Invalid headers_json: ${e?.message || e}` }], isError: true }; }
+      if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+        return { content: [{ type: "text", text: `Invalid headers_json: expected a JSON object of header names to values.` }], isError: true };
+      }
     }
     const r = await impitFetch({ url, method, headers, body: body || undefined, impersonate, proxy: proxy || undefined, timeoutMs: timeout_ms, useBrowserCookies: use_browser_cookies });
     if (r.error) return { content: [{ type: "text", text: `Request failed: ${r.error}` }], isError: true };
     const blocked = looksBlocked(r.status, r.text);
-    const shown = r.text.length > max_chars ? r.text.slice(0, max_chars) + `\n…[truncated, ${r.text.length} chars total]` : r.text;
-    const hdrLines = Object.entries(r.headers).slice(0, 15).map(([k, v]) => `  ${k}: ${v}`).join("\n");
+    const bodyText = reveal_values ? r.text : maskBody(r.text);
+    const shown = bodyText.length > max_chars ? bodyText.slice(0, max_chars) + `\n…[truncated, ${bodyText.length} chars total]` : bodyText;
+    const hdrLines = Object.entries(r.headers).slice(0, 15).map(([k, v]) => `  ${k}: ${reveal_values ? v : maskHeaderValue(k, v)}`).join("\n");
+    const urlShown = reveal_values ? r.url : maskUrl(r.url);
+    const trail = (r.redirects || []).map(t => reveal_values ? t : maskUrl(t));
     return {
       content: [{ type: "text", text:
-        `${method.toUpperCase()} ${r.url}\nstatus: ${r.status}${blocked ? "  ⚠ looks anti-bot blocked — retry via the browser (smart_fetch escalates automatically)" : ""}\n` +
+        `${method.toUpperCase()} ${urlShown}\nstatus: ${r.status}${blocked ? "  ⚠ this may be an anti-bot block — retry via the browser (smart_fetch escalates automatically)" : ""}\n` +
         `cookies sent: ${use_browser_cookies ? "browser session (recomputed per redirect hop)" : "none"}  impersonate: ${impersonate}\n` +
-        (r.redirects && r.redirects.length ? `redirects: ${r.redirects.join(" | ")}\n` : "") +
+        (trail.length ? `redirects: ${trail.join(" | ")}\n` : "") +
         `\n── headers ──\n${hdrLines}\n\n── body ──\n${shown}` }],
     };
   });
 
 regTool("http_session_cookies",
-  "Show which browser cookies would be sent with an HTTP request to this URL. Use it to confirm session sharing before relying on http_request.",
-  { url: z.string() },
-  async ({ url }) => {
+  "Show which browser cookies would be sent with an HTTP request to this URL. Use it to confirm session sharing before relying on http_request. Values are masked unless reveal_values=true.",
+  { url: z.string(), reveal_values: z.boolean().default(false) },
+  async ({ url, reveal_values }) => {
     if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
     const cookies = await S.browserContext.cookies(url);
     if (!cookies.length) return { content: [{ type: "text", text: `No cookies would be sent to ${url}.` }] };
     const lines = cookies.map((c: any) =>
-      `  ${c.name}=${String(c.value).slice(0, 30)}…  domain=${c.domain} path=${c.path}${c.httpOnly ? " httpOnly" : ""}${c.secure ? " secure" : ""}${(!c.expires || c.expires <= 0) ? " [session]" : ""}`);
+      `  ${c.name}=${reveal_values ? c.value : maskedValue(c.value)}  domain=${c.domain} path=${c.path}${c.httpOnly ? " httpOnly" : ""}${c.secure ? " secure" : ""}${(!c.expires || c.expires <= 0) ? " [session]" : ""}`);
     return { content: [{ type: "text", text: `${cookies.length} cookie(s) for ${url}:\n${lines.join("\n")}` }] };
   });
 
@@ -340,14 +354,15 @@ regTool("scrape_markdown",
       await gotoReady(page, url, "domcontentloaded", 45000);
       await settle(page, 1200);
       const html = await page.content();
-      return { content: [{ type: "text", text: `source: browser\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
+      return { content: [{ type: "text", text: `source: browser\nurl: ${maskUrl(page.url())}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
     }
     const r = await impitFetch({ url, impersonate, proxy: proxy || undefined });
     if (r.error) return { content: [{ type: "text", text: `Fetch failed: ${r.error}` }], isError: true };
     if (looksBlocked(r.status, r.text)) {
-      return { content: [{ type: "text", text: `Blocked by anti-bot (status ${r.status}) at ${r.url}. Retry with use_browser=true, or call smart_fetch which escalates automatically.` }], isError: true };
+      return { content: [{ type: "text", text: `This looks like an anti-bot block (status ${r.status}) at ${maskUrl(r.url)}. Retry with use_browser=true, or call smart_fetch which escalates automatically.` }], isError: true };
     }
-    return { content: [{ type: "text", text: `source: http (${impersonate} TLS)\nstatus: ${r.status}\nurl: ${r.url}\n\n${htmlToMarkdown(r.text, r.url, max_chars)}` }] };
+    const thin = looksThin(r.status, r.text) ? `note: very little content came back. If the page needs JavaScript, retry with use_browser=true.\n` : "";
+    return { content: [{ type: "text", text: `source: http (${impersonate} TLS)\nstatus: ${r.status}\nurl: ${maskUrl(r.url)}\n${thin}\n${htmlToMarkdown(r.text, r.url, max_chars)}` }] };
   });
 
 regTool("smart_fetch",
@@ -364,10 +379,13 @@ regTool("smart_fetch",
     let httpNote = "";
     if (!force_browser) {
       const r = await impitFetch({ url, impersonate, proxy: proxy || undefined });
-      if (!r.error && !looksBlocked(r.status, r.text)) {
-        return { content: [{ type: "text", text: `path: http (no browser used)\nstatus: ${r.status}\nurl: ${r.url}\n\n${htmlToMarkdown(r.text, r.url, max_chars)}` }] };
+      const thin = !r.error && looksThin(r.status, r.text);
+      const canEscalate = S.browserUp && S.pages.length > 0;
+      if (!r.error && !looksBlocked(r.status, r.text) && (!thin || !canEscalate)) {
+        const note = thin ? `note: very little content came back and no browser is running to check it with.\n` : "";
+        return { content: [{ type: "text", text: `path: http (no browser used)\nstatus: ${r.status}\nurl: ${maskUrl(r.url)}\n${note}\n${htmlToMarkdown(r.text, r.url, max_chars)}` }] };
       }
-      httpNote = r.error ? `http error: ${r.error}` : `http status ${r.status} looked blocked`;
+      httpNote = r.error ? `http error: ${r.error}` : thin ? `http body was very short` : `http status ${r.status} looked blocked`;
     }
     if (!S.browserUp || S.pages.length === 0) {
       return { content: [{ type: "text", text: `${httpNote || "browser forced"} — and no browser is running. Call browser_launch first, then retry.` }], isError: true };
@@ -378,10 +396,10 @@ regTool("smart_fetch",
     for (let i = 0; i < 8; i++) {
       await page.waitForTimeout(1000);
       const html = await page.content();
-      if (html.length > 1500 && !looksBlocked(200, html)) {
-        return { content: [{ type: "text", text: `path: browser (escalated — ${httpNote})\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
+      if (!looksBlocked(200, html)) {
+        return { content: [{ type: "text", text: `path: browser (escalated — ${httpNote})\nurl: ${maskUrl(page.url())}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
       }
     }
     const html = await page.content();
-    return { content: [{ type: "text", text: `path: browser (escalated — ${httpNote}); challenge may still be active\nurl: ${page.url()}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
+    return { content: [{ type: "text", text: `path: browser (escalated — ${httpNote}); challenge may still be active\nurl: ${maskUrl(page.url())}\n\n${htmlToMarkdown(html, page.url(), max_chars)}` }] };
   });

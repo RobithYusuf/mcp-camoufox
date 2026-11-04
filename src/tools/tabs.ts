@@ -4,7 +4,8 @@
 import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { writeFileSync } from "fs";
-import { S, getPage } from "../state.js";
+import { S, getPage, dialogLog } from "../state.js";
+import { maskedValue } from "../redact.js";
 import { ACTION_TIMEOUT, resolveOutPath,
          refLocator,
          trackPage, gotoReady } from "../helpers.js";
@@ -59,17 +60,17 @@ regTool("tab_select", "Switch to a tab by index, or by url_contains (first tab w
   index: z.number().default(-1).describe("Tab index. Ignored if url_contains is set."),
   url_contains: z.string().default("").describe("Select the first tab whose URL contains this substring."),
 }, async ({ index, url_contains }) => {
-  if (!S.pages.length) return { content: [{ type: "text", text: "No tabs open." }] };
+  if (!S.pages.length) return { content: [{ type: "text", text: "No tabs open." }], isError: true };
   let idx = index;
   if (url_contains) {
     idx = S.pages.findIndex(p => { try { return p.url().includes(url_contains); } catch { return false; } });
     if (idx < 0) {
       const list = S.pages.map((p, i) => { let u = "?"; try { u = p.url(); } catch {} return `[${i}] ${u}`; }).join("\n  ");
-      return { content: [{ type: "text", text: `No tab URL contains "${url_contains}". Open tabs:\n  ${list}` }] };
+      return { content: [{ type: "text", text: `No tab URL contains "${url_contains}". Open tabs:\n  ${list}` }], isError: true };
     }
   }
   if (idx < 0 || idx >= S.pages.length) {
-    return { content: [{ type: "text", text: `Invalid index ${idx}. Have ${S.pages.length} tabs. Pass index or url_contains.` }] };
+    return { content: [{ type: "text", text: `Invalid index ${idx}. Have ${S.pages.length} tabs. Pass index or url_contains.` }], isError: true };
   }
   S.activePage = idx;
   try { await S.pages[idx].bringToFront(); } catch {}
@@ -83,12 +84,12 @@ regTool("tab_close", "Close a tab by index (-1 = active), or by url_contains.", 
   let idx: number;
   if (url_contains) {
     idx = S.pages.findIndex(p => { try { return p.url().includes(url_contains); } catch { return false; } });
-    if (idx < 0) return { content: [{ type: "text", text: `No tab URL contains "${url_contains}".` }] };
+    if (idx < 0) return { content: [{ type: "text", text: `No tab URL contains "${url_contains}".` }], isError: true };
   } else {
     idx = index === -1 ? S.activePage : index;
   }
   if (idx < 0 || idx >= S.pages.length) {
-    return { content: [{ type: "text", text: `Invalid index.` }] };
+    return { content: [{ type: "text", text: `Invalid index ${idx}. Have ${S.pages.length} tabs.` }], isError: true };
   }
   // Remember the active page by IDENTITY before splicing — closing a
   // lower-indexed tab shifts every later index down, so a plain
@@ -98,7 +99,7 @@ regTool("tab_close", "Close a tab by index (-1 = active), or by url_contains.", 
   try { await page.close(); } catch {}
   if (S.pages.length === 0) {
     S.activePage = 0;
-    return { content: [{ type: "text", text: "Last tab closed." }] };
+    return { content: [{ type: "text", text: "Last tab closed. The browser is still running: tab_new opens another, browser_close stops it." }] };
   }
   const reFound = S.pages.indexOf(activeObj);
   // If we closed the active tab itself, fall back to whatever took its slot.
@@ -108,13 +109,14 @@ regTool("tab_close", "Close a tab by index (-1 = active), or by url_contains.", 
 
 // ── Tools: Cookies ─────────────────────────────────────────────────────────
 
-regTool("cookie_list", "List cookies.", {
+regTool("cookie_list", "List cookies. Values are masked by default; reveal_values=true shows them.", {
   domain: z.string().default(""),
-}, async ({ domain }) => {
+  reveal_values: z.boolean().default(false).describe("Show cookie values. A session cookie is a login, so they are masked by default."),
+}, async ({ domain, reveal_values }) => {
   if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
   let cookies = await S.browserContext.cookies();
   if (domain) cookies = cookies.filter(c => c.domain.includes(domain));
-  const lines = cookies.slice(0, 50).map(c => `  ${c.name}=${String(c.value).slice(0, 40)}  domain=${c.domain}`);
+  const lines = cookies.slice(0, 50).map(c => `  ${c.name}=${reveal_values ? c.value : maskedValue(c.value)}  domain=${c.domain} path=${c.path}`);
   return { content: [{ type: "text", text: lines.length ? `Cookies (${cookies.length}):\n${lines.join("\n")}` : "No cookies." }] };
 });
 
@@ -141,60 +143,53 @@ regTool("cookie_set",
     const life = expires_days > 0
       ? `expires in ${expires_days}d (survives browser_close)`
       : "SESSION cookie — will be LOST on browser_close; pass expires_days to persist";
-    return { content: [{ type: "text", text: `Cookie set: ${name}=${value.slice(0, 4)}…(${value.length} chars, masked) domain=${domain} — ${life}` }] };
+    return { content: [{ type: "text", text: `Cookie set: ${name}=${maskedValue(value)} domain=${domain} — ${life}` }] };
   });
 
-regTool("cookie_delete", "Delete cookies. Both empty = clear all.", {
+regTool("cookie_delete", "Delete cookies by exact name and/or domain (a domain also covers its subdomains, never a look-alike such as notexample.com). Both empty = clear all. The count is read back from the browser.", {
   name: z.string().default(""), domain: z.string().default(""),
 }, async ({ name, domain }) => {
   if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
+  const ctx = S.browserContext;
   if (!name && !domain) {
-    await S.browserContext.clearCookies();
+    await ctx.clearCookies();
+    const left = (await ctx.cookies()).length;
+    if (left) return { content: [{ type: "text", text: `Tried to clear all cookies, but ${left} remain.` }], isError: true };
     return { content: [{ type: "text", text: "All cookies cleared." }] };
   }
-  const cookies = await S.browserContext.cookies();
-  const toKeep = cookies.filter(c => {
-    const matchN = !name || c.name === name;
-    const matchD = !domain || c.domain.includes(domain);
-    return !(matchN && matchD);
-  });
-  const deleted = cookies.length - toKeep.length;
-  await S.browserContext.clearCookies();
-  if (toKeep.length) await S.browserContext.addCookies(toKeep as any);
-  return { content: [{ type: "text", text: `Deleted ${deleted} cookie(s).` }] };
+  const want = domain.replace(/^\./, "").toLowerCase();
+  const matches = (c: any) => {
+    if (name && c.name !== name) return false;
+    if (!want) return true;
+    const host = String(c.domain).replace(/^\./, "").toLowerCase();
+    return host === want || host.endsWith("." + want);
+  };
+  const before = await ctx.cookies();
+  for (const c of before.filter(matches)) {
+    await ctx.clearCookies({ name: c.name, domain: c.domain, path: c.path });
+  }
+  const after = await ctx.cookies();
+  const left = after.filter(matches).length;
+  const gone = before.length - after.length;
+  if (left) return { content: [{ type: "text", text: `Deleted ${gone} cookie(s), but ${left} matching cookie(s) are still there.` }], isError: true };
+  return { content: [{ type: "text", text: `Deleted ${gone} cookie(s).` }] };
 });
 
 // ── Tools: Dialog ──────────────────────────────────────────────────────────
 
-regTool("dialog_handle", "Set handler for the next alert/confirm/prompt on ANY open tab (first dialog wins, handler then clears).", {
+regTool("dialog_handle", "Set the answer for the next alert/confirm/prompt on ANY tab, including tabs opened later. Dialogs nobody armed are dismissed at once and named in the reply of the call they appeared in, so arm this BEFORE the action that opens one.", {
   action: z.enum(["accept", "dismiss"]).default("accept"),
   prompt_text: z.string().default(""),
 }, async ({ action, prompt_text }) => {
   if (!S.pages.length) throw new Error("Browser not running. Call browser_launch first.");
-  // Arm every tab, not just the active one — a dialog can fire on a popup the
-  // site opened. The first dialog disarms all tabs; later dialogs get
-  // Playwright's default auto-dismiss instead of hanging the page.
-  let used = false;
-  // Tell a persistent dialog_auto_handle to stand down for this one dialog.
-  S.oneShotDialogArmed = true;
-  const handler = async (dialog: Dialog) => {
-    if (used) { try { await dialog.dismiss(); } catch {} return; }
-    used = true;
-    S.oneShotDialogArmed = false;
-    S.oneShotDialogHandler = null;
-    for (const p of S.pages) { try { p.off("dialog", handler); } catch {} }
-    try {
-      if (action === "accept") await dialog.accept(prompt_text);
-      else await dialog.dismiss();
-    } catch {}
-  };
-  // Arm tabs opened LATER too. Arming only today's tabs was a silent hang: the
-  // persistent handler stands down while this one is armed, so a dialog on a new
-  // tab reached no handler at all — and a registered listener suppresses
-  // Playwright's auto-dismiss, leaving that page blocked forever.
-  S.oneShotDialogHandler = handler;
-  for (const p of S.pages) p.on("dialog", handler);
-  return { content: [{ type: "text", text: `Next dialog will be ${action}'d (armed on ${S.pages.length} tab(s); tabs opened later are armed too)` }] };
+  S.oneShotDialog = { action, promptText: prompt_text };
+  // A dialog cannot be left open and answered later: the page is blocked until it is
+  // answered. So say when this arrived too late for one that just went by.
+  const last = dialogLog.at(-1);
+  const missed = last && Date.now() - last.at < 10000
+    ? `\n⚠ A ${last.type} dialog ("${last.message}") already went by ${Math.round((Date.now() - last.at) / 1000)}s ago and was ${last.answer}. This applies to the next one, so repeat the action.`
+    : "";
+  return { content: [{ type: "text", text: `Next dialog will be ${action}'d (any tab, including tabs opened later)${missed}` }] };
 });
 
 // ── Tools: File Upload ─────────────────────────────────────────────────────
@@ -336,7 +331,14 @@ regTool("scroll", "Scroll the page.", {
   else if (direction === "right") dx = amount;
   else if (direction === "left") dx = -amount;
   // Use JS scroll — mouse.wheel doesn't work reliably in Firefox/Camoufox
-  await page.evaluate(`window.scrollBy(${dx}, ${dy})`);
-  await page.waitForTimeout(300);
-  return { content: [{ type: "text", text: `Scrolled ${direction} ${amount}px` }] };
+  const pos = `JSON.stringify([window.scrollX, window.scrollY])`;
+  const before = JSON.parse(await page.evaluate(pos) as string);
+  await page.evaluate(`window.scrollBy({ left: ${dx}, top: ${dy}, behavior: "instant" })`);
+  await page.waitForTimeout(100);
+  const after = JSON.parse(await page.evaluate(pos) as string);
+  const moved = Math.round(Math.abs(after[0] - before[0]) + Math.abs(after[1] - before[1]));
+  // Report the distance covered: the end of the page stops a scroll short.
+  return { content: [{ type: "text", text: moved === 0
+    ? `Did not move: the page is already at its ${direction} limit or cannot scroll (moved 0px). Asked for ${amount}px.`
+    : `Scrolled ${direction} ${moved}px${moved !== amount ? ` (asked for ${amount}px; the page ended first)` : ""}.` }] };
 });

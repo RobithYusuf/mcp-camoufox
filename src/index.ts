@@ -2,7 +2,7 @@
 /**
  * MCP Camoufox — stealth browser automation MCP server.
  *
- * 127 tools over MCP stdio: browser control (Camoufox/Firefox via Playwright's
+ * MCP stdio tools: browser control (Camoufox/Firefox via Playwright's
  * Juggler) plus a browserless HTTP path that presents the same Firefox TLS
  * fingerprint, so routine fetching never has to pay for a browser launch.
  *
@@ -18,6 +18,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { server } from "./server.js";
+import { shutdownBrowser } from "./tools/browser.js";
 
 // Each tool module registers itself on import. Import order only affects the
 // order tools appear in tools/list, never their behaviour.
@@ -37,8 +38,23 @@ async function main() {
   console.error("[mcp-camoufox] Server running on stdio...");
 }
 
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
+// Leave nothing behind however the client goes away. A client that crashes only
+// closes our stdin, and the browser's pipes then keep this process alive for ever
+// with the browser still running. A signal used to exit at once and leave the temp
+// profile on disk.
+let exiting = false;
+function exitCleanly() {
+  if (exiting) return;
+  exiting = true;
+  // Never let a wedged browser keep the process alive.
+  setTimeout(() => process.exit(0), 20000).unref();
+  shutdownBrowser().catch(() => {}).finally(() => process.exit(0));
+}
+process.on("SIGINT", exitCleanly);
+process.on("SIGTERM", exitCleanly);
+process.on("SIGHUP", exitCleanly);
+process.stdin.on("end", exitCleanly);
+process.stdin.on("close", exitCleanly);
 
 main().catch((err) => {
   console.error("[mcp-camoufox] Fatal:", err);

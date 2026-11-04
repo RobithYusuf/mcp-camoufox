@@ -3,11 +3,12 @@
 // Registered by importing this module — see src/index.ts.
 import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
-import { rmSync } from "fs";
-import { S, PROFILE_DIR, getPage, consoleMessages, networkRequests, storageSnapshots } from "../state.js";
-import { ACTION_TIMEOUT, jsStr, clickWithFallback, clickNote, fillLocator, refLocator,
-         scopeRoot } from "../helpers.js";
+import { S, PROFILE_DIR, getPage, storageSnapshots } from "../state.js";
+import { ACTION_TIMEOUT, jsStr, clickWithFallback, clickNote, fillLocator, refLocator, SECRET_FIELD_FN, maskedField,
+         isSecretLocator, hitTestAt, observeClick, pointerMove, pointerClick, scopeRoot } from "../helpers.js";
 import { regTool, toolRegistry } from "../server.js";
+import { stopCurrentBrowser } from "./browser.js";
+import { isSecretName, maskUrl, maskBody, maskedValue } from "../redact.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LLM-ergonomics kit — fewer round-trips, fewer blind guesses
@@ -141,7 +142,7 @@ regTool("assert_clickable",
     if (r.pointerEvents === "none") problems.push("pointer-events: none");
     if (!r.hit && r.inViewport && !r.zeroSize) problems.push(`covered by ${r.topAtCenter} — that element would receive the click`);
     const verdict = problems.length === 0 ? "PASS: a real click would reach this element." : `FAIL: ${problems.join("; ")}`;
-    return { content: [{ type: "text", text: `${verdict}\n\n${JSON.stringify(r, null, 2)}` }] };
+    return { content: [{ type: "text", text: `${verdict}\n\n${JSON.stringify(r, null, 2)}` }], ...(problems.length ? { isError: true } : {}) };
   });
 
 regTool("scroll_to",
@@ -157,7 +158,14 @@ regTool("scroll_to",
     if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
     if (await loc.count() === 0) return { content: [{ type: "text", text: `Not found: ${ref ? `ref=${ref}` : selector}` }], isError: true };
     await loc.evaluate((el: any, b: string) => el.scrollIntoView({ behavior: "smooth", block: b, inline: "nearest" }), block);
-    await page.waitForTimeout(500);
+    // A smooth scroll on a long page outlasts any fixed wait, so wait for it to stop.
+    let last = "";
+    for (let i = 0; i < 40; i++) {
+      await page.waitForTimeout(100);
+      const now = String(await loc.evaluate((el: any) => el.getBoundingClientRect().top));
+      if (i > 1 && now === last) break;
+      last = now;
+    }
     const pos = await loc.evaluate((el: any) => { const r = el.getBoundingClientRect(); return `${Math.round(r.x)},${Math.round(r.y)}`; });
     return { content: [{ type: "text", text: `Scrolled ${ref ? `ref=${ref}` : selector} into view (block=${block}); now at ${pos}` }] };
   });
@@ -174,15 +182,19 @@ regTool("click_element_offset",
     const page = getPage();
     const loc = targetLocator(page, ref, selector);
     if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+    if (await loc.count() === 0) return { content: [{ type: "text", text: `Not found: ${ref ? `ref=${ref}` : selector}` }], isError: true };
     try { await loc.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT }); } catch {}
     const box = await loc.boundingBox();
     if (!box) return { content: [{ type: "text", text: "Element has no bounding box (hidden?)" }], isError: true };
     const x = box.x + box.width * (Math.min(100, Math.max(0, x_percent)) / 100);
     const y = box.y + box.height * (Math.min(100, Math.max(0, y_percent)) / 100);
-    await page.mouse.move(x + 60, y - 40, { steps: 8 });
-    await page.mouse.click(x, y);
-    await page.waitForTimeout(600);
-    return { content: [{ type: "text", text: `Clicked at ${x_percent}%,${y_percent}% of the element → (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}` }] };
+    const blocked = await hitTestAt(loc, { x: Math.min(x - box.x, Math.max(0, box.width - 0.5)), y: Math.min(y - box.y, Math.max(0, box.height - 0.5)) });
+    if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
+    const outcome = await observeClick(page, async () => {
+      await pointerMove(page, x + 60, y - 40, { steps: 8 });
+      await pointerClick(page, x, y);
+    });
+    return { content: [{ type: "text", text: `Clicked at ${x_percent}%,${y_percent}% of the element → (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}\n${outcome.note}` }] };
   });
 
 regTool("click_at_corner",
@@ -197,6 +209,7 @@ regTool("click_at_corner",
     const page = getPage();
     const loc = targetLocator(page, ref, selector);
     if (!loc) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
+    if (await loc.count() === 0) return { content: [{ type: "text", text: `Not found: ${ref ? `ref=${ref}` : selector}` }], isError: true };
     try { await loc.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT }); } catch {}
     const box = await loc.boundingBox();
     if (!box) return { content: [{ type: "text", text: "Element has no bounding box (hidden?)" }], isError: true };
@@ -204,10 +217,13 @@ regTool("click_at_corner",
     const top = corner.startsWith("top");
     const x = left ? box.x + offset : box.x + box.width - offset;
     const y = top ? box.y + offset : box.y + box.height - offset;
-    await page.mouse.move(x + 50, y - 30, { steps: 8 });
-    await page.mouse.click(x, y);
-    await page.waitForTimeout(600);
-    return { content: [{ type: "text", text: `Clicked ${corner} corner at (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}` }] };
+    const blocked = await hitTestAt(loc, { x: x - box.x, y: y - box.y });
+    if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
+    const outcome = await observeClick(page, async () => {
+      await pointerMove(page, x + 50, y - 30, { steps: 8 });
+      await pointerClick(page, x, y);
+    });
+    return { content: [{ type: "text", text: `Clicked ${corner} corner at (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}\n${outcome.note}` }] };
   });
 
 regTool("paste_text",
@@ -267,11 +283,12 @@ regTool("paste_text",
       return { via: pasteHandled ? "synthetic-paste-event" : "native-setter+input", value: isField ? el.value : (el.textContent || "") };
     }, text);
     const ok = String(result.value) === text;
+    const secret = await isSecretLocator(loc);
     const caveat = result.via === "native-setter+input"
       ? " (NOTE: the real clipboard path was unavailable and Firefox won't attach data to a synthetic paste — a field that ONLY listens for paste may still be empty in the app's state)"
       : "";
     return {
-      content: [{ type: "text", text: `paste_text via ${result.via} → field now ${ok ? "matches" : `DIFFERS: "${String(result.value).slice(0, 60)}"`}${caveat}` }],
+      content: [{ type: "text", text: `paste_text via ${result.via} → field now ${ok ? "matches" : `DIFFERS: ${secret ? maskedField(String(result.value).length) : `"${String(result.value).slice(0, 60)}"`}`}${caveat}` }],
       ...(ok ? {} : { isError: true }),
     };
   });
@@ -317,7 +334,7 @@ regTool("form_introspect",
           type: el.type || "",
           name: el.name || "",
           id: el.id || "",
-          value: String(el.value || "").slice(0, 60),
+          value: (${SECRET_FIELD_FN})(el) ? (el.value ? "••• " + String(el.value).length + " chars (masked)" : "") : String(el.value || "").slice(0, 60),
           required: !!el.required,
           disabled: !!el.disabled,
           readonly: !!el.readOnly,
@@ -428,24 +445,10 @@ regTool("dialog_auto_handle",
   async ({ action, prompt_text, enabled }) => {
     if (!S.browserUp) throw new Error("Browser not running. Call browser_launch first.");
     if (!enabled) {
-      if (S.autoDialogHandler) for (const p of S.pages) { try { p.off("dialog", S.autoDialogHandler); } catch {} }
-      S.autoDialogHandler = null; S.autoDialogCfg = null;
-      return { content: [{ type: "text", text: "Persistent dialog handler removed. Dialogs fall back to Playwright's auto-dismiss." }] };
+      S.autoDialogCfg = null;
+      return { content: [{ type: "text", text: "Persistent dialog handler removed. Dialogs are dismissed automatically and named in the reply." }] };
     }
     S.autoDialogCfg = { action, promptText: prompt_text };
-    if (!S.autoDialogHandler) {
-      S.autoDialogHandler = async (dialog: Dialog) => {
-        // A one-shot dialog_handle takes precedence for the next dialog.
-        if (S.oneShotDialogArmed) return;
-        const cfg = S.autoDialogCfg;
-        if (!cfg) { try { await dialog.dismiss(); } catch {} return; }
-        try {
-          if (cfg.action === "accept") await dialog.accept(cfg.promptText);
-          else await dialog.dismiss();
-        } catch {}
-      };
-      for (const p of S.pages) p.on("dialog", S.autoDialogHandler);
-    }
     return { content: [{ type: "text", text: `Persistent dialog handler armed: every dialog will be ${action}'d (${S.pages.length} tab(s), new tabs inherit it). Call with enabled=false to remove.` }] };
   });
 
@@ -462,15 +465,16 @@ regTool("wait_for_request",
     url_pattern: z.string(),
     method: z.string().default("").describe("Optional HTTP verb filter (GET/POST/…)"),
     timeout: z.number().default(15000),
+    reveal_values: z.boolean().default(false).describe("Show credentials in the URL and body. Masked by default."),
   },
-  async ({ url_pattern, method, timeout }) => {
+  async ({ url_pattern, method, timeout, reveal_values }) => {
     const page = getPage();
     try {
       const req = await page.waitForRequest(
         (r: any) => r.url().includes(url_pattern) && (!method || r.method().toUpperCase() === method.toUpperCase()),
         { timeout });
       const post = req.postData();
-      return { content: [{ type: "text", text: `Request: ${req.method()} ${req.url().slice(0, 200)}${post ? `\nbody: ${post.slice(0, 500)}` : ""}` }] };
+      return { content: [{ type: "text", text: `Request: ${req.method()} ${(reveal_values ? req.url() : maskUrl(req.url())).slice(0, 200)}${post ? `\nbody: ${(reveal_values ? post : maskBody(post)).slice(0, 500)}` : ""}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `No request matching "${url_pattern}"${method ? ` (${method})` : ""} within ${timeout}ms.` }], isError: true };
     }
@@ -491,13 +495,17 @@ async function captureStorage(page: Page): Promise<any> {
   return { ...web, cookies: Object.fromEntries(cookies.map((c: any) => [`${c.domain}${c.path}:${c.name}`, String(c.value)])) };
 }
 
-function diffMaps(before: Record<string, string>, after: Record<string, string>) {
+// mask: which entries hold a credential. Cookie values always may; storage values do
+// when the key is named like one. The keys themselves stay visible: finding which key
+// holds the token is what this tool is for.
+function diffMaps(before: Record<string, string>, after: Record<string, string>, mask: (key: string) => boolean) {
   const added: any = {}, removed: any = {}, changed: any = {};
+  const show = (k: string, v: string, n: number) => mask(k) ? maskedValue(v) : String(v).slice(0, n);
   for (const k of Object.keys(after)) {
-    if (!(k in before)) added[k] = String(after[k]).slice(0, 120);
-    else if (before[k] !== after[k]) changed[k] = { from: String(before[k]).slice(0, 60), to: String(after[k]).slice(0, 60) };
+    if (!(k in before)) added[k] = show(k, after[k], 120);
+    else if (before[k] !== after[k]) changed[k] = { from: show(k, before[k], 60), to: show(k, after[k], 60) };
   }
-  for (const k of Object.keys(before)) if (!(k in after)) removed[k] = String(before[k]).slice(0, 120);
+  for (const k of Object.keys(before)) if (!(k in after)) removed[k] = show(k, before[k], 120);
   return { added, removed, changed };
 }
 
@@ -513,9 +521,9 @@ regTool("storage_snapshot",
 
 regTool("storage_diff",
   "Compare current storage against an earlier storage_snapshot — shows exactly which cookies/localStorage/sessionStorage keys were added, removed or changed. " +
-  "The fastest way to find which key holds a session token.",
-  { name: z.string().default("default") },
-  async ({ name }) => {
+  "The fastest way to find which key holds a session token. Cookie values and credential-named storage keys are masked unless reveal_values=true.",
+  { name: z.string().default("default"), reveal_values: z.boolean().default(false) },
+  async ({ name, reveal_values }) => {
     const page = getPage();
     const before = storageSnapshots.get(name);
     if (!before) {
@@ -525,9 +533,9 @@ regTool("storage_diff",
     const after = await captureStorage(page);
     const out = {
       url: before.url === after.url ? after.url : { from: before.url, to: after.url },
-      cookies: diffMaps(before.cookies, after.cookies),
-      localStorage: diffMaps(before.local, after.local),
-      sessionStorage: diffMaps(before.session, after.session),
+      cookies: diffMaps(before.cookies, after.cookies, () => !reveal_values),
+      localStorage: diffMaps(before.local, after.local, k => !reveal_values && isSecretName(k)),
+      sessionStorage: diffMaps(before.session, after.session, k => !reveal_values && isSecretName(k)),
     };
     const count = (d: any) => Object.keys(d.added).length + Object.keys(d.removed).length + Object.keys(d.changed).length;
     const total = count(out.cookies) + count(out.localStorage) + count(out.sessionStorage);
@@ -611,19 +619,12 @@ regTool("browser_recover",
   {}, async () => {
     const steps: string[] = [];
     if (S.browserContext) {
-      try {
-        await Promise.race([S.browserContext.close(), new Promise(r => setTimeout(r, 5000))]);
-        steps.push("context close attempted");
-      } catch (e: any) { steps.push(`context close failed (ignored): ${String(e?.message || e).slice(0, 80)}`); }
+      const res = await stopCurrentBrowser();
+      steps.push(res.alive.length ? `browser still running: pid ${res.alive.join(", ")}`
+        : res.verified ? `browser process gone${res.forced ? " (needed a signal)" : ""}`
+        : "context closed; process exit could not be verified on this platform");
+      if (res.tempNote) steps.push(res.tempNote);
     } else steps.push("no context held");
-    if (S.activeProfileIsTemp && S.activeProfileDir) {
-      try { rmSync(S.activeProfileDir, { recursive: true, force: true }); steps.push("temp profile removed"); } catch { steps.push("temp profile removal failed"); }
-    }
-    S.browserContext = null; S.pages = []; S.activePage = 0; S.browserUp = false;
-    S.activeProfileDir = null; S.activeProfileIsTemp = false;
-    consoleMessages.length = 0; networkRequests.length = 0; S.networkSeq = 0;
-    S.networkCaptureBodies = false; S.networkHandler = null; S.consoleHandler = null;
-    S.autoDialogHandler = null; S.autoDialogCfg = null; S.oneShotDialogArmed = false; S.oneShotDialogHandler = null;
     steps.push("server state reset");
     // A stale lock file means another Camoufox still owns the shared profile.
     let lockNote = "";

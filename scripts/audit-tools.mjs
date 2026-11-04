@@ -34,6 +34,8 @@ const registry = await new Promise((resolve, reject) => {
 const doc = readFileSync(TOOLS_MD, "utf8");
 const readme = readFileSync(README, "utf8");
 const problems = [];
+// Snake_case words in the README that are parameters or settings, not tools.
+const KNOWN_NON_TOOLS = new Set(["fresh_profile", "no_viewport", "reveal_values", "expires_days", "full_page", "last_exit", "fields_json", "submit_label", "access_token", "cf_clearance"]);
 
 // 1. every registered tool has a row of its own
 const sections = doc.split(/^### /m).slice(1);
@@ -64,11 +66,42 @@ if (undocumented.length) problems.push(`docs/TOOLS.md — not documented: ${undo
 if (declaredTotal !== registry.length) {
   problems.push(`docs/TOOLS.md — category counts sum to ${declaredTotal}, the server registers ${registry.length}`);
 }
-for (const [label, text] of [["README.md", readme]]) {
-  for (const m of text.matchAll(/\*\*(\d+) tools\*\*|## All (\d+) Tools|\| \*\*(\d+)\*\* \|/g)) {
-    const n = Number(m[1] || m[2] || m[3]);
-    if (n !== registry.length) problems.push(`${label} — says ${n} where the server registers ${registry.length}: "${m[0]}"`);
+const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+const agents = readFileSync(join(ROOT, "AGENTS.md"), "utf8");
+for (const [label, text] of [["README.md", readme], ["package.json description", pkg.description], ["AGENTS.md", agents], ["docs/TOOLS.md", doc.split("\n")[0]]]) {
+  for (const m of text.matchAll(/\b(\d+) tools\b/gi)) {
+    if (Number(m[1]) !== registry.length) problems.push(`${label} — says ${m[1]} where the server registers ${registry.length}: "${m[0]}"`);
   }
+}
+if (!/\b\d+ tools\b/i.test(readme)) problems.push("README.md — no longer states the tool count");
+
+// 3. the README's group tables agree with docs/TOOLS.md, group by group
+const docGroups = new Map(sections.map(s => {
+  const m = s.split("\n")[0].match(/^(.+?) \((\d+)\)\s*$/);
+  return m ? [m[1].replace(/\s*\(.*\)$/, ""), Number(m[2])] : null;
+}).filter(Boolean));
+let readmeSum = 0;
+for (const m of readme.matchAll(/^\| ([^|`]+?) \| (\d+) \| `/gm)) {
+  readmeSum += Number(m[2]);
+  if (docGroups.get(m[1]) !== Number(m[2])) problems.push(`README.md — group "${m[1]}" says ${m[2]}, docs/TOOLS.md says ${docGroups.get(m[1]) ?? "no such group"}`);
+}
+if (readmeSum !== registry.length) problems.push(`README.md — the group tables add up to ${readmeSum}, the server registers ${registry.length}`);
+for (const t of readme.matchAll(/`([a-z]+_[a-z0-9_]+)`/g)) {
+  if (!registry.includes(t[1]) && !KNOWN_NON_TOOLS.has(t[1])) problems.push(`README.md — mentions \`${t[1]}\`, which is not a registered tool`);
+}
+
+// 4. the README's plain-language rules, which drift the moment nobody is looking
+for (const [rx, why] of [
+  [/\bpkill\b|\bkillall\b/i, "advice to kill processes by pattern also hits the server and other agents' browsers"],
+  [/rm\s+-rf/i, "advice to delete folders can destroy a profile holding real logins"],
+  [/—/, "no em dashes"],
+  [/\b(unique|undetectable|bypasses|most feature-rich|100%|zero automation)\b/i, "no promotional or absolute claims"],
+  [/⭐|★/, "no star ratings"],
+  [/\b(gpt-[0-9o]|claude-[0-9a-z]|gemini-[0-9]|opus [0-9]|sonnet [0-9])/i, "no specific AI model names, use your-vision-model"],
+  [/^#+ .*[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/mu, "no emoji in headings"],
+]) {
+  const hit = readme.match(rx);
+  if (hit) problems.push(`README.md — "${hit[0].slice(0, 40)}": ${why}`);
 }
 
 console.log(`tools registered: ${registry.length} | documented: ${documented.size} | categories: ${sections.length}`);

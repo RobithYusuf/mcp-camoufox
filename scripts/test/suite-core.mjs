@@ -55,7 +55,7 @@ export default async function run() {
   const c = S.call;
 
   await check("browser_launch (fresh profile)", async () => {
-    const t = await c("browser_launch", { url: fx.url, headless: true, fresh_profile: true });
+    const t = await c("browser_launch", { url: fx.url, headless: true, fresh_profile: true, geoip: false });
     return [t.includes("Browser launched") && t.includes("Viewport:"), t.split("\n").pop()];
   });
   await check("reset_profile refuses while browser up", async () => {

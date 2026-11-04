@@ -28,14 +28,18 @@ export const S = {
   // both pass the "already running" guard and each build a context — the loser is
   // then unreachable by browser_close. Callers queue on this instead.
   launchInFlight: null as Promise<unknown> | null,
-  // console/network/dialog capture handlers, so they can be detached again
+  // Set while browser_close or browser_recover is stopping the browser on purpose,
+  // so the context's close event is not mistaken for a crash.
+  stopping: false,
+  // Why the last browser went away when no tool asked it to.
+  lastExitNote: "",
+  // console/network capture handlers, so they can be detached again
   consoleHandler: null as ((msg: any) => void) | null,
   networkHandler: null as ((res: any) => void) | null,
-  autoDialogHandler: null as ((d: Dialog) => void) | null,
+  // Dialog policy, read by the one listener trackPage attaches to every page. A
+  // one-shot answer beats the persistent one; with neither, the dialog is dismissed.
   autoDialogCfg: null as { action: "accept" | "dismiss"; promptText: string } | null,
-  oneShotDialogArmed: false,
-  // The live one-shot dialog handler, so trackPage can arm tabs opened later.
-  oneShotDialogHandler: null as null | ((d: any) => any),
+  oneShotDialog: null as { action: "accept" | "dismiss"; promptText: string } | null,
   networkCaptureBodies: false,
   networkSeq: 0,
   // Request interception. Routed on the CONTEXT, so tabs opened later are covered
@@ -49,13 +53,21 @@ export interface InterceptEntry { action: "block" | "allow"; type: string; url: 
 export const interceptLog: InterceptEntry[] = [];
 
 export function getPage(): Page {
-  if (!S.browserUp || S.pages.length === 0) {
-    throw new Error("Browser not running. Call browser_launch first.");
+  if (!S.browserUp) {
+    throw new Error(`Browser not running.${S.lastExitNote ? ` ${S.lastExitNote}` : ""} Call browser_launch first.`);
+  }
+  if (S.pages.length === 0) {
+    throw new Error("The browser is running but every tab is closed. Call tab_new to open one, or browser_close to stop it.");
   }
   if (S.activePage >= S.pages.length) S.activePage = 0;
   return S.pages[S.activePage];
 }
 
+
+// Every dialog the server has answered, newest last. A reply can then say a dialog
+// appeared, which a page cannot be asked about afterwards.
+export interface DialogEntry { seq: number; at: number; type: string; message: string; answer: string; }
+export const dialogLog: DialogEntry[] = [];
 
 // Buffers the capture tools share.
 export const consoleMessages: { type: string; text: string }[] = [];

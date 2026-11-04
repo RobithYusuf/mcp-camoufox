@@ -7,7 +7,7 @@ defaults; hard constraints may only be overridden when the developer explicitly 
 
 ## Product and repository map
 
-An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 133 tools over Camoufox, a
+An MCP server (stdio JSON-RPC) that gives an agent a stealth browser: 135 tools over Camoufox, a
 Firefox build with C++-level anti-fingerprinting. Published on npm as `mcp-camoufox`.
 
 ```
@@ -18,9 +18,12 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
 - `src/index.ts` — entry: connects stdio, imports the tool modules.
 - `src/state.ts` — the single mutable record `S`, page bookkeeping, shared capture buffers.
 - `src/helpers.ts` — refs, clicks, fills, snapshots, paths, TOTP.
-- `src/server.ts` — the `McpServer` instance and the `regTool` registry.
+- `src/redact.ts` — what a reply may show of a credential. Every masking decision lives here.
+- `src/lifecycle.ts` — finding, stopping and proving gone a browser process; temp profile cleanup.
+- `src/os-input.ts` — real OS cursor clicks for `os_click_xy`.
+- `src/server.ts` — the `McpServer` instance and the `regTool` registry, with the guarantees every tool shares.
 - `src/tools/*.ts` — the tools, grouped by area; each registers itself on import.
-- `scripts/test/` — the regression suites; `scripts/*.mjs` — release checks.
+- `scripts/test/` — the regression suites and the protocol sweep; `scripts/*.mjs` — release checks.
 - `docs/TOOLS.md` — the authoritative tool reference. `README.md` — the summary and the pitch.
 - `docs/images/` — proof screenshots.
 - Runtime data lives outside the repo: `~/.camoufox-mcp/{profile,screenshots,sessions}`.
@@ -66,20 +69,49 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
   inference.
 - `PKG_VERSION` is read from `package.json` via `createRequire`, so the MCP handshake version cannot
   drift from the published one.
+- `regTool` wraps every handler: a throw becomes an `isError` reply with credentials scrubbed, a call
+  past its deadline answers instead of hanging (`page.evaluate` has no timeout), and a dialog answered
+  during the call is named in a separate content item, so `evaluate`'s own text stays exactly its result.
+
+### Credentials in replies
+
+- A tool that can print a cookie, header, URL or body masks it through `redact.ts` by default and takes
+  `reveal_values=true`. Secret form fields go through `SECRET_FIELD_FN` and have no reveal option.
+- Playwright failures quote the element, including its `value` attribute, so `fill` on a disabled
+  password field printed the password. `scrubErrorText` handles that in `regTool`, and `fillLocator` cuts
+  the typed value from its own errors.
+- `cookie_import` refuses a masked export. It would overwrite a real login with the placeholder.
+- Not masked, on purpose: `evaluate` output, and page URLs from `navigate`, `get_url` and `tab_list`,
+  which an agent has to be able to use. A secret in free text under an ordinary name is not detectable.
 
 ### Refs, clicking and filling
 
 - `browser_snapshot` injects `data-mcp-ref` attributes; `refLocator(page, ref)` is the only place that
   selector is written. Refs are numbered before any role/offset/limit filtering, so they stay stable.
-- `clickWithFallback` returns `"real" | "fallback"` and every click tool appends `clickNote(mode)`. A
+- `clickWithFallback` returns `{mode, blocker}` and every click tool appends `clickNote(result)`. A
   blocked click must never read as a clean one. The fallback replays the full pointer sequence
   (`pointerover/pointerdown/mousedown/pointerup/mouseup` then `el.click()`), because a bare
   `el.click()` does nothing on Radix, Headless UI and MUI.
+- The fallback is only for a left click on a visible, enabled element something covers. A disabled element
+  ignores it, a hidden one fires a handler no user could reach, and a blocked right or double click used to
+  replay as a LEFT click. Those three are refused and nothing is fired.
+- `observeClick` reports what the page did: navigated, content changed, opened a tab, or nothing. It compares
+  a hash of the HTML plus form state. Comparing lengths reads a counter going 1 to 2 as no change. Focus is
+  not a reaction and scroll is excluded, because Playwright scrolls the target into view first. A fallback
+  click that changed nothing is an error.
+- `page.mouse` knows nothing about what is under it. Tools aiming at an element by coordinates run
+  `hitTestAt` first, a Playwright trial click, so a covered element is refused instead of reporting a clean
+  click the cover received.
+- `locator.evaluate` needs a real function. A string is evaluated and never called on Firefox, and the tool
+  quietly gets undefined. To splice `SECRET_FIELD_FN` in, build one with `elementFn(body)`.
+- `SNAPSHOT_JS` clears old `data-mcp-ref` attributes first. Otherwise one ref names two elements after a
+  re-snapshot, and `refLocator`'s `.first()` can pick the one now hidden.
 - `click_text` and `click_role` refuse to guess: more than one match fails with a numbered candidate
   list. `within` (`"@dialog"`, a CSS selector, or `"ref:e5"`) or `index` disambiguates. Taking
   `.first()` once clicked a page header's "Cancel" instead of the dialog's and destroyed a filled form.
 - Always fill through `fillLocator`. Firefox's select-all is a no-op on `input[type=email]` and
-  `[type=number]`, so a plain `locator.fill()` appends to the old value.
+  `[type=number]`, so a plain `locator.fill()` appends to the old value. It restores the old value when the
+  fill then fails: clearing first used to wipe disabled and readonly fields while reporting an error.
 - `formatSnapshot` caps its element list at `MAX_SNAPSHOT_CHARS` (60k). A 6,000-element page produced a
   566,000-character response with no warning at all; it now stops and prints the exact `offset=` call to
   continue, plus the `roles=` and `extract_structured` alternatives.
@@ -114,15 +146,30 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
   handlers to new tabs.
 - The active tab is tracked by page **identity**, not index. Closing a lower-indexed tab must not move
   "active" to a different page.
-- A one-shot `dialog_handle` arms tabs opened later too (`S.oneShotDialogHandler`, armed by `trackPage`).
-  It tells the persistent handler to stand down globally, so arming only the tabs that existed at the
-  time left a dialog on a newer tab with no handler at all — and a registered listener suppresses
-  Playwright's auto-dismiss, blocking that page forever.
+- Dialogs have one listener per page, attached by `trackPage`, reading `S.oneShotDialog` then
+  `S.autoDialogCfg`. A registered listener suppresses Playwright's auto-dismiss, so it must answer every
+  dialog or that page blocks forever. A dialog cannot stay open to be answered later: `dialog_handle` armed
+  too late says one already went by, and applies to the next.
 - `console_start`/`network_start` attach to every page and detach any previous handler first, so
   re-calling never stacks listeners. `browser_close` nulls the handler refs and clears the buffers.
 - `browser_launch` claims its launch slot synchronously before the first `await`. The SDK dispatches
   requests concurrently, and two launches otherwise each build a context — the loser unreachable by
   `browser_close`.
+
+### Browser lifecycle
+
+- "Closed" is a claim about a process. `stopBrowser` closes the context, then checks `ps` for `-profile <dir>`,
+  and escalates to signals only against this server's own descendants on that exact profile. A shared pattern
+  would hit a browser another agent or the developer is using. Windows has no such listing, so the reply says
+  the exit could not be verified.
+- A temp profile is removed only when no process is on it (`removeTempProfile`).
+- The context's `close` event resets all state. Without it a crashed browser left `browser_up: true` and
+  `browser_launch` refusing forever. All state is cleared in one place, `resetBrowserState`.
+- Closing every tab leaves the browser alive, so `browser_launch` opens a tab in it instead of a second browser.
+- `index.ts` shuts down on stdin end as well as on signals. A client that crashes only closes stdin, and the
+  browser's pipes then keep the server alive forever. Playwright's signal handlers are off so ours can finish.
+- Temp folder names carry the owner's PID (`profile-fresh-p<pid>-…`). The next launch removes one whose owner
+  is dead and that no process is on. Older names have no owner to check and are only counted in `server_status`.
 
 ### The browserless HTTP path
 
@@ -162,6 +209,20 @@ These are platform truths, not preferences. Each one cost a release.
   and `tab_new` discards a tab whose first navigation never committed and retries on a fresh one. Do
   NOT re-issue `goto` on a page whose navigation is still in flight: both calls then fail, which broke
   every CSP navigation when it was tried. A 30s timeout from `navigate` is this flake — retry it.
+- `camoufox.cfg` sets `browser.sessionhistory.max_entries` to 0, which turns history off: `page.goBack` answers
+  null and `history.back()` does nothing, even over a pushState entry, while every reply said "Went back".
+  `browser_launch` sets it to 50, stock Firefox's value. `history.length` proves nothing either way:
+  camoufox-js randomises it.
+- Once the pointer has been inside a page, `page.mouse.move` to y in [0, 1) is never answered (Playwright floors
+  it to 0; y=1 and y=-5 are fine), and later mouse calls on that tab wait behind it. A stepped move crossing the
+  top edge lands on 0 only sometimes, which looked like a random wedge for months. Always use `pointerMove` and
+  `pointerClick`, which hold y at 1 or more.
+- Playwright starts a headed Firefox with `-foreground`, which takes keyboard focus from whatever the developer
+  is typing in. `browser_launch` drops it with `ignoreDefaultArgs`.
+- `page.waitForURL` waits for the load event by default, and `waitForLoadState` for a lifecycle event, so both
+  break after the fifth page. Use `waitForUrl` and `waitReady`.
+- `setViewportSize` with a non-positive size hangs and leaves the page with no usable viewport, after which every
+  real click fails its actionability check. `set_viewport_size` validates first.
 - `page.url()` is a function, not a property.
 - `mouse.wheel()` silently no-ops; scroll with `window.scrollBy` via evaluate.
 - `page.pdf()` is Chromium-only and always throws here; `save_pdf` catches it and points at
@@ -195,8 +256,11 @@ These are platform truths, not preferences. Each one cost a release.
 
 - `docs/TOOLS.md` is the authoritative tool reference — every tool, with its parameters — and must be
   updated in the same change that adds, removes or modifies a tool, including the `### Category (N)`
-  count in its heading. `README.md` carries the category summary, the hero count, the comparison table
-  and the troubleshooting rows; update those too when they are affected.
+  count in its heading. `README.md` carries the group tables, the tool count, the test results and the
+  troubleshooting rows; update those too when they are affected.
+- README wording: plain language, measured results with their limits. A demo on a Cloudflare test sitekey
+  (`1x`, `2x`, `3x`) is not proof of passing a real site. No advice to `pkill` a browser or delete a profile.
+  `npm run audit:tools` enforces what it can.
 - Run `npm run audit:tools` instead of counting by eye. It diffs the live `tools/list` against
   `docs/TOOLS.md` and the README's counts, and exits non-zero on a mismatch. Both failure modes it
   catches had already happened: a tool documented nowhere, and a heading that still said "Debug (5)"
@@ -206,17 +270,23 @@ These are platform truths, not preferences. Each one cost a release.
 ## Verification and debugging
 
 ```bash
-npm test                 # 94 checks, three suites, real browser over MCP stdio
+npm test                 # four suites, real browser over MCP stdio, sandboxed HOME
+npm run test:sweep       # EVERY tool over a real MCP client, effects read from the page (minutes)
 npm test -- core         # one suite
 npm test -- --parallel   # all three at once (~27s vs ~52s); each owns its browser and port
 MCPC_ONLY=snapshot npm test -- core   # only checks whose name matches — debugging aid, NOT a verification
 npm run test:schema      # dump every tool name/description/schema
 npm run smoke:install    # install the PUBLISHED package and drive a real browser
-npm run audit:tools      # diff docs/TOOLS.md + README counts against the live tool registry
+npm run audit:tools      # diff docs/TOOLS.md + README against the live tool registry, plus README wording rules
 npm run smoke:real       # drive real sites (CSP, inline SVG, 6 tabs, interception) — run before publishing
 ```
 
 - Use evidence proportional to the risk, but a change to a shared helper means the whole suite.
+- A new tool needs an entry in `scripts/test/sweep.mjs`: one success path and one failure path, with the effect
+  read back from the page. The sweep fails on a tool with no entry. It found `go_back` moving nowhere since the
+  first release while 98 checks stayed green, because those checks read the words in the reply.
+- `MCP_TEST_DIST=<path>/dist/index.js npm run test:sweep` runs the sweep against another build, which is the
+  quick way to prove a check fails without its fix.
 - A local fixture is not a real site. Three bugs shipped while the local suite was green: `eval()`-based
   polling died on every strict CSP, `browser_launch` produced a viewport no real window could have, and
   `detect_content_pattern` threw on any inline SVG. No fixture had a CSP header, a window manager or an
@@ -228,11 +298,11 @@ npm run smoke:real       # drive real sites (CSP, inline SVG, 6 tabs, intercepti
 - Before a refactor, snapshot the tool surface and diff it afterwards. On its first real use this
   caught a rename leaking into English prose inside three tool descriptions — something TypeScript
   cannot see.
-- Release order: `npx tsc` → `npm test` → `npm run audit:tools` → `npm run smoke:real` → version bump →
+- Release order: `npx tsc` → `npm test` → `npm run test:sweep` → `npm run smoke:real` → version bump →
   `npm publish` → `npm run smoke:install`
   against the published version → commit and push.
-- The suites use `fresh_profile: true`; the shared profile may be locked by a browser the developer is
-  already running.
+- The suites use `fresh_profile: true` and a throwaway HOME, so they cannot reach `~/.camoufox-mcp`. Pass
+  `geoip: false` when launching: the default calls a public IP service.
 - Every suite cleans up in a `finally` (browser closed, fixture closed, server killed) and takes an
   OS-assigned port. Both were added after crashed runs leaked Camoufox processes and left a fixed port
   bound, so the *next* run died on `EADDRINUSE` and the real failure was never visible.

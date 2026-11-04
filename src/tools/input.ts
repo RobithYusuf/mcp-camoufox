@@ -5,15 +5,16 @@ import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { getPage } from "../state.js";
-import { ACTION_TIMEOUT, clickWithFallback, clickNote, fillLocator, refLocator,
-         scopeRoot, describeMatches, candidateList } from "../helpers.js";
+import { ACTION_TIMEOUT, clickWithFallback, clickReply, fillLocator, refLocator, SECRET_FIELD_FN, elementFn,
+         maskedField, isSecretLocator, scopeRoot, describeMatches, candidateList, navSeqOf, lastNavAt, waitReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Element Interaction ─────────────────────────────────────────────
 
 regTool(
   "click",
-  "Click element by ref ID from browser_snapshot. Auto JS-fallback for overlays.",
+  "Click element by ref ID from browser_snapshot and report what the page did (navigated, changed, opened a tab, or nothing). " +
+    "When a covering element blocks a left click it falls back to synthetic pointer events and says so. Disabled or hidden elements are refused.",
   {
     ref: z.string().describe("Element ref (e.g. 'e5')"),
     button: z.enum(["left", "right", "middle"]).default("left"),
@@ -21,9 +22,7 @@ regTool(
   },
   async ({ ref, button, dblclick }) => {
     const page = getPage();
-    const mode = await clickWithFallback(refLocator(page, ref), { button, dblclick });
-    await page.waitForTimeout(1000);
-    return { content: [{ type: "text", text: `Clicked ref=${ref}. URL: ${page.url()}${clickNote(mode)}` }] };
+    return clickReply(page, `Clicked ref=${ref}`, () => clickWithFallback(refLocator(page, ref), { button, dblclick }));
   }
 );
 
@@ -61,9 +60,7 @@ regTool(
       return { content: [{ type: "text", text: `index=${index} out of range — only ${n} match(es) for text='${text}'${scope}.` }], isError: true };
     }
     const target = index >= 0 ? loc.nth(index) : loc.first();
-    const mode = await clickWithFallback(target);
-    await page.waitForTimeout(1000);
-    return { content: [{ type: "text", text: `Clicked text='${text}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}. URL: ${page.url()}${clickNote(mode)}` }] };
+    return clickReply(page, `Clicked text='${text}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}`, () => clickWithFallback(target));
   }
 );
 
@@ -101,9 +98,7 @@ regTool(
       return { content: [{ type: "text", text: `index=${index} out of range — only ${n} match(es) for role=${role} name='${ariaName}'${scope}.` }], isError: true };
     }
     const target = index >= 0 ? loc.nth(index) : loc.first();
-    const mode = await clickWithFallback(target);
-    await page.waitForTimeout(1000);
-    return { content: [{ type: "text", text: `Clicked role=${role} name='${ariaName}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}. URL: ${page.url()}${clickNote(mode)}` }] };
+    return clickReply(page, `Clicked role=${role} name='${ariaName}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}`, () => clickWithFallback(target));
   }
 );
 
@@ -123,11 +118,7 @@ regTool("fill", "Fill input/textarea by ref ID. Always replaces existing content
   const loc = refLocator(page, ref);
   await fillLocator(loc, value);
   // Never echo a password back into the agent transcript / logs.
-  const secret = await loc.evaluate((el: any) => {
-    const t = String(el.type || "").toLowerCase();
-    const hint = `${el.name || ""} ${el.id || ""} ${el.getAttribute("autocomplete") || ""}`.toLowerCase();
-    return t === "password" || /pass|secret|token|otp|cvv|card|pin/.test(hint);
-  }).catch(() => false);
+  const secret = await isSecretLocator(loc);
   return { content: [{ type: "text", text: secret
     ? `Filled ref=${ref} (${value.length} chars, value masked — looks like a secret field)`
     : `Filled ref=${ref} with '${value.slice(0, 50)}'` }] };
@@ -160,8 +151,16 @@ regTool("type_text", "Type text char by char via keyboard.", {
   delay: z.number().default(50).describe("Delay between keys (ms)"),
 }, async ({ text, delay }) => {
   const page = getPage();
+  const focus = JSON.parse(await page.evaluate(`(function () {
+    var el = document.activeElement;
+    var editable = !!el && el !== document.body && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+    return JSON.stringify({ editable: editable, secret: editable && (${SECRET_FIELD_FN})(el) });
+  })()`) as string);
   await page.keyboard.type(text, { delay });
-  return { content: [{ type: "text", text: `Typed: '${text.slice(0, 50)}'` }] };
+  // Keys sent with nothing focused go to the page. A page may listen for that, so they
+  // are still sent, but "Typed" alone would imply they landed in a field.
+  const note = focus.editable ? "" : " ⚠ No editable field was focused, so these keys went to the page itself. Click or fill the field first if they were meant for it.";
+  return { content: [{ type: "text", text: `Typed: ${focus.secret ? maskedField(text.length) : `'${text.slice(0, 50)}'`}${note}` }] };
 });
 
 regTool("press_key", "Press key or combo (Enter, Escape, Control+a, etc.).", {
@@ -193,11 +192,18 @@ regTool("wait_for", "Wait for element/text to appear or disappear.", {
   return { content: [{ type: "text", text: `Waited ${timeout}ms` }] };
 });
 
-regTool("wait_for_navigation", "Wait for page load to complete.", {
+regTool("wait_for_navigation", "Wait for a navigation to happen and finish. Counts one that finished in the last 2s, since it may have completed before this call. Fails if none is seen.", {
   timeout: z.number().default(15000),
 }, async ({ timeout }) => {
   const page = getPage();
-  await page.waitForLoadState("domcontentloaded", { timeout });
+  const started = Date.now(), seq = navSeqOf(page);
+  const recent = started - lastNavAt(page) < 2000;
+  while (!recent && navSeqOf(page) === seq && Date.now() - started < timeout) await page.waitForTimeout(50);
+  if (!recent && navSeqOf(page) === seq) {
+    return { content: [{ type: "text", text: `No navigation happened within ${timeout}ms. URL: ${page.url()}` }], isError: true };
+  }
+  // Polls the document: the load events stop arriving after the fifth page in a context.
+  await waitReady(page, "domcontentloaded", Math.max(1000, timeout - (Date.now() - started)));
   return { content: [{ type: "text", text: `Navigation complete. URL: ${page.url()}` }] };
 });
 
@@ -215,13 +221,13 @@ regTool(
     timeout: z.number().default(15000).describe("Max wait in ms"),
   },
   async ({ conditions, timeout }) => {
+    const page = getPage();
     if (!conditions || conditions.length === 0) {
       return {
         content: [{ type: "text", text: "Error: conditions array is empty" }],
         isError: true,
       };
     }
-    const page = getPage();
     const deadline = Date.now() + timeout;
 
     // Poll-based race — works for url/title (no native waitFor for those across all kinds)
@@ -259,6 +265,7 @@ regTool(
     }
     return {
       content: [{ type: "text", text: `timeout: no condition matched within ${timeout}ms. Current URL: ${page.url()}` }],
+      isError: true,
     };
   }
 );
@@ -296,9 +303,17 @@ regTool("get_html", "Get HTML content from page or element.", {
 }, async ({ selector, outer }) => {
   const page = getPage();
   const loc = page.locator(selector).first();
-  let html = outer
-    ? await loc.evaluate((el: any) => el.outerHTML)
-    : await loc.innerHTML({ timeout: ACTION_TIMEOUT });
+  // A server-rendered value="…" on a secret field is in the markup, so it goes from a
+  // copy before the HTML leaves the page.
+  let html: string = await loc.evaluate(elementFn(`
+    var isSecret = ${SECRET_FIELD_FN};
+    var copy = el.cloneNode(true);
+    var fields = [copy].concat(Array.prototype.slice.call(copy.querySelectorAll("input, textarea")));
+    for (var i = 0; i < fields.length; i++) {
+      if (fields[i].getAttribute && fields[i].hasAttribute("value") && isSecret(fields[i])) fields[i].setAttribute("value", "***");
+    }
+    return ${outer ? "copy.outerHTML" : "copy.innerHTML"};
+  `), undefined, { timeout: ACTION_TIMEOUT });
   if (html.length > 10000) html = html.slice(0, 10000) + `\n<!-- truncated -->`;
   return { content: [{ type: "text", text: html }] };
 });

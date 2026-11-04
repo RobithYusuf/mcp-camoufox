@@ -4,13 +4,14 @@
 import { z } from "zod";
 import { Camoufox } from "camoufox-js";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
-import { mkdirSync, rmSync } from "fs";
+import { mkdirSync } from "fs";
 import { join } from "path";
-import { S, PROFILE_DIR, PROFILE_PARENT, SCREENSHOT_DIR, getPage, ensureDirs,
-         consoleMessages, networkRequests, storageSnapshots } from "../state.js";
+import { S, PROFILE_DIR, SCREENSHOT_DIR, getPage, ensureDirs,
+         consoleMessages, networkRequests, storageSnapshots, interceptLog, dialogLog } from "../state.js";
 import { ACTION_TIMEOUT, safeName, ERROR_HOOK_JS, refLocator,
          snapshotPage,
-         trackPage, gotoReady, waitReady, settle } from "../helpers.js";
+         trackPage, gotoReady, waitReady, settle, historyStep } from "../helpers.js";
+import { stopBrowser, removeTempProfile, tempProfilePath, sweepAbandonedTempProfiles } from "../lifecycle.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Browser Lifecycle ───────────────────────────────────────────────
@@ -51,6 +52,55 @@ async function ensureCamoufoxBinary() {
   console.error("\n[mcp-camoufox] Download complete.\n");
 }
 
+// Forget the browser. Everything a session holds lives here, so close, recover and an
+// unexpected exit cannot each forget something different.
+export function resetBrowserState(): void {
+  S.browserContext = null;
+  S.pages = [];
+  S.activePage = 0;
+  S.browserUp = false;
+  S.activeProfileDir = null;
+  S.activeProfileIsTemp = false;
+  consoleMessages.length = 0;
+  networkRequests.length = 0;
+  S.networkSeq = 0;
+  S.networkCaptureBodies = false;
+  S.networkHandler = null;
+  S.consoleHandler = null;
+  S.autoDialogCfg = null;
+  S.oneShotDialog = null;
+  S.interceptHandler = null; S.interceptBlocked = 0; S.interceptAllowed = 0;
+  interceptLog.length = 0;
+  dialogLog.length = 0;
+  storageSnapshots.clear();
+}
+
+/** Stop the current browser and remove its temp profile only once it is gone. */
+export async function stopCurrentBrowser(): Promise<{ verified: boolean; alive: number[]; forced: boolean; tempNote: string }> {
+  const ctx = S.browserContext, dir = S.activeProfileDir, isTemp = S.activeProfileIsTemp;
+  S.stopping = true;
+  try {
+    const res = await stopBrowser(ctx, dir);
+    let tempNote = "";
+    if (isTemp && dir) {
+      if (res.alive.length) tempNote = `Temp profile kept at ${dir}: the browser is still running on it.`;
+      else {
+        const problem = removeTempProfile(dir);
+        tempNote = problem ? `Temp profile NOT removed (${dir}): ${problem}` : `Temp profile removed (${dir}).`;
+      }
+    }
+    return { ...res, tempNote };
+  } finally {
+    resetBrowserState();
+    S.stopping = false;
+  }
+}
+
+/** Used when the server itself is going away. */
+export async function shutdownBrowser(): Promise<void> {
+  if (S.browserContext) await stopCurrentBrowser();
+}
+
 regTool(
   "browser_launch",
   "Launch Camoufox stealth browser and navigate to URL. Browser persists between calls. " +
@@ -80,6 +130,14 @@ regTool(
     // already-running path rather than building a second context.
     if (S.launchInFlight) { try { await S.launchInFlight; } catch {} }
     if (S.browserUp && S.browserContext) {
+      // Every tab was closed. The browser is still alive, so open a tab in it: starting
+      // a second one on the same profile would fail, and getPage here used to answer
+      // "call browser_launch first" from inside browser_launch, for ever.
+      if (S.pages.length === 0) {
+        const fresh = await S.browserContext.newPage();
+        trackPage(fresh);
+        S.activePage = S.pages.indexOf(fresh);
+      }
       const page = getPage();
       if (url && url !== "about:blank") {
         await gotoReady(page, url, "domcontentloaded", 30000);
@@ -100,10 +158,10 @@ regTool(
     // Pick profile dir: fresh temp dir or shared persistent
     let profileDir = PROFILE_DIR;
     let isTemp = false;
+    // A crashed server cannot clean up after itself, so the next launch does.
+    sweepAbandonedTempProfiles();
     if (fresh_profile) {
-      const ts = Date.now();
-      const rand = Math.random().toString(36).slice(2, 8);
-      profileDir = join(PROFILE_PARENT, `profile-fresh-${ts}-${rand}`);
+      profileDir = tempProfilePath();
       mkdirSync(profileDir, { recursive: true });
       isTemp = true;
     }
@@ -132,24 +190,49 @@ regTool(
           ? { viewport: null }
           : { window: [w, h] as [number, number], viewport: { width: w, height: Math.max(200, h - 80) } }),
         i_know_what_im_doing: true,
+        // Playwright starts a headed Firefox with -foreground, which pulls the window
+        // to the front and takes the keyboard from whatever the developer is typing in.
+        ...(headless ? {} : { ignoreDefaultArgs: ["-foreground"] }),
+        // index.ts closes the browser and removes a temp profile on these. Playwright's
+        // own handlers would race it and could exit first.
+        handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
         firefox_user_prefs: {
           "permissions.default.desktop-notification": 2,
           "dom.webnotifications.enabled": false,
           "browser.translations.automaticallyPopup": false,
+          // camoufox.cfg sets this to 0, which turns history off: goBack answers null
+          // and history.back() does nothing, even over a pushState entry. 50 is stock
+          // Firefox's own value.
+          "browser.sessionhistory.max_entries": 50,
           // Lets navigator.clipboard.writeText work without a user gesture, so
           // paste_text can deliver a REAL (trusted) paste event. Firefox refuses
           // to attach clipboardData to a synthetic ClipboardEvent, so without
           // this a paste-only framework field can never be filled.
           "dom.events.testing.asyncClipboard": true,
         },
-      }) as BrowserContext;
+      } as any) as BrowserContext;
     } catch (e) {
-      // Don't leak the freshly-created temp profile dir if launch failed.
-      if (isTemp) { try { rmSync(profileDir, { recursive: true, force: true }); } catch {} }
+      // Leave nothing behind from a launch that failed, unless a process somehow
+      // still holds the folder.
+      await stopBrowser(null, profileDir).catch(() => {});
+      if (isTemp) removeTempProfile(profileDir);
       throw e;
     }
 
     S.browserContext = ctx;
+    S.lastExitNote = "";
+    // Locator calls without their own timeout default to 30s, half of what most MCP
+    // clients allow, for an answer that is nearly always "that element is not there".
+    ctx.setDefaultTimeout(10000);
+    // The browser can go away without a tool asking: a crash, a kill, the user quitting
+    // it. Without this, browser_up stayed true and browser_launch refused for ever.
+    ctx.on("close", () => {
+      if (S.stopping || S.browserContext !== ctx) return;
+      const dir = S.activeProfileDir, temp = S.activeProfileIsTemp;
+      resetBrowserState();
+      S.lastExitNote = "The last browser exited unexpectedly (it crashed or was closed from outside).";
+      if (temp && dir) removeTempProfile(dir);
+    });
     // Page-error hook must be installed before the first navigation so
     // get_page_errors has something to read (it runs on every page load).
     try { await ctx.addInitScript(ERROR_HOOK_JS); } catch {}
@@ -191,8 +274,14 @@ regTool(
     }
 
     if (url && url !== "about:blank") {
-      await gotoReady(page, url, "domcontentloaded", 30000);
-      await settle(page, 1500);
+      try {
+        await gotoReady(page, url, "domcontentloaded", 30000);
+        await settle(page, 1500);
+      } catch (e: any) {
+        // Worth a distinct reply: the launch itself worked and the browser is running,
+        // so the caller should navigate again rather than launch again.
+        return { content: [{ type: "text", text: `The browser launched and is running, but the first navigation failed: ${String(e?.message || e)}\nCall navigate to try another URL, or browser_close to stop it.` }], isError: true };
+      }
     }
     const title = await page.title();
     const profileNote = isTemp ? " (fresh temp profile)" : "";
@@ -226,51 +315,32 @@ regTool(
     "If the launch used fresh_profile=true, the temp profile is removed.",
   {},
   async () => {
+    if (!S.browserContext) {
+      return { content: [{ type: "text", text: "No browser is running, so there is nothing to close." }] };
+    }
+    const isTemp = S.activeProfileIsTemp;
     // Say what actually persists. "Profile saved" alone was misleading: session
     // cookies (no expiry) live in memory and die here, which reads as "the
     // profile lost my login".
     let cookieNote = "";
-    if (S.browserContext) {
-      try {
-        const cookies = await S.browserContext.cookies();
-        const session = cookies.filter((c: any) => !c.expires || c.expires <= 0).length;
-        const persisted = cookies.length - session;
-        cookieNote = ` Cookies: ${persisted} persisted, ${session} session-only (dropped — standard browser behaviour; use cookie_set(expires_days=…) or storage_state_save to keep a login).`;
-      } catch {}
+    try {
+      const cookies = await Promise.race([
+        S.browserContext.cookies(),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 3000)),
+      ]);
+      const session = cookies.filter((c: any) => !c.expires || c.expires <= 0).length;
+      const persisted = cookies.length - session;
+      cookieNote = ` Cookies: ${persisted} persisted, ${session} session-only (dropped — standard browser behaviour; use cookie_set(expires_days=…) or storage_state_save to keep a login).`;
+    } catch {}
+    const res = await stopCurrentBrowser();
+    // "Closed" is a claim about a process, so it is only made after looking.
+    if (res.alive.length) {
+      return { content: [{ type: "text", text: `The browser did NOT exit: pid ${res.alive.join(", ")} is still running on the profile. ${res.tempNote}` }], isError: true };
     }
-    if (S.browserContext) {
-      try { await S.browserContext.close(); } catch {}
-    }
-    let note = "Profile saved." + cookieNote;
-    if (S.activeProfileIsTemp && S.activeProfileDir) {
-      try {
-        rmSync(S.activeProfileDir, { recursive: true, force: true });
-        note = `Temp profile removed (${S.activeProfileDir}).`;
-      } catch (e: any) {
-        note = `Profile saved. Warning: failed to remove temp profile: ${e?.message || e}`;
-      }
-    }
-    S.browserContext = null;
-    S.pages = [];
-    S.activePage = 0;
-    S.browserUp = false;
-    S.activeProfileDir = null;
-    S.activeProfileIsTemp = false;
-    // Reset capture state so a later launch doesn't read stale cross-session
-    // data and the handlers don't pin closed page objects.
-    consoleMessages.length = 0;
-    networkRequests.length = 0;
-    S.networkSeq = 0;
-    S.networkCaptureBodies = false;
-    S.networkHandler = null;
-    S.consoleHandler = null;
-    S.autoDialogHandler = null;
-    S.autoDialogCfg = null;
-    S.oneShotDialogArmed = false;
-    S.oneShotDialogHandler = null;
-    S.interceptHandler = null; S.interceptBlocked = 0; S.interceptAllowed = 0;
-    storageSnapshots.clear();
-    return { content: [{ type: "text", text: `Browser closed. ${note}` }] };
+    const proof = res.verified
+      ? `Process exit verified${res.forced ? " (it had to be stopped with a signal)" : ""}.`
+      : "Process exit could NOT be verified on this platform.";
+    return { content: [{ type: "text", text: `Browser closed. ${proof} ${isTemp ? res.tempNote : `Profile saved.${cookieNote}`}` }] };
   }
 );
 
@@ -324,18 +394,18 @@ regTool(
   }
 );
 
-regTool("go_back", "Navigate back in history.", {}, async () => {
+regTool("go_back", "Navigate back in history. Fails when the page does not move.", {}, async () => {
   const page = getPage();
-  await page.goBack({ waitUntil: "commit", timeout: 15000 });
-  await waitReady(page, "domcontentloaded", 15000);
-  return { content: [{ type: "text", text: `Went back. URL: ${page.url()}` }] };
+  const { moved, url } = await historyStep(page, "back", 15000);
+  if (!moved) return { content: [{ type: "text", text: `Did not go back: no previous page in this tab's history. URL: ${url}` }], isError: true };
+  return { content: [{ type: "text", text: `Went back. URL: ${url}` }] };
 });
 
-regTool("go_forward", "Navigate forward in history.", {}, async () => {
+regTool("go_forward", "Navigate forward in history. Fails when the page does not move.", {}, async () => {
   const page = getPage();
-  await page.goForward({ waitUntil: "commit", timeout: 15000 });
-  await waitReady(page, "domcontentloaded", 15000);
-  return { content: [{ type: "text", text: `Went forward. URL: ${page.url()}` }] };
+  const { moved, url } = await historyStep(page, "forward", 15000);
+  if (!moved) return { content: [{ type: "text", text: `Did not go forward: no next page in this tab's history. URL: ${url}` }], isError: true };
+  return { content: [{ type: "text", text: `Went forward. URL: ${url}` }] };
 });
 
 regTool("reload", "Reload the current page.", {}, async () => {

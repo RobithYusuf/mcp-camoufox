@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.png
+!docs/images/*.png
 *.pdf
 .DS_Store
 PLAN-CHROMIUM-STEALTH.md

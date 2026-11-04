@@ -5,8 +5,9 @@ import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { S, getPage } from "../state.js";
-import { jsStr, clickWithFallback, clickNote, refLocator,
+import { jsStr, clickWithFallback, clickNote, refLocator, SECRET_FIELD_FN, elementFn, historyStep,
          scopeRoot, describeMatches, candidateList, snapshotPage, waitReady, settle } from "../helpers.js";
+import { maskedValue } from "../redact.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Scraping / Extraction ───────────────────────────────────────────
@@ -247,7 +248,8 @@ regTool("extract_table", "Extract data from an HTML table as JSON array.", {
       out.push(row);
     }
     return { headers: headers, total_rows: rows.length - start, extracted: out.length, rows: out };
-  })()`);
+  })()`) as any;
+  if (results?.error) return { content: [{ type: "text", text: `No table matches selector "${selector}".` }], isError: true };
   return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 });
 
@@ -361,8 +363,8 @@ regTool(
 
 regTool("back_and_snapshot", "Navigate back + return snapshot.", {}, async () => {
   const page = getPage();
-  await page.goBack({ waitUntil: "commit", timeout: 15000 });
-  await waitReady(page, "domcontentloaded", 15000);
+  const { moved, url } = await historyStep(page, "back", 15000);
+  if (!moved) return { content: [{ type: "text", text: `Did not go back: no previous page in this tab's history. URL: ${url}` }], isError: true };
   await settle(page, 500);
   const snap = await snapshotPage(page);
   return { content: [{ type: "text", text: snap }] };
@@ -389,7 +391,7 @@ regTool(
     const mode = await clickWithFallback(refLocator(page, ref));
     await page.waitForTimeout(wait_ms);
     const snap = await snapshotPage(page);
-    return { content: [{ type: "text", text: (mode === "real" ? "" : `NOTE:${clickNote(mode)}\n\n`) + snap }] };
+    return { content: [{ type: "text", text: (mode.mode === "real" ? "" : `NOTE:${clickNote(mode)}\n\n`) + snap }] };
   }
 );
 
@@ -446,18 +448,18 @@ regTool(
       const { total, items } = await describeMatches(loc);
       return { content: [{ type: "text", text: `${total} inputs match label "${label}" — choose one by ref:\n${candidateList(total, items)}` }] };
     }
-    const info = await loc.first().evaluate((el: any) => {
-      const ref = 'l' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
+    const info = await loc.first().evaluate(elementFn(`
+      var ref = 'l' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
       el.setAttribute('data-mcp-ref', ref);
       return {
-        ref,
+        ref: ref,
         tag: el.tagName.toLowerCase(),
         type: el.type || '',
         name: el.name || '',
         placeholder: el.placeholder || '',
-        value: el.value || '',
+        value: (${SECRET_FIELD_FN})(el) ? (el.value ? '••• ' + el.value.length + ' chars (masked)' : '') : (el.value || ''),
       };
-    });
+    `));
     return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
   }
 );
@@ -503,12 +505,14 @@ regTool(
   "Export all cookies as JSON string. Use with cookie_import to transfer session.",
   {
     domain: z.string().default("").describe("Filter by domain (empty = all)"),
+    reveal_values: z.boolean().default(false).describe("Include real cookie values, which cookie_import needs. A cookie is a login, so they are masked by default. cookie_export_file writes them to a 0600 file without printing them."),
   },
-  async ({ domain }) => {
+  async ({ domain, reveal_values }) => {
     if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
     let cookies = await S.browserContext.cookies();
     if (domain) cookies = cookies.filter(c => c.domain.includes(domain));
-    return { content: [{ type: "text", text: JSON.stringify(cookies, null, 2) }] };
+    const shown = reveal_values ? cookies : cookies.map((c: any) => ({ ...c, value: maskedValue(c.value) }));
+    return { content: [{ type: "text", text: JSON.stringify(shown, null, 2) }] };
   }
 );
 
@@ -525,7 +529,12 @@ regTool(
       cookies = JSON.parse(cookies_json);
       if (!Array.isArray(cookies)) throw new Error("not an array");
     } catch (e: any) {
-      return { content: [{ type: "text", text: `Invalid cookies JSON: ${e.message}` }] };
+      return { content: [{ type: "text", text: `Invalid cookies JSON: ${e.message}` }], isError: true };
+    }
+    // A masked export pasted back in would overwrite real logins with the placeholder.
+    const masked = cookies.filter(c => /^\*\*\*\(\d+ chars\)$/.test(String(c?.value)));
+    if (masked.length) {
+      return { content: [{ type: "text", text: `Refused: ${masked.length} cookie(s) hold a masked placeholder, not a value. Export with cookie_export(reveal_values=true) or cookie_export_file.` }], isError: true };
     }
     await S.browserContext.addCookies(cookies);
     return { content: [{ type: "text", text: `Imported ${cookies.length} cookies.` }] };

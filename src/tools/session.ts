@@ -7,11 +7,20 @@ import { mkdirSync, chmodSync } from "fs";
 import { join } from "path";
 import { PROFILE_PARENT, getPage } from "../state.js";
 import { ACTION_TIMEOUT, safeName, writeSecretFile, expandHome, resolveOutPath,
-         refLocator,
+         refLocator, hitTestAt, observeClick, pointerMove, pointerClick, navSeqOf, waitForUrl, waitReady,
          inflightOf, gotoReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Storage State (Session Reuse) ───────────────────────────────────
+
+// about:blank and similar pages throw on any storage access. Their cookies are still
+// worth saving, so a page without storage is not a failure.
+const READ_WEB_STORAGE = `(() => {
+  var data = { local: {}, session: {} };
+  try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); data.local[k] = localStorage.getItem(k); } } catch (e) {}
+  try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); data.session[k2] = sessionStorage.getItem(k2); } } catch (e) {}
+  return { url: location.href, origin: location.origin, local: data.local, session: data.session };
+})()`;
 
 regTool("storage_state_save", "Save cookies + localStorage to a JSON file. Reload via storage_state_load on a fresh browser to skip login/CF entirely.", {
   path: z.string().describe("Output file path (e.g. ~/.camoufox-mcp/sessions/site.json)"),
@@ -19,16 +28,7 @@ regTool("storage_state_save", "Save cookies + localStorage to a JSON file. Reloa
   const page = getPage();
   const ctx = page.context();
   const cookies = await ctx.cookies();
-  const origins = await page.evaluate(`(() => {
-    var data = { local: {}, session: {} };
-    for (var i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i); data.local[k] = localStorage.getItem(k);
-    }
-    for (var j = 0; j < sessionStorage.length; j++) {
-      var k = sessionStorage.key(j); data.session[k] = sessionStorage.getItem(k);
-    }
-    return { url: location.href, origin: location.origin, ...data };
-  })()`);
+  const origins = await page.evaluate(READ_WEB_STORAGE);
   const target = resolveOutPath(path);
   writeSecretFile(target, JSON.stringify({ cookies, origins: [origins] }, null, 2));
   return { content: [{ type: "text", text: `Saved storage state: ${target} (${cookies.length} cookies, ${Object.keys((origins as any).local || {}).length} localStorage, ${Object.keys((origins as any).session || {}).length} sessionStorage)` }] };
@@ -80,12 +80,7 @@ regTool("auth_capture", "Save current session as named auth state (e.g. logged-i
   const page = getPage();
   const ctx = page.context();
   const cookies = await ctx.cookies();
-  const origins = await page.evaluate(`(() => {
-    var data = { local: {}, session: {} };
-    for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); data.local[k] = localStorage.getItem(k); }
-    for (var j = 0; j < sessionStorage.length; j++) { var k = sessionStorage.key(j); data.session[k] = sessionStorage.getItem(k); }
-    return { url: location.href, origin: location.origin, ...data };
-  })()`);
+  const origins = await page.evaluate(READ_WEB_STORAGE);
   const dir = join(PROFILE_PARENT, "sessions");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { chmodSync(dir, 0o700); } catch {}
@@ -133,6 +128,7 @@ regTool("humanize_click", "Click element with humanized mouse approach (3-step B
   const page = getPage();
   if (!ref && !selector) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
   const loc = ref ? refLocator(page, ref) : page.locator(selector!).first();
+  if (await loc.count() === 0) return { content: [{ type: "text", text: `Not found: ${ref ? `ref=${ref}` : selector}. The ref may be from an older snapshot: call browser_snapshot again.` }], isError: true };
   // Scroll into view first: boundingBox() is viewport-relative, so on a scrolled
   // page an off-screen element yields negative coords and the "click" lands nowhere.
   try { await loc.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT }); } catch {}
@@ -144,14 +140,20 @@ regTool("humanize_click", "Click element with humanized mouse approach (3-step B
   }
   const tx = box.x + box.width / 2 + (Math.random() * 8 - 4);
   const ty = box.y + box.height / 2 + (Math.random() * 6 - 3);
-  await page.mouse.move(tx + 200, ty - 100, { steps: 20 });
-  await page.waitForTimeout(180 + Math.random() * 120);
-  await page.mouse.move(tx + 60, ty - 25, { steps: 12 });
-  await page.waitForTimeout(120 + Math.random() * 80);
-  await page.mouse.move(tx, ty, { steps: 8 });
-  await page.waitForTimeout(70 + Math.random() * 50);
-  await page.mouse.click(tx, ty);
-  return { content: [{ type: "text", text: `humanize_click at (${Math.round(tx)},${Math.round(ty)})` }] };
+  // page.mouse has no idea what is under it, so without this a covered element reported
+  // a clean click while the cover received it.
+  const blocked = await hitTestAt(loc, { x: Math.max(0, tx - box.x), y: Math.max(0, ty - box.y) });
+  if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
+  const outcome = await observeClick(page, async () => {
+    await pointerMove(page, tx + 200, ty - 100, { steps: 20 });
+    await page.waitForTimeout(180 + Math.random() * 120);
+    await pointerMove(page, tx + 60, ty - 25, { steps: 12 });
+    await page.waitForTimeout(120 + Math.random() * 80);
+    await pointerMove(page, tx, ty, { steps: 8 });
+    await page.waitForTimeout(70 + Math.random() * 50);
+    await pointerClick(page, tx, ty);
+  });
+  return { content: [{ type: "text", text: `humanize_click at (${Math.round(tx)},${Math.round(ty)}).\n${outcome.note}` }] };
 });
 
 regTool("humanize_type", "Type text with Gaussian-distributed delays between keystrokes (mean ~80ms, sigma ~30ms). Mimics human typing rhythm.", {
@@ -161,8 +163,8 @@ regTool("humanize_type", "Type text with Gaussian-distributed delays between key
   mean_delay_ms: z.number().default(80),
 }, async ({ ref, selector, text, mean_delay_ms }) => {
   const page = getPage();
-  if (ref) await refLocator(page, ref).focus();
-  else if (selector) await page.locator(selector).first().focus();
+  if (ref) await refLocator(page, ref).focus({ timeout: ACTION_TIMEOUT });
+  else if (selector) await page.locator(selector).first().focus({ timeout: ACTION_TIMEOUT });
   for (const ch of text) {
     await page.keyboard.type(ch);
     // Gaussian-ish delay (Box-Muller)
@@ -184,7 +186,7 @@ regTool("mouse_drift", "Random mouse movements over a duration — builds up mou
   for (let i = 0; i < points; i++) {
     const x = Math.floor(Math.random() * (vp.width - 100)) + 50;
     const y = Math.floor(Math.random() * (vp.height - 100)) + 50;
-    await page.mouse.move(x, y, { steps: 12 });
+    await pointerMove(page, x, y, { steps: 12 });
     await page.waitForTimeout(interval * (0.7 + Math.random() * 0.6));
   }
   return { content: [{ type: "text", text: `mouse_drift: ${points} points over ${duration_ms}ms` }] };
@@ -223,12 +225,12 @@ regTool("mouse_replay", "Replay the last recorded mouse path with original timin
 }, async ({ speed }) => {
   const page = getPage();
   const points = await page.evaluate(`(window.__mcp_mouse_rec?.points || [])`) as any[];
-  if (!points.length) return { content: [{ type: "text", text: "IS_ERROR: No recording found — call mouse_record first, then move the mouse." }], isError: true };
+  if (!points.length) return { content: [{ type: "text", text: "No recording found — call mouse_record first, then move the mouse." }], isError: true };
   let lastT = 0;
   for (const p of points) {
     const wait = (p.t - lastT) / speed;
     if (wait > 5) await page.waitForTimeout(wait);
-    await page.mouse.move(p.x, p.y);
+    await pointerMove(page, p.x, p.y);
     lastT = p.t;
   }
   return { content: [{ type: "text", text: `mouse_replay: ${points.length} points moved (no click issued).` }] };
@@ -245,6 +247,7 @@ regTool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to b
     "https://www.google.com", "https://en.wikipedia.org/wiki/Special:Random",
   ];
   const per = Math.floor(duration_ms / urls.length);
+  const failed: string[] = [];
   for (const url of urls) {
     try {
       await gotoReady(page, url, "domcontentloaded", 15000);
@@ -253,9 +256,13 @@ regTool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to b
       const dy = Math.round(200 + Math.random() * 400);
       await page.evaluate(`window.scrollBy(0, ${dy})`).catch(() => {});
       await page.waitForTimeout(per * 0.3);
-    } catch {}
+    } catch (e: any) { failed.push(`${url} (${String(e?.message || e).split("\n")[0].slice(0, 80)})`); }
   }
-  return { content: [{ type: "text", text: `session_warmup: visited ${urls.length} sites over ${duration_ms}ms` }] };
+  const ok = urls.length - failed.length;
+  return {
+    content: [{ type: "text", text: `session_warmup: visited ${ok} of ${urls.length} sites over ${duration_ms}ms${failed.length ? `. Failed: ${failed.join("; ")}` : ""}` }],
+    ...(ok === 0 ? { isError: true } : {}),
+  };
 });
 
 regTool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva). Also reports `challenged`: whether the page is CURRENTLY a block/verification interstitial rather than the real content. A vendor present with challenged=false means the page passed and the vendor's scripts are merely loaded — the vendor's presence alone is not a block.", {}, async () => {
@@ -286,16 +293,16 @@ regTool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current pa
 
 // ── Tools: Assertions ──────────────────────────────────────────────────────
 
-regTool("assert_element_visible", "Assert element exists and is visible. Returns success/fail (no throw).", {
+regTool("assert_element_visible", "Assert element exists and is visible. A failed assertion is an error reply, so batches and workflows count it.", {
   selector: z.string(),
 }, async ({ selector }) => {
   const page = getPage();
   try {
     const el = page.locator(selector).first();
     const visible = await el.isVisible({ timeout: 3000 });
-    return { content: [{ type: "text", text: visible ? `PASS: ${selector} visible` : `FAIL: ${selector} not visible` }] };
+    return { content: [{ type: "text", text: visible ? `PASS: ${selector} visible` : `FAIL: ${selector} not visible` }], ...(visible ? {} : { isError: true }) };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `FAIL: ${selector} not found (${e.message?.slice(0, 80)})` }] };
+    return { content: [{ type: "text", text: `FAIL: ${selector} not found (${e.message?.slice(0, 80)})` }], isError: true };
   }
 });
 
@@ -308,7 +315,7 @@ regTool("assert_text_present", "Assert text is present anywhere on page (case-se
   const found = await page.evaluate(
     `document.body.innerText.includes(${JSON.stringify(text)})`
   ) as boolean;
-  return { content: [{ type: "text", text: found ? `PASS: '${text}' present` : `FAIL: '${text}' not found in body` }] };
+  return { content: [{ type: "text", text: found ? `PASS: '${text}' present` : `FAIL: '${text}' not found in body` }], ...(found ? {} : { isError: true }) };
 });
 
 regTool("assert_url_matches", "Assert current URL matches pattern (substring or regex).", {
@@ -318,7 +325,7 @@ regTool("assert_url_matches", "Assert current URL matches pattern (substring or 
   const page = getPage();
   const url = page.url();
   const match = regex ? new RegExp(pattern).test(url) : url.includes(pattern);
-  return { content: [{ type: "text", text: match ? `PASS: URL '${url}' matches '${pattern}'` : `FAIL: URL '${url}' does not match '${pattern}'` }] };
+  return { content: [{ type: "text", text: match ? `PASS: URL '${url}' matches '${pattern}'` : `FAIL: URL '${url}' does not match '${pattern}'` }], ...(match ? {} : { isError: true }) };
 });
 
 // ── Tools: Convenience / Workflow ──────────────────────────────────────────
@@ -334,25 +341,34 @@ regTool("click_and_wait", "Click element then wait for navigation or selector. A
   if (!ref && !selector) return { content: [{ type: "text", text: "Error: ref or selector required" }], isError: true };
   const loc = ref ? refLocator(page, ref) : page.locator(selector!).first();
   const beforeUrl = page.url();
-  // The wait result is REPORTED. Swallowing the timeout made an unmet condition
-  // look like a successful click+navigate.
-  let waitErr: string | null = null;
-  const condition = wait_for_url ? `url contains "${wait_for_url}"`
-    : wait_for_selector ? `selector "${wait_for_selector}"` : "domcontentloaded";
-  await Promise.all([
-    loc.click({ timeout: timeout_ms }),
-    (wait_for_url ? page.waitForURL((u) => u.toString().includes(wait_for_url), { timeout: timeout_ms })
-      : wait_for_selector ? page.waitForSelector(wait_for_selector, { timeout: timeout_ms })
-      : page.waitForLoadState("domcontentloaded", { timeout: timeout_ms })
-    ).catch((e: any) => { waitErr = String(e?.message || e).split("\n")[0].slice(0, 140); }),
-  ]);
-  if (waitErr) {
-    return {
-      content: [{ type: "text", text: `click_and_wait: the CLICK happened but the wait did NOT succeed — ${condition} was never met within ${timeout_ms}ms (${waitErr}). URL: ${beforeUrl} → ${page.url()}` }],
-      isError: true,
-    };
+  const seq = navSeqOf(page);
+  await loc.click({ timeout: timeout_ms });
+  // The conditions are polled rather than handed to page.waitForURL, which waits for the
+  // load event: Camoufox stops delivering that after the fifth page in a context, so a
+  // navigation that worked read as a timeout.
+  if (wait_for_url) {
+    if (!await waitForUrl(page, u => u.includes(wait_for_url), timeout_ms)) {
+      return { content: [{ type: "text", text: `click_and_wait: the CLICK happened but the wait did NOT succeed — url contains "${wait_for_url}" was never met within ${timeout_ms}ms. URL: ${beforeUrl} → ${page.url()}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `click_and_wait: url contains "${wait_for_url}" met. ${beforeUrl} → ${page.url()}` }] };
   }
-  return { content: [{ type: "text", text: `click_and_wait: ${condition} met. ${beforeUrl} → ${page.url()}` }] };
+  if (wait_for_selector) {
+    try {
+      await page.locator(wait_for_selector).first().waitFor({ state: "visible", timeout: timeout_ms });
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `click_and_wait: the CLICK happened but the wait did NOT succeed — selector "${wait_for_selector}" was never met within ${timeout_ms}ms (${String(e?.message || e).split("\n")[0].slice(0, 140)}). URL: ${beforeUrl} → ${page.url()}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `click_and_wait: selector "${wait_for_selector}" met. ${beforeUrl} → ${page.url()}` }] };
+  }
+  // No condition given. A click may simply not navigate, so this is not an error, but it
+  // must not claim a load happened either.
+  const deadline = Date.now() + Math.min(timeout_ms, 3000);
+  while (navSeqOf(page) === seq && Date.now() < deadline) await page.waitForTimeout(50);
+  if (navSeqOf(page) === seq) {
+    return { content: [{ type: "text", text: `click_and_wait: clicked, no navigation within ${Math.min(timeout_ms, 3000)}ms. URL: ${page.url()}` }] };
+  }
+  await waitReady(page, "domcontentloaded", timeout_ms);
+  return { content: [{ type: "text", text: `click_and_wait: navigated and loaded. ${beforeUrl} → ${page.url()}` }] };
 });
 
 regTool("wait_for_network_idle", "Wait until there are no in-flight requests for idle_ms continuously. Requests are counted from the moment the page was opened, so one that was ALREADY in flight when you call this is not mistaken for idle.", {

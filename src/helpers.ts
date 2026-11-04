@@ -1,7 +1,8 @@
 // Pure-ish helpers shared by the tool modules: refs, clicks, fills, snapshots,
 // paths, TOTP. Only trackPage/inflight touch shared state.
 import type { Page } from "playwright-core";
-import { S, HOME_DIR, PROFILE_DIR, SCREENSHOT_DIR } from "./state.js";
+import { S, HOME_DIR, PROFILE_DIR, SCREENSHOT_DIR, dialogLog } from "./state.js";
+import { scrubErrorText } from "./redact.js";
 
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { join, dirname } from "path";
@@ -130,25 +131,80 @@ export function totpFromSecret(secret: string, step = 30, digits = 6): string {
   return (code % 10 ** digits).toString().padStart(digits, "0");
 }
 
-// Click a locator, falling back to synthetic events when Playwright's
-// actionability check fails (overlay, moving element, portal that just mounted).
+// A secret-looking field, as a function source to splice into evaluate strings. Its
+// value must not reach a reply through any tool, so there is one definition of it.
+export const SECRET_FIELD_FN = `function (el) {
+  var ty = String(el.type || "").toLowerCase();
+  var hint = (String(el.name || "") + " " + String(el.id || "") + " " + String((el.getAttribute && el.getAttribute("autocomplete")) || "") + " " + String((el.getAttribute && el.getAttribute("aria-label")) || "")).toLowerCase();
+  return ty === "password" || /pass|secret|token|otp|cvv|card|pin/.test(hint);
+}`;
+
+/** Does this element hold a secret? Read through the shared definition. */
+export async function isSecretLocator(loc: any): Promise<boolean> {
+  try { return !!(await loc.evaluate(elementFn(`return (${SECRET_FIELD_FN})(el);`), undefined, { timeout: ACTION_TIMEOUT })); }
+  catch { return false; }
+}
+
+/** A locator.evaluate function built from source, so SECRET_FIELD_FN can be spliced in.
+ *  It must be a real function: a string here is evaluated and never called on Firefox,
+ *  and the tool then quietly gets undefined back. */
+export function elementFn(body: string): (el: any) => any {
+  return new Function("el", body) as any;
+}
+
+// What a tool may say about a value that might be secret.
+export function maskedField(length: number): string {
+  return `••• ${length} chars (masked)`;
+}
+
+// Click a locator, falling back to synthetic events when Playwright's actionability
+// check fails because something covers the target (overlay, a portal that just mounted).
 //
-// Returns which path was used so callers can SAY SO. The old version fell back
-// to a bare el.click() and still reported "Clicked" — pointer-driven widgets
-// (Radix, Headless UI, MUI) ignore that entirely, so a blocked click looked
-// successful while nothing happened. The fallback now replays the full pointer
-// sequence, and the mode is surfaced to the caller either way.
+// Returns which path was used so callers can SAY SO. The old version fell back to a
+// bare el.click() and still reported "Clicked". Pointer-driven widgets (Radix,
+// Headless UI, MUI) ignore that entirely, so the fallback replays the full pointer
+// sequence.
+//
+// The fallback is refused when it could only mislead: a disabled control ignores it,
+// a hidden one would fire a handler no user could reach, and a blocked right or double
+// click must not silently become the left click it would replay.
 export type ClickMode = "real" | "fallback";
+export interface ClickResult { mode: ClickMode; blocker?: string; }
+
+/** The element Playwright says took the pointer, from its failure log. */
+function interceptorIn(message: string): string {
+  const m = scrubErrorText(message).match(/(<[^\n]*?>)[^\n]*?(?:subtree )?intercepts pointer events/);
+  return m ? m[1].slice(0, 140) : "";
+}
+
 export async function clickWithFallback(
   loc: any,
   opts?: { button?: "left" | "right" | "middle"; dblclick?: boolean },
-): Promise<ClickMode> {
+): Promise<ClickResult> {
   const button = opts?.button || "left";
   try {
     if (opts?.dblclick) await loc.dblclick({ button, timeout: ACTION_TIMEOUT });
     else await loc.click({ button, timeout: ACTION_TIMEOUT });
-    return "real";
-  } catch {
+    return { mode: "real" };
+  } catch (err: any) {
+    const why = String(err?.message || err);
+    if (await loc.count().catch(() => 0) === 0) {
+      throw new Error("Element not found. The ref may be from an older snapshot: call browser_snapshot again.");
+    }
+    const state = await loc.evaluate((el: any) => {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      return {
+        disabled: !!el.matches?.(":disabled") || el.getAttribute?.("aria-disabled") === "true",
+        hidden: cs.display === "none" || cs.visibility === "hidden" || r.width < 1 || r.height < 1,
+      };
+    }, undefined, { timeout: ACTION_TIMEOUT });
+    if (state.disabled) throw new Error("Not clicked: the element is disabled, so a click would do nothing. Nothing was fired.");
+    if (state.hidden) throw new Error("Not clicked: the element is hidden (display, visibility or zero size). Nothing was fired. Take a new browser_snapshot, or click the visible control that stands for it.");
+    const blocker = interceptorIn(why);
+    if (button !== "left" || opts?.dblclick) {
+      throw new Error(`Not clicked: the real ${opts?.dblclick ? "double " : ""}${button} click was blocked${blocker ? ` by ${blocker}` : ""}, and no synthetic fallback exists for it. Nothing was fired.`);
+    }
     await loc.evaluate((el: any) => {
       const r = el.getBoundingClientRect();
       const base: any = {
@@ -168,15 +224,83 @@ export async function clickWithFallback(
       // navigation, form submit, label activation — still happen.
       if (typeof el.click === "function") el.click();
     }, undefined, { timeout: ACTION_TIMEOUT });
-    return "fallback";
+    return { mode: "fallback", blocker };
   }
 }
 
 // Suffix appended to every click result so a degraded click is never silent.
-export function clickNote(mode: ClickMode): string {
-  return mode === "real"
+export function clickNote(result: ClickResult): string {
+  return result.mode === "real"
     ? ""
-    : " ⚠ real mouse click was blocked (overlay / actionability) — used synthetic pointer-event fallback. VERIFY the effect; if the widget ignores it, dismiss the blocker first or use mouse_click_xy.";
+    : ` ⚠ the real mouse click was blocked${result.blocker ? ` by ${result.blocker}` : ""}, so synthetic pointer events were dispatched on the element instead. Dismiss the blocker first if the widget ignores them.`;
+}
+
+// What a click did, read from the page. Only a hash leaves the page, so a form's
+// values cannot reach a reply through this. Comparing lengths read a counter going
+// from 1 to 2 as no change. Focus is left out on purpose: focus dropping to <body> is
+// what clicking anything unfocusable does, not a reaction. Scroll is left out because
+// Playwright scrolls a target into view before clicking it.
+const PAGE_SIGNATURE_JS = `(function () {
+  var h = 2166136261;
+  function add(t) { for (var i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 16777619); } }
+  add(document.documentElement ? document.documentElement.outerHTML : "");
+  var f = document.querySelectorAll("input, textarea, select");
+  for (var j = 0; j < f.length; j++) add(String(f[j].value) + (f[j].checked ? "1" : "0"));
+  return document.title + "|" + (h >>> 0);
+})()`;
+
+async function pageSignature(page: Page): Promise<string | null> {
+  try {
+    return await Promise.race([
+      page.evaluate(PAGE_SIGNATURE_JS) as Promise<string>,
+      new Promise<null>(r => setTimeout(() => r(null), 1500)),
+    ]);
+  } catch { return null; }
+}
+
+export interface ClickOutcome { changed: boolean; note: string; }
+
+/** Run a click and report what the page did. Waits up to waitMs but returns as soon
+ *  as something reacted. A new tab changes nothing on its own page, so tabs are watched
+ *  too, or a working popup button reads as dead and an agent clicks it again. */
+export async function observeClick(page: Page, click: () => Promise<void>, waitMs = 1000): Promise<ClickOutcome> {
+  const ctx = page.context();
+  const pagesBefore = new Set(ctx.pages());
+  const urlBefore = page.url();
+  const seqBefore = navSeqOf(page);
+  const sigBefore = await pageSignature(page);
+  await click();
+  const deadline = Date.now() + waitMs;
+  const opened = () => ctx.pages().filter(p => !pagesBefore.has(p));
+  for (;;) {
+    await page.waitForTimeout(50).catch(() => {});
+    if (page.isClosed()) return { changed: true, note: "The tab closed itself." };
+    const navigated = page.url() !== urlBefore || navSeqOf(page) !== seqBefore;
+    if (opened().length) {
+      const fresh = opened()[0];
+      // A popup starts on about:blank and gets its address a moment later.
+      for (let i = 0; i < 20 && fresh.url() === "about:blank"; i++) await page.waitForTimeout(50).catch(() => {});
+      return { changed: true, note: `Opened a new tab [${S.pages.indexOf(fresh)}]: ${fresh.url()}. The active tab did not change; use tab_select to switch.` };
+    }
+    if (navigated) return { changed: true, note: `Page navigated to ${page.url()}.` };
+    const sig = await pageSignature(page);
+    if (sig !== null && sigBefore !== null && sig !== sigBefore) return { changed: true, note: "Page content changed." };
+    if (Date.now() >= deadline) break;
+  }
+  if (sigBefore === null) return { changed: true, note: "Could not read the page before the click, so no effect can be reported." };
+  return { changed: false, note: `⚠ No page change observed within ${waitMs}ms. The click was delivered, but nothing reacted yet; check with wait_for_change, or assert_clickable if it should have.` };
+}
+
+/** Shared reply for a click through clickWithFallback. A blocked click that also
+ *  changed nothing failed, whatever the synthetic events returned. */
+export async function clickReply(page: Page, label: string, click: () => Promise<ClickResult>, waitMs = 1000) {
+  let result: ClickResult = { mode: "real" };
+  const outcome = await observeClick(page, async () => { result = await click(); }, waitMs);
+  const failed = result.mode === "fallback" && !outcome.changed;
+  return {
+    content: [{ type: "text" as const, text: `${label}. URL: ${page.isClosed() ? "(tab closed)" : page.url()}${clickNote(result)}\n${outcome.note}` }],
+    ...(failed ? { isError: true } : {}),
+  };
 }
 
 // Fill that really REPLACES the existing value.
@@ -185,16 +309,31 @@ export function clickNote(mode: ClickMode): string {
 // input[type=number] (Firefox restricts the selection APIs on those types), so a
 // fill over a non-empty field APPENDS — e.g. re-filling an email field yields
 // "old@x.comnew@x.com". Clearing first makes fill deterministic for every type.
+//
+// A fill that then fails must leave the field as it found it: clearing a disabled or
+// readonly field and reporting an error destroyed its value. The typed value is also
+// cut from any error, which may quote it.
 export async function fillLocator(loc: any, value: string): Promise<void> {
+  const prior: string | null = await loc.evaluate((el: any) => {
+    if (!el || typeof el.value !== "string" || el.value === "") return null;
+    if (el.matches?.(":disabled") || el.readOnly || el.type === "checkbox" || el.type === "radio") return null;
+    const old = el.value;
+    el.value = "";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return old;
+  }, undefined, { timeout: ACTION_TIMEOUT });
   try {
-    await loc.evaluate((el: any) => {
-      if (el && typeof el.value === "string" && el.value !== "") {
-        el.value = "";
+    await loc.fill(value, { timeout: ACTION_TIMEOUT });
+  } catch (err: any) {
+    if (prior !== null) {
+      await loc.evaluate((el: any, old: string) => {
+        el.value = old;
         el.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    }, undefined, { timeout: ACTION_TIMEOUT });
-  } catch {}
-  await loc.fill(value, { timeout: ACTION_TIMEOUT });
+      }, prior, { timeout: ACTION_TIMEOUT }).catch(() => {});
+    }
+    const msg = String(err?.message || err);
+    throw new Error(value ? msg.split(value).join("***") : msg);
+  }
 }
 
 // Locator for a snapshot ref (data-mcp-ref). Centralizes the selector so the
@@ -238,11 +377,14 @@ export async function describeMatches(loc: any, cap = 8): Promise<{ total: numbe
         parts.unshift(s);
       }
       const r = el.getBoundingClientRect();
+      const ty = String(el.type || "").toLowerCase();
+      const hint = `${el.name || ""} ${el.id || ""} ${el.getAttribute("autocomplete") || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
+      const secret = ty === "password" || /pass|secret|token|otp|cvv|card|pin/.test(hint);
       return {
         ref, index: idx,
         tag: el.tagName.toLowerCase(),
         role: el.getAttribute("role") || "",
-        text: (el.innerText || el.value || "").trim().slice(0, 60),
+        text: (el.innerText || (secret ? "" : el.value) || "").trim().slice(0, 60),
         path: parts.join(" > "),
         visible: r.width > 0 && r.height > 0,
         at: `${Math.round(r.x)},${Math.round(r.y)}`,
@@ -265,6 +407,84 @@ export function candidateList(total: number, items: any[]): string {
 // counting from zero, so a request that was ALREADY in flight looked like idle.
 export const inflightByPage = new WeakMap<Page, { n: number }>();
 export function inflightOf(p: Page): number { return inflightByPage.get(p)?.n ?? 0; }
+
+// Main-frame navigations per page, counted from framenavigated. The lifecycle events
+// are unusable here, and readyState alone cannot tell "already loaded" from "just
+// navigated", so the waits and click reports read this.
+const navByPage = new WeakMap<Page, { seq: number; at: number }>();
+export function navSeqOf(p: Page): number { return navByPage.get(p)?.seq ?? 0; }
+export function lastNavAt(p: Page): number { return navByPage.get(p)?.at ?? 0; }
+
+/** Substring match, or glob-ish when the pattern contains `*`. */
+export function urlMatches(url: string, pattern: string): boolean {
+  if (!pattern) return false;
+  if (!pattern.includes("*")) return url.includes(pattern);
+  const rx = new RegExp("^" + pattern.split("*").map(p => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
+  return rx.test(url);
+}
+
+/** Wait for the page URL by polling it. page.waitForURL waits for the load event by
+ *  default, which Camoufox stops delivering after the fifth page in a context. */
+export async function waitForUrl(page: Page, matches: (url: string) => boolean, timeout: number): Promise<boolean> {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (matches(page.url())) return true;
+    if (Date.now() >= deadline) return false;
+    await page.waitForTimeout(50);
+  }
+}
+
+/** Move or click the mouse without touching the top edge. Once the pointer has been
+ *  inside the page, a move to y in [0, 1) is never answered by Juggler (Playwright floors
+ *  the coordinate to 0; y=1 and y=-5 are both fine), and every later mouse call on that
+ *  tab waits behind it. A stepped move crossing the edge lands on 0 only sometimes, which
+ *  made this look like a random wedge. Nothing above y=1 is worth aiming at, so the
+ *  target is held at y>=1 and a straight path from there never crosses the edge. */
+export function safePointY(y: number): number { return y < 1 ? 1 : y; }
+export async function pointerMove(page: Page, x: number, y: number, opts?: { steps?: number }): Promise<void> {
+  await page.mouse.move(x, safePointY(y), opts);
+}
+export async function pointerClick(page: Page, x: number, y: number, opts?: { button?: "left" | "right" | "middle" }): Promise<void> {
+  await page.mouse.click(x, safePointY(y), opts);
+}
+
+/** The viewport the page really has. page.viewportSize() is null under no_viewport. */
+export async function viewportOf(page: Page): Promise<{ width: number; height: number }> {
+  const fixed = page.viewportSize();
+  if (fixed) return fixed;
+  const raw = await page.evaluate(`(function () { return JSON.stringify({ width: innerWidth, height: innerHeight }); })()`) as string;
+  return JSON.parse(raw);
+}
+
+/** Refuse a coordinate click on an element when something else would take it. A
+ *  trial click runs Playwright's own hit test at that exact point without firing. */
+export async function hitTestAt(loc: any, position?: { x: number; y: number }): Promise<string | null> {
+  try {
+    await loc.click({ trial: true, timeout: ACTION_TIMEOUT, ...(position ? { position } : {}) });
+    return null;
+  } catch (err: any) {
+    const msg = String(err?.message || err);
+    const blocker = interceptorIn(msg);
+    if (blocker) return `Not clicked: ${blocker} covers that point and would take the click.`;
+    if (await loc.count().catch(() => 0) === 0) return "Not clicked: element not found. The ref may be from an older snapshot: call browser_snapshot again.";
+    return `Not clicked: the element cannot be clicked there. ${scrubErrorText(msg).split("\n")[0].slice(0, 160)}`;
+  }
+}
+
+/** Go back or forward and report whether the page moved. page.goBack answers null when
+ *  there is nothing to go to, and also for a same-document (pushState) entry, so null
+ *  alone does not mean "stayed put". history.length proves nothing here: Camoufox
+ *  randomises it. browser_launch has to enable session history for this to work. */
+export async function historyStep(page: Page, direction: "back" | "forward", timeout = 15000): Promise<{ moved: boolean; url: string }> {
+  const seq = navSeqOf(page), urlBefore = page.url();
+  const opts = { waitUntil: "commit" as const, timeout };
+  const res = direction === "back" ? await page.goBack(opts) : await page.goForward(opts);
+  const changed = () => res !== null || navSeqOf(page) !== seq || page.url() !== urlBefore;
+  if (!changed()) await page.waitForTimeout(150);
+  if (!changed()) return { moved: false, url: page.url() };
+  await waitReady(page, "domcontentloaded", timeout);
+  return { moved: true, url: page.url() };
+}
 
 export type WaitUntil = "domcontentloaded" | "load" | "networkidle";
 
@@ -353,8 +573,12 @@ export async function gotoReady(
     if (!/Timeout\s+\d+ms exceeded/i.test(msg)) throw err;
     let arrived = false;
     try {
-      const raw = await page.evaluate(
-        `(() => JSON.stringify({ href: location.href, doc: document.documentURI, state: document.readyState }))()`) as string;
+      // Bounded: on a tab that never committed this evaluate can hang for ever, and
+      // then the navigation never reports its own timeout.
+      const raw = await Promise.race([
+        page.evaluate(`(() => JSON.stringify({ href: location.href, doc: document.documentURI, state: document.readyState }))()`) as Promise<string>,
+        new Promise<string>((_, rej) => setTimeout(() => rej(new Error("page did not answer")), 3000)),
+      ]);
       const g = JSON.parse(raw);
       arrived = sameNavTarget(g.href, url)
         && !/^about:(neterror|certerror|blocked|httpsonlyerror)/.test(String(g.doc || ""))
@@ -374,6 +598,23 @@ function sameNavTarget(landed: string, requested: string): boolean {
   } catch { return landed === requested; }
 }
 
+let dialogSeq = 0;
+async function answerDialog(dialog: any): Promise<void> {
+  const once = S.oneShotDialog;
+  if (once) S.oneShotDialog = null;
+  const policy = once || S.autoDialogCfg;
+  const accept = policy?.action === "accept";
+  dialogLog.push({
+    seq: ++dialogSeq, at: Date.now(), type: dialog.type(), message: String(dialog.message()).slice(0, 200),
+    answer: accept ? "accepted" : policy ? "dismissed" : "dismissed automatically (no handler armed)",
+  });
+  if (dialogLog.length > 50) dialogLog.shift();
+  try {
+    if (accept) await dialog.accept(policy?.promptText || undefined);
+    else await dialog.dismiss();
+  } catch {}
+}
+
 // Track a page in the global S.pages[] list and auto-remove it on close.
 // Used for the initial page, tab_new, AND pages opened by the site itself
 // (window.open / target=_blank) via the browserContext "page" event — without
@@ -385,12 +626,13 @@ export function trackPage(p: Page): void {
   S.pages.push(p);
   if (S.consoleHandler) p.on("console", S.consoleHandler);
   if (S.networkHandler) p.on("response", S.networkHandler);
-  // A persistent dialog handler must cover tabs the site opens later too,
-  // otherwise a popup's confirm() hangs the flow.
-  if (S.autoDialogHandler) p.on("dialog", S.autoDialogHandler);
-  // A one-shot dialog_handle promises the next dialog on ANY tab — including one
-  // opened after it was armed, which would otherwise hang with no handler at all.
-  if (S.oneShotDialogHandler) p.on("dialog", S.oneShotDialogHandler);
+  // One listener per page, so a dialog on any tab, including one opened later, always
+  // gets an answer. Any registered listener turns off Playwright's auto-dismiss, so
+  // this must answer every dialog or that page stays blocked for ever.
+  p.on("dialog", answerDialog);
+  const nav = { seq: 0, at: 0 };
+  navByPage.set(p, nav);
+  p.on("framenavigated", f => { if (f === p.mainFrame()) { nav.seq++; nav.at = Date.now(); } });
   const inflight = { n: 0 };
   inflightByPage.set(p, inflight);
   p.on("request", () => { inflight.n++; });
@@ -416,6 +658,10 @@ export const SNAPSHOT_JS = `(() => {
     + '[role="button"], [role="link"], [role="textbox"], [role="checkbox"], '
     + '[role="radio"], [role="tab"], [role="menuitem"], [contenteditable="true"], '
     + 'img[alt], h1, h2, h3, h4, h5, h6, label, [role="dialog"], [role="alert"], [role="status"]';
+  // A ref left on an element from an earlier snapshot would make the new number name
+  // two elements, and refLocator's .first() could then pick the one now hidden.
+  var stale = document.querySelectorAll('[data-mcp-ref]');
+  for (var si = 0; si < stale.length; si++) stale[si].removeAttribute('data-mcp-ref');
   var els = document.querySelectorAll(sels);
   var results = [];
   var refId = 0;

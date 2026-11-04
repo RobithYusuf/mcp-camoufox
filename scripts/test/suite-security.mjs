@@ -29,7 +29,7 @@ export default async function run() {
 
   S = await startServer();
   const c = S.call;
-  await c("browser_launch", { url: victim.url, headless: true, fresh_profile: true });
+  await c("browser_launch", { url: victim.url, headless: true, fresh_profile: true, geoip: false });
   await c("cookie_set", { name: "AUTH", value: "victim-session-token", domain: "127.0.0.1", expires_days: 1 });
 
   // v0.9.6: impit replayed the Cookie header onto a cross-origin redirect target
@@ -95,8 +95,8 @@ export default async function run() {
   await check("concurrent browser_launch builds ONE context", async () => {
     await c("browser_close");
     const [a, b] = await Promise.all([
-      c("browser_launch", { url: victim.url, headless: true, fresh_profile: true }),
-      c("browser_launch", { url: victim.url, headless: true, fresh_profile: true }),
+      c("browser_launch", { url: victim.url, headless: true, fresh_profile: true, geoip: false }),
+      c("browser_launch", { url: victim.url, headless: true, fresh_profile: true, geoip: false }),
     ]);
     const launched = [a, b].filter(x => x.includes("Browser launched")).length;
     return [launched === 1, `${launched} launched, ${2 - launched} reused`];

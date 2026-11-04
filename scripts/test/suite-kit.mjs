@@ -95,7 +95,7 @@ export default async function run() {
   });
   await check("http_request flags an anti-bot response", async () => {
     const t = await c("http_request", { url: `${fx.url}/maybe` });
-    return [t.includes("looks anti-bot blocked"), t.split("\n")[1]];
+    return [t.includes("may be an anti-bot block"), t.split("\n")[1]];
   });
   await check("scrape_markdown (browserless)", async () => {
     const t = await c("scrape_markdown", { url: fx.url });
@@ -109,16 +109,17 @@ export default async function run() {
   });
 
   await check("browser_launch", async () => {
-    const t = await c("browser_launch", { url: fx.url, headless: true, fresh_profile: true });
+    const t = await c("browser_launch", { url: fx.url, headless: true, fresh_profile: true, geoip: false });
     return [t.includes("Browser launched"), t.split("\n")[0]];
   });
   await check("http_request reuses browser cookies", async () => {
     await c("cookie_set", { name: "sid", value: "abc123", domain: "127.0.0.1", expires_days: 1 });
-    const t = await c("http_request", { url: `${fx.url}/echo` });
+    // The echo body quotes the cookie it received, so it needs reveal_values to be readable.
+    const t = await c("http_request", { url: `${fx.url}/echo`, reveal_values: true });
     return [t.includes("sid=abc123"), "cookie forwarded"];
   });
   await check("use_browser_cookies=false omits them", async () => {
-    const t = await c("http_request", { url: `${fx.url}/echo`, use_browser_cookies: false });
+    const t = await c("http_request", { url: `${fx.url}/echo`, use_browser_cookies: false, reveal_values: true });
     return [!t.includes("sid=abc123"), "omitted"];
   });
   await check("http_session_cookies", async () => {
@@ -183,11 +184,11 @@ export default async function run() {
   await check("assert_clickable names the blocker", async () => {
     const ok = await c("assert_clickable", { selector: "#sub" });
     const bad = await c("assert_clickable", { selector: "#under" });
-    return [ok.startsWith("PASS") && bad.startsWith("FAIL") && bad.includes("blanket"), bad.split("\n")[0]];
+    return [ok.startsWith("PASS") && bad.startsWith("IS_ERROR: FAIL") && bad.includes("blanket"), bad.split("\n")[0]];
   });
   await check("assert_clickable flags off-screen", async () => {
     const t = await c("assert_clickable", { selector: "#deep" });
-    return [t.startsWith("FAIL") && t.includes("outside the viewport"), t.split("\n")[0]];
+    return [t.startsWith("IS_ERROR: FAIL") && t.includes("outside the viewport"), t.split("\n")[0]];
   });
   await check("scroll_to brings an element into view", async () => {
     await c("scroll_to", { selector: "#deep" });
@@ -271,7 +272,8 @@ export default async function run() {
     await c("storage_snapshot", { name: "before" });
     await c("localstorage_set", { key: "token", value: "tok-999" });
     const t = await c("storage_diff", { name: "before" });
-    return [t.includes("token") && t.includes("tok-999"), t.split("\n")[0]];
+    const shown = await c("storage_diff", { name: "before", reveal_values: true });
+    return [t.includes("token") && !t.includes("tok-999") && shown.includes("tok-999"), t.split("\n")[0]];
   });
   await check("indexeddb list + delete", async () => {
     await c("evaluate", { expression: "new Promise(function(res){var r=indexedDB.open('kitdb',1);r.onsuccess=function(){r.result.close();res('ok')};r.onerror=function(){res('err')}})" });
@@ -327,12 +329,12 @@ export default async function run() {
   });
   await check("export_curl rebuilds a captured request and warns about credentials", async () => {
     await c("network_start", { capture_bodies: true });
-    await c("cookie_set", { name: "sid", value: "secret-session", url: fx.url });
+    await c("cookie_set", { name: "sid", value: "secret-session", domain: "127.0.0.1" });
     await c("navigate", { url: `${fx.url}/target` });
     const t = await c("export_curl", { url_contains: "/target" });
-    const red = await c("export_curl", { url_contains: "/target", redact: true });
-    return [t.includes("curl -X GET") && t.includes("⚠") && red.includes("<REDACTED>") && !red.includes("secret-session"),
-            `warned=${t.includes("⚠")} redacted=${red.includes("<REDACTED>")}`];
+    const shown = await c("export_curl", { url_contains: "/target", reveal_values: true });
+    return [t.includes("curl -X GET") && !t.includes("secret-session") && t.includes("masked") && shown.includes("secret-session") && shown.includes("⚠"),
+            `masked=${!t.includes("secret-session")} revealWarned=${shown.includes("⚠")}`];
   });
   await check("fingerprint_audit finds no contradiction in a normal launch", async () => {
     const t = await c("fingerprint_audit");

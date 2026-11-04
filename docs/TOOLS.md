@@ -24,7 +24,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 | Tool         | Description                                                                     |
 | ------------ | ------------------------------------------------------------------------------- |
 | `navigate`   | Go to URL. Options: `wait_until` (domcontentloaded/load/networkidle), `timeout` |
-| `go_back`    | Back in history                                                                 |
+| `go_back` | Back in history. An error when there is no previous page. |
 | `go_forward` | Forward in history                                                              |
 | `reload`     | Reload page                                                                     |
 
@@ -89,11 +89,11 @@ Anything that adds, removes or changes a tool must update this file in the same 
 | Tool                  | Description                                                                                                                                                                   |
 | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `wait_for`            | Wait for selector or text (visible/hidden/attached/detached)                                                                                                                  |
-| `wait_for_navigation` | Wait for page load                                                                                                                                                            |
+| `wait_for_navigation` | Wait for a navigation to happen and finish. Counts one that finished in the last 2s. An error if none is seen within `timeout`. |
 | `wait_for_url`        | Wait for URL pattern match. Wrap in `/…/` for regex; a bare `/path` is treated as a substring.                                                                                |
-| `wait_for_response`   | Wait for network response pattern                                                                                                                                             |
+| `wait_for_response` | Wait for a response whose URL contains `url_pattern`. Credentials in the URL are masked. Pass `reveal_values=true` for the real values. |
 | `wait_for_change`     | Wait until the page actually CHANGES and report what changed (url/title/DOM size/text) — the honest replacement for a fixed sleep after a click                               |
-| `wait_for_request`    | Block until the page ISSUES a matching request — confirms an action really fired its API call                                                                                 |
+| `wait_for_request` | Block until the page ISSUES a matching request, to confirm an action fired its API call. Credentials in the URL and body are masked. Pass `reveal_values=true` for the real values. |
 | `wait_for_any_of`     | Race several conditions (`selector`/`text`/`url_contains`/`title_contains`) — returns the first that matches so the agent can branch in one call. Ideal for post-login flows. |
 
 
@@ -113,9 +113,9 @@ Anything that adds, removes or changes a tool must update this file in the same 
 
 | Tool            | Description                                                                                                                                                                                                 |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cookie_list`   | List cookies. Options: `domain` filter                                                                                                                                                                      |
+| `cookie_list` | List cookies. Options: `domain` filter. Values are masked. Pass `reveal_values=true` for the real values. |
 | `cookie_set`    | Set cookie with `expires_days`, `http_only`, `secure`, `same_site`. `**expires_days=0` (default) makes a session cookie that dies at `browser_close`** — pass a lifetime to keep a login across relaunches. |
-| `cookie_delete` | Delete by name/domain. Empty = clear all.                                                                                                                                                                   |
+| `cookie_delete` | Delete by exact `name` and/or `domain` (a domain covers its subdomains, not look-alikes). Empty = clear all. The count is read back from the browser. |
 
 
 ### Local Storage (3)
@@ -123,7 +123,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 
 | Tool                 | Description             |
 | -------------------- | ----------------------- |
-| `localstorage_get`   | Get all or specific key |
+| `localstorage_get` | Get all or a specific key. Keys named like a credential are masked. Pass `reveal_values=true` for the real values. |
 | `localstorage_set`   | Set key-value           |
 | `localstorage_clear` | Clear all               |
 
@@ -133,7 +133,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 
 | Tool                   | Description                                                                |
 | ---------------------- | -------------------------------------------------------------------------- |
-| `sessionstorage_get`   | Get all or specific key                                                    |
+| `sessionstorage_get` | Get all or a specific key. Keys named like a credential are masked. Pass `reveal_values=true` for the real values. |
 | `sessionstorage_set`   | Set key-value                                                              |
 | `sessionstorage_clear` | Clear all sessionStorage for the origin (parity with `localstorage_clear`) |
 
@@ -173,7 +173,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 
 | Tool                    | Description                                                                                                                                                                           |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `batch_actions`         | Multiple actions in one call (click, fill, type, press, wait)                                                                                                                         |
+| `batch_actions` | Multiple actions in one call (click, fill, type, press, select, check, uncheck, wait). Stops at the first failure unless `stop_on_error=false`. A failed or malformed action makes the reply an error. |
 | `fill_form`             | Fill multiple fields + optional submit                                                                                                                                                |
 | `login_classic`         | Composite login for email→password forms (Google/Microsoft/generic). Auto email→Next→password→submit, optional TOTP 2FA (`totp_secret` or `totp_code`). Collapses 5–8 calls into one. |
 | `navigate_and_snapshot` | Navigate + snapshot in one call                                                                                                                                                       |
@@ -195,7 +195,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 
 | Tool        | Description                                                               |
 | ----------- | ------------------------------------------------------------------------- |
-| `scroll`    | Scroll up/down/left/right by pixel amount                                 |
+| `scroll` | Scroll up/down/left/right by pixel amount. Reports the distance really moved, including 0. |
 | `scroll_to` | Scroll a specific element into view (`ref`/`selector`, `block` alignment) |
 
 
@@ -204,7 +204,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 
 | Tool                 | Description                                                                                                      |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `dialog_handle`      | Pre-set accept/dismiss for the next alert/confirm/prompt on **any** open tab (first dialog wins, then disarms)   |
+| `dialog_handle` | Set the answer for the next alert/confirm/prompt on **any** tab, including later ones. Says so if a dialog already went by, because it applies to the next one. |
 | `dialog_auto_handle` | PERSISTENT handler — stays armed across every dialog and every tab, including popups. `enabled=false` removes it |
 
 
@@ -222,11 +222,11 @@ Anything that adds, removes or changes a tool must update this file in the same 
 | Tool                            | Description                                                                                                                                                                                                                                          |
 | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `console_start` / `console_get` | Capture and retrieve browser console messages. Capture spans **all tabs** and follows newly opened tabs/popups (re-calling `console_start` resets cleanly — no listener stacking).                                                                   |
-| `network_start` / `network_get` | Capture network requests across **all tabs** (follows tab switches + popups). `network_start(capture_bodies=true)` also records request/response headers + text bodies. `network_get(filter=...)` narrows by URL substring; each row shows an `#id`. |
-| `network_get_detail`            | Full request + response (headers + text body) for one captured request by `#id` or `url` substring. Needs `capture_bodies=true`. Replaces the `evaluate()`+`fetch()` workaround for inspecting API payloads.                                         |
+| `network_start` / `network_get` | `network_get` masks credentials in URLs (`reveal_values=true` shows them). Capture network requests across **all tabs** (follows tab switches + popups). `network_start(capture_bodies=true)` also records request/response headers + text bodies. `network_get(filter=...)` narrows by URL substring; each row shows an `#id`. |
+| `network_get_detail` | Full request + response (headers + text body) for one captured request by `#id` or `url` substring. Needs `capture_bodies=true`. Cookie, Authorization, Set-Cookie, tokens and passwords are masked. Pass `reveal_values=true` for the real values. An error when no request matches. |
 | `intercept_start` / `intercept_stop` | Abort requests before they leave the browser, by resource type (`image`, `media`, `font`, `stylesheet`, `script`, `xhr`, `fetch`, `websocket`) and/or URL pattern (`*doubleclick.net*`). Blocking images and stylesheets removes most of a typical page's bytes — the biggest single speed-up for scraping. Routed on the **context**, so tabs opened later are covered too. `document` cannot be blocked: that would abort the navigation itself. |
-| `intercept_log`                 | What interception actually blocked and allowed, with the rule that matched each decision — so a "blocked" claim can be checked rather than trusted.                                                                                                 |
-| `export_curl`                   | Rebuild a captured request as a runnable `curl` command (method, headers, body) to replay or share an API call. Needs `capture_bodies=true`. Warns when the command carries live credentials; `redact=true` produces a shareable version.           |
+| `intercept_log` | What interception blocked and allowed, with the rule that matched each decision. Credentials in URLs are masked. Pass `reveal_values=true` for the real values. |
+| `export_curl` | Rebuild a captured request as a `curl` command. Needs `capture_bodies=true`. Credentials become placeholders, so the command does not reproduce the call as is. Pass `reveal_values=true` for the real values. |
 
 
 ### Compound (reduce round-trips) (4)
@@ -255,7 +255,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 
 | Tool                 | Description                                                                                   |
 | -------------------- | --------------------------------------------------------------------------------------------- |
-| `cookie_export`      | Export all cookies as JSON (for transfer)                                                     |
+| `cookie_export` | Export all cookies as JSON. Values are masked, and `cookie_import` refuses a masked export. Pass `reveal_values=true` to transfer, or use `cookie_export_file`, which writes a 0600 file. |
 | `cookie_import`      | Import cookies from JSON (restore session)                                                    |
 | `cookie_export_file` | Write all cookies to a JSON file (Playwright format)                                          |
 | `cookie_import_file` | Load cookies from a JSON file (Playwright format)                                             |
@@ -325,8 +325,8 @@ The browser is the expensive path. `impit` (already shipped with camoufox-js) sp
 
 | Tool                   | Description                                                                                                                                                |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `http_request`         | HTTP with a real Firefox TLS fingerprint, reusing the live browser's cookies by default — log in with the browser, then hit the site's API cheaply         |
-| `http_session_cookies` | Show which browser cookies would be sent to a URL (verify session sharing before relying on it)                                                            |
+| `http_request` | HTTP with a real Firefox TLS fingerprint, reusing the live browser's cookies by default. Set-Cookie, tokens in JSON or form bodies and tokens in URLs are masked. Pass `reveal_values=true` for the real values. |
+| `http_session_cookies` | Show which browser cookies would be sent to a URL. Values are masked. Pass `reveal_values=true` for the real values. |
 | `scrape_markdown`      | One URL → clean LLM-ready markdown (headings/links/lists kept, nav/footer/scripts stripped). Browserless by default, `use_browser=true` for JS-heavy pages |
 | `smart_fetch`          | Tries HTTP first, escalates to the stealth browser **only** when the response looks anti-bot blocked. The efficiency core                                  |
 | `search` | Search through an API **you** control — self-hosted SearXNG, or Brave/Tavily/Exa with a key — returning a normalised title/url/snippet list. Set `MCP_SEARCH_ENDPOINT` once. Never scrapes a result page. |
@@ -338,7 +338,7 @@ The browser is the expensive path. `impit` (already shipped with camoufox-js) sp
 | Tool               | Description                                                                                    |
 | ------------------ | ---------------------------------------------------------------------------------------------- |
 | `storage_snapshot` | Capture cookies + localStorage + sessionStorage into a named slot                              |
-| `storage_diff`     | Diff current state against that slot — the fastest way to find which key holds a session token |
+| `storage_diff` | Diff current state against that slot, to find which key holds a session token. Cookie values and credential-named storage keys are masked. Pass `reveal_values=true` for the real values. |
 | `indexeddb_list`   | List IndexedDB databases for the origin (where many SPAs hide auth state)                      |
 | `indexeddb_delete` | Delete an IndexedDB database by name                                                           |
 
@@ -348,9 +348,9 @@ The browser is the expensive path. `impit` (already shipped with camoufox-js) sp
 
 | Tool                   | Description                                                                                                                                                              |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `server_status`        | Health check: browser status, tabs, URL                                                                                                                                  |
+| `server_status` | Health check: browser status, tab count, URL with credentials masked, the profile in use (`profile_dir`, `profile_is_temp`), and `last_exit` if the browser died. |
 | `get_page_errors`      | Uncaught JS errors + unhandled promise rejections, captured by a hook installed at `browser_launch`. Buffer resets on every navigation — read it before navigating away. |
-| `export_har`           | Export captured traffic as a valid **HAR 1.2** file (opens in DevTools). Needs `network_start` first; headers/bodies included only with `capture_bodies=true`.           |
+| `export_har` | Export captured traffic as a **HAR 1.2** file, mode 0600. Needs `network_start` first and is an error with nothing captured. Credentials are masked. Pass `reveal_values=true` for the real values. |
 | `page_stats`           | Element count, page size, load metrics + extraction strategy recommendation                                                                                              |
 | `performance_timeline` | TTFB, DOMContentLoaded, load, FCP, LCP + the 5 slowest resources (CLS is unavailable — Firefox has no layout-shift API)                                                  |
 | `fingerprint_audit`    | The fingerprint a site actually sees (user-agent, platform, languages, timezone, screen vs window, cores, WebGL, `navigator.webdriver`), and flags **contradictions between those values** — a viewport larger than the screen, a Chrome object on a Firefox UA, a platform that disagrees with the user-agent. Self-consistency only: it cannot tell you whether a given site's detector passes you. |
