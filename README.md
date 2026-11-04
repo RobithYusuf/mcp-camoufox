@@ -11,7 +11,7 @@
 
 </div>
 
-The most feature-rich stealth browser MCP server. **133 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
+The most feature-rich stealth browser MCP server. **135 tools** for full browser control powered by [Camoufox](https://github.com/daijro/camoufox) — a Firefox fork with C++ level anti-detection that bypasses Cloudflare, bot detection, and anti-automation.
 
 > **One command. No Python. No manual setup. Everything auto-installs.**
 
@@ -40,7 +40,7 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | redf0x1/camofox-mcp                                             | 47      | Yes     | Yes         | Yes                |
 | Sekinal/camoufox-mcp                                            | 49      | Yes     | No (clone)  | Yes                |
 | Playwright CLI                                                  | 60+     | No      | Yes         | Yes                |
-| [**mcp-camoufox**](https://github.com/RobithYusuf/mcp-camoufox) | **133** | **Yes** | **Yes**     | **Yes**            |
+| [**mcp-camoufox**](https://github.com/RobithYusuf/mcp-camoufox) | **135** | **Yes** | **Yes**     | **Yes**            |
 
 <sub>Competitor figures checked 19 Aug 2026: camofox-mcp counted by running `tools/list` against v1.15.0 from npm (it is npx-installable — an earlier version of this table wrongly said otherwise); the others are taken from their own READMEs.</sub>
 
@@ -55,13 +55,29 @@ claude mcp add camoufox -- npx -y mcp-camoufox@latest
 | `browserscan.net/bot-detection`          | WebDriver/UA/CDP/Navigator  | ✅ All categories "Normal" ([proof](docs/images/browserscan.jpg))                   |
 
 
-### 🎯 Cloudflare Turnstile → Success via `click_turnstile()`
+### 🎯 Cloudflare Turnstile → `click_turnstile()` (clicks the checkbox, reports the outcome honestly)
 
-<img src="docs/images/turnstile.jpg" alt="Cloudflare Turnstile success" width="500">
+<img src="docs/images/turnstile.jpg" alt="Cloudflare Turnstile widget" width="500">
 
-`click_turnstile()` auto-detects the widget via 6 selector fallback (`iframe[src*=challenges.cloudflare.com]`, `[data-sitekey]`, `.cf-turnstile`, …), computes checkbox position (offset_x=30 from widget left), and clicks with a 3-step Bezier-like approach — combined with Camoufox's native `humanize` + `disable_coop` for cross-origin iframe click.
+`click_turnstile()` auto-detects the widget via 6 selector fallback (`iframe[src*=challenges.cloudflare.com]`, `[data-sitekey]`, `.cf-turnstile`, …), computes checkbox position (offset_x=30 from widget left), and clicks with a pre-drift approach — combined with Camoufox's native `humanize` + `disable_coop` for cross-origin iframe click. It then reports what it **observed**: the response token, the final page title/URL, whether a challenge interstitial still shows, and a warning if the widget uses a Cloudflare **test sitekey** (whose result is fixed and proves nothing).
 
-**Scope:** works on **Interactive Turnstile** (visible iframe widget). **Managed Challenge** interstitials ("Just a moment...") render the widget in shadow DOM — not supported here; use sister project [mcp-stealth-chrome](https://github.com/RobithYusuf/mcp-stealth-chrome) (Chrome+CDP) for those. Real-world bypass success also depends on IP reputation and browser fingerprint — code alone doesn't guarantee it.
+**Why a Playwright click often isn't enough.** A Playwright click is delivered at the browser→renderer boundary, so its event carries `mozInputSource=0` / `pointerType=""` rather than a hardware pointer — and Cloudflare commonly rejects it on a real interactive challenge, re-issuing it (watch for a `cf_chl_rc_ni` cookie). A click that *lands* is not a challenge that *passed*, so `click_turnstile` returns an error rather than a false "solved" when no usable token results.
+
+### 🖱️ Real OS click → passes interactive Turnstile (macOS): `turnstile_coords` + `os_click_xy`
+
+A **real OS cursor click** (CoreGraphics `CGEvent`) arrives with a genuine hardware-input origin (`mozInputSource=1`) and passes an interactive Turnstile where a synthetic click is rejected. The catch found the hard way: a Juggler/Playwright command issued on the challenge tab *next to* the click makes Turnstile reject it — so the locate and the click must be **two separate MCP calls**:
+
+```
+turnstile_coords          → {found, x, y, width, height}   # locate the checkbox (no click)
+os_click_xy  x  y          → real OS click at those coords   # click only, nothing else on the tab
+```
+
+Verified passing from a cold start on `nopecha.com/demo/cloudflare`. Requirements and fallbacks:
+- **Headed** browser (`headless=false`): it drives the real cursor and brings the window frontmost, one click at a time — it cannot run headless or at scale. **macOS is verified**; **Windows** (`SendInput`) and **Linux** (`xdotool`, X11 only) backends are implemented but **not yet tested**.
+- **macOS Accessibility permission** (one-time, per host app). macOS forbids an app from granting it to itself, so if it is missing `os_click_xy` opens the native permission dialog, waits briefly to **auto-click once granted**, and otherwise **parks the cursor on the checkbox** so a person finishes with one ordinary left-click. Windows and Linux need no such permission.
+- Not a silver bullet: input origin is necessary but not sufficient — IP reputation, session age and fingerprint still weigh in.
+
+**The reliable, no-cost path for repeat runs** is to solve once (any of the above, or a real device), then reuse the resulting `cf_clearance` with `storage_state_save` / `storage_state_load` — same profile, IP and UA, within the cookie's TTL.
 
 ### 🧪 bot.sannysoft.com → Firefox Fingerprint Pass
 
@@ -132,7 +148,7 @@ The browser lands in `%LOCALAPPDATA%\camoufox`, profile/screenshots/sessions in
 
 That's all. Camoufox browser binary (~80MB) downloads automatically on first launch.
 
-## All 133 Tools
+## All 135 Tools
 
 Grouped by area. **[→ Full reference, every tool and parameter](https://github.com/RobithYusuf/mcp-camoufox/blob/main/docs/TOOLS.md)**
 
@@ -143,7 +159,7 @@ Grouped by area. **[→ Full reference, every tool and parameter](https://github
 | DOM &amp; Content | 7 | `browser_snapshot`, `screenshot`, `get_text` |
 | Element Interaction | 12 | `click`, `click_text`, `click_role` |
 | Keyboard | 2 | `type_text`, `press_key` |
-| Mouse XY | 4 | `mouse_click_xy`, `mouse_move`, `click_turnstile` |
+| Mouse XY | 6 | `mouse_click_xy`, `mouse_move`, `click_turnstile`, `turnstile_coords`, `os_click_xy` |
 | Wait | 7 | `wait_for`, `wait_for_navigation`, `wait_for_url` |
 | Tabs | 4 | `tab_list`, `tab_new`, `tab_select` |
 | Cookies | 3 | `cookie_list`, `cookie_set`, `cookie_delete` |
@@ -171,7 +187,7 @@ Grouped by area. **[→ Full reference, every tool and parameter](https://github
 | Debug | 6 | `server_status`, `get_page_errors`, `export_har` |
 | Site Automation | 2 | `chatgpt_generate_image`, `chatgpt_generate_batch` |
 
-<sub>32 categories, 133 tools. The full table lives in
+<sub>32 categories, 135 tools. The full table lives in
 [docs/TOOLS.md](https://github.com/RobithYusuf/mcp-camoufox/blob/main/docs/TOOLS.md) so this page stays readable — nothing was dropped, and a script
 checks both against the running server's tool registry.</sub>
 

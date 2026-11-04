@@ -1,4 +1,4 @@
-# mcp-camoufox — all 133 tools
+# mcp-camoufox — all 135 tools
 
 The authoritative tool reference. Every tool the server registers is listed here with its
 parameters and behaviour; the [README](../README.md) carries the category summary.
@@ -70,14 +70,16 @@ Anything that adds, removes or changes a tool must update this file in the same 
 | `press_key` | Key or combo: `Enter`, `Escape`, `Tab`, `Control+a`, `Meta+c`              |
 
 
-### Mouse XY (4)
+### Mouse XY (6)
 
 
 | Tool              | Description                                                                                                                                                                                                                 |
 | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mouse_click_xy`  | Click at exact coordinates. Optional `steps` (0=instant, 15-30=human-like pre-movement)                                                                                                                                     |
-| `mouse_move`      | Move cursor to coordinates. Optional `steps` for interpolated path                                                                                                                                                          |
-| `click_turnstile` | Auto-find + humanized click on Cloudflare Turnstile widget. Params: `offset_x` (default 30), `offset_y`, `wait_render_ms`. Works on Interactive Turnstile (visible iframe widget). Not for Managed Challenge interstitials. |
+| `mouse_click_xy`  | Click at exact coordinates. Optional `steps` curves the pre-movement path (shape only — the event is still Playwright-synthesized, mozInputSource=0, not a hardware pointer)                                                 |
+| `mouse_move`      | Move cursor to coordinates. Optional `steps` interpolates the path. Still a synthesized event, not a hardware-origin one                                                                                                     |
+| `click_turnstile` | Playwright-click a Cloudflare Turnstile checkbox. Params: `offset_x` (default 30), `offset_y`, `wait_render_ms`, `max_attempts`. Reports the response token AND the final title/URL + whether a challenge still shows, flags a TEST sitekey, and errors when no token results — a Playwright click (mozInputSource=0) is often rejected by Cloudflare, so a landed click is not a passed challenge. For a real OS click that DOES pass interactive Turnstile on macOS, use `turnstile_coords` + `os_click_xy`; or reuse a cf_clearance via `storage_state_save/load`. |
+| `turnstile_coords`| Locate a Turnstile checkbox and return its VIEWPORT `{found,x,y,width,height}` WITHOUT clicking. Pair with `os_click_xy` in a SEPARATE call — the frame-API locate touches the challenge iframe, which Turnstile rejects if it happens next to the click, so locate and click must be different MCP calls. |
+| `os_click_xy`     | **Headed desktop.** Deliver a REAL OS cursor click at a VIEWPORT x,y — hardware-input origin (`mozInputSource=1`) that passes interactive Turnstile where a synthetic click fails. **macOS verified (CGEvent); Windows (SendInput) and Linux (xdotool/X11) implemented but not yet tested.** Click only (no locate/reads), so pass coords from a prior `turnstile_coords`. macOS needs Accessibility; if missing it opens the permission dialog, waits briefly to auto-click on grant, else parks the cursor on the target for a one-click human handoff. Windows/Linux need no permission but a real desktop session (Linux = X11, not Wayland). |
 | `drag_and_drop`   | Drag between two elements                                                                                                                                                                                                   |
 
 
@@ -279,7 +281,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 | Tool              | Description                                                                        |
 | ----------------- | ---------------------------------------------------------------------------------- |
 | `session_warmup`  | Visit Google/Wikipedia (random) before targeting protected site. Helps IP scoring. |
-| `detect_anti_bot` | Heuristic detection of CF/DataDome/Akamai/PerimeterX/Imperva/reCAPTCHA/hCaptcha.   |
+| `detect_anti_bot` | Heuristic detection of CF/DataDome/Akamai/PerimeterX/Imperva/reCAPTCHA/hCaptcha. Also reports `challenged`: whether the page is currently a block/verification interstitial vs. a vendor merely present on already-passed content. |
 
 
 ### Assertions (4)

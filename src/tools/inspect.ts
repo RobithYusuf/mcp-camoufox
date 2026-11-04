@@ -9,6 +9,7 @@ import { S, PROFILE_DIR, SCREENSHOT_DIR, getPage, networkRequests } from "../sta
 import { PKG_VERSION, ACTION_TIMEOUT, jsStr, resolveOutPath,
          refLocator } from "../helpers.js";
 import { regTool } from "../server.js";
+import { osClickViewport, osInputError } from "../os-input.js";
 
 // ── Tools: Element Inspection ──────────────────────────────────────────────
 
@@ -143,7 +144,7 @@ regTool("sessionstorage_set", "Set a sessionStorage item.", {
 
 // ── Tools: Mouse XY ────────────────────────────────────────────────────────
 
-regTool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpolated pre-movement (human-like).", {
+regTool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpolated pre-movement to curve the path. Note: 'human-like' here means the path SHAPE only — the event is still Playwright-synthesized (mozInputSource=0, pointerType=\"\"), which some anti-bot checks on a hardware-input origin can tell apart from a real mouse.", {
   x: z.number(), y: z.number(),
   button: z.enum(["left", "right", "middle"]).default("left"),
   steps: z.number().default(0).describe("Interpolation steps for pre-click movement (0=instant, 15-30=human-like)"),
@@ -158,7 +159,7 @@ regTool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpol
   return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button} steps=${steps}` }] };
 });
 
-regTool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-like).", {
+regTool("mouse_move", "Move mouse to x,y. steps>0 interpolates the path (curved, not teleported). The move is still a Playwright-synthesized event, not a hardware-origin one.", {
   x: z.number(), y: z.number(),
   steps: z.number().default(0).describe("Interpolation steps (0=instant jump, 15-30=smooth)"),
 }, async ({ x, y, steps }) => {
@@ -167,7 +168,7 @@ regTool("mouse_move", "Move mouse to x,y. steps>0 interpolates path (human-like)
   return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y}) steps=${steps}` }] };
 });
 
-regTool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox. Locates the widget via in-page selectors AND the Playwright frame API (handles closed shadow roots that document.querySelector misses), polls for render, skips if already solved, then does a humanized real-mouse click with retries + small nudge, verifying the cf-turnstile-response token after each attempt. Managed Challenge full-page interstitials still need mcp-stealth-chrome.", {
+regTool("click_turnstile", "Click a Cloudflare Interactive Turnstile checkbox. Locates the widget via in-page selectors AND the Playwright frame API (handles closed shadow roots that document.querySelector misses), polls for render, skips if already solved, then does a real-mouse click with retries + small nudge. Reports what it OBSERVED afterwards — the response token, plus the final page title/URL and whether a challenge is still showing — because a Playwright-synthesized click is often rejected by Cloudflare (the event carries mozInputSource=0 / pointerType=\"\", not a hardware pointer), so a click that lands is not the same as a challenge that passed. A widget on a Cloudflare TEST sitekey (always-pass/always-block/force-interactive) is flagged, since its outcome proves nothing about a real one. This is the Playwright-click path; on macOS a REAL OS click that passes checks a synthetic one does not is available via turnstile_coords + os_click_xy (two separate calls).", {
   offset_x: z.number().default(30).describe("Pixels from widget left edge to the checkbox (calibrated for CF checkbox)"),
   offset_y: z.number().optional().describe("Vertical offset from widget top (default = height/2)"),
   wait_render_ms: z.number().default(500).describe("Wait before first detection to let widget render"),
@@ -230,6 +231,23 @@ regTool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox
     }).catch(() => false);
   };
 
+  // What the page looks like after a click — a token alone lies in two directions:
+  // a Cloudflare TEST sitekey mints a token that proves nothing, and on a real
+  // interstitial the host page can stay titled "Just a moment..." (403) even
+  // after the widget is clicked. Read both so the reply can't be a false pass.
+  const readState = async (): Promise<{ title: string; url: string; challenged: boolean; testKey: string | null }> => {
+    return await page.evaluate(() => {
+      var el = document.querySelector('[data-sitekey]') as HTMLElement | null;
+      var key = el ? (el.getAttribute('data-sitekey') || '') : '';
+      // CF's documented dummy sitekeys all match this shape (1x/2x/3x + zeros);
+      // their outcome is fixed by Cloudflare, not earned by the client.
+      var isTest = /^[123]x0{20}/i.test(key) || /0000000000000000/.test(key);
+      var t = document.title || '';
+      var challenged = /just a moment|checking your browser|verifying you are human|performing security/i.test(t);
+      return { title: t, url: location.href, challenged: challenged, testKey: isTest ? key : null };
+    }).catch(() => ({ title: "", url: "", challenged: false, testKey: null }));
+  };
+
   // Poll for the widget to render (~6s).
   let coords: TSCoords | null = null;
   for (let i = 0; i < 12 && !coords; i++) {
@@ -243,7 +261,11 @@ regTool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox
   }
 
   if (!coords) {
-    return { content: [{ type: "text", text: "Turnstile widget not found — selector + frame-API both missed. Likely a Managed Challenge interstitial (use mcp-stealth-chrome) or not rendered yet (retry with wait_render_ms=3000)." }] };
+    const st = await readState();
+    const hint = st.challenged
+      ? ` The page is still a challenge interstitial (title "${st.title}") — the checkbox usually sits in a cross-origin, closed-shadow iframe this tool cannot always reach. A Playwright click often will not pass it regardless; a cf_clearance from one manual/real-device solve, reused via storage_state_save/load, is the reliable path.`
+      : " Retry with wait_render_ms=3000 if the widget simply had not rendered yet.";
+    return { content: [{ type: "text", text: `IS_ERROR: Turnstile widget not found — selector + frame-API both missed.${hint}` }], isError: true };
   }
 
   // Click with retries. Each attempt re-locates (widget can shift), applies a tiny
@@ -261,7 +283,7 @@ regTool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox
     const targetY = coords.top + (offset_y ?? Math.floor(coords.height / 2)) + nudge;
     lastTarget = `${targetX},${targetY}`;
 
-    // Single pre-drift from off-target, then direct real-mouse click. Camoufox's
+    // Single pre-drift from off-target, then direct Playwright click. Camoufox's
     // humanize layer handles path curvature + timing; extra Bezier hops are redundant.
     await page.mouse.move(targetX + 180, targetY - 80, { steps: 15 });
     await page.waitForTimeout(150);
@@ -273,7 +295,75 @@ regTool("click_turnstile", "Auto-solve Cloudflare Interactive Turnstile checkbox
     }
   }
 
-  return { content: [{ type: "text", text: `Turnstile ${solved ? "SOLVED ✓" : "clicked but token not detected"} at (${lastTarget}) via ${coords?.found ?? "?"}${solved ? "" : " — if still unsolved it may be a Managed Challenge (use mcp-stealth-chrome) or needs a screenshot to confirm 'Success!'"}` }] };
+  const st = await readState();
+  const lines: string[] = [];
+  lines.push(`Turnstile: clicked at (${lastTarget}) via ${coords?.found ?? "?"}; response token ${solved ? "present" : "NOT present"}.`);
+  lines.push(`Page after: title "${st.title}" — ${st.url}`);
+  if (st.testKey) {
+    lines.push(`⚠ This is a Cloudflare TEST sitekey (${st.testKey}). Its result is fixed by Cloudflare and proves nothing about a real challenge — do not cite it as evidence of bypassing Turnstile.`);
+  }
+  if (solved && !st.challenged) {
+    lines.push(`Token present and no challenge interstitial remains${st.testKey ? " — but see the test-sitekey note above." : "."}`);
+  } else if (st.challenged) {
+    lines.push(`A challenge interstitial is STILL showing, so the Playwright click did not pass. A synthesized click carries mozInputSource=0 / pointerType="" and Cloudflare commonly rejects it (watch for a cf_chl_rc_ni cookie). On macOS the reliable path is turnstile_coords + os_click_xy (a REAL OS click, delivered in its own call); otherwise reuse a cf_clearance from one real solve via storage_state_save/load. Confirm with a screenshot either way.`);
+  } else {
+    lines.push(`No response token appeared and no obvious interstitial — the widget may not have processed the click. Take a screenshot to confirm, or retry.`);
+  }
+  // No usable token means the click did not achieve a pass — a failed outcome,
+  // surfaced as an error so a caller cannot read it as success.
+  const isError = !solved;
+  return { content: [{ type: "text", text: (isError ? "IS_ERROR: " : "") + lines.join("\n") }], ...(isError ? { isError: true } : {}) };
+});
+
+regTool("turnstile_coords", "Locate a Cloudflare Turnstile checkbox and return its VIEWPORT x,y (JSON {found,x,y,width,height}) WITHOUT clicking. Pair with os_click_xy in a SEPARATE call: the frame-API locate here touches the challenge iframe, which Turnstile rejects if it happens next to the click — so locating and clicking must be different MCP calls.", {
+  wait_render_ms: z.number().default(500).describe("Wait before detection to let the widget render"),
+}, async ({ wait_render_ms }) => {
+  const page = getPage();
+  await page.waitForTimeout(wait_render_ms);
+  // Same two-path locate as click_turnstile: light-DOM selectors, then the frame API.
+  const viaSel = await page.evaluate(() => {
+    const sels = ['iframe[src*="challenges.cloudflare.com"]','iframe[src*="turnstile"]','[data-testid*="challenge-widget"]','[data-testid*="turnstile"]','[data-sitekey]','.cf-turnstile'];
+    for (const sel of sels) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      let r = el.getBoundingClientRect();
+      if (r.width < 50 || r.height < 20) continue;
+      el.scrollIntoView({ block: "center", inline: "center" });
+      r = el.getBoundingClientRect();
+      return { found: sel, left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) };
+    }
+    return null;
+  }).catch(() => null) as any;
+  let box = viaSel;
+  if (!box) {
+    for (const frame of page.frames()) {
+      const u = frame.url() || "", n = frame.name() || "";
+      if (!(/challenges\.cloudflare\.com|turnstile/i.test(u) || /^cf-chl-widget/i.test(n))) continue;
+      const el = await frame.frameElement().catch(() => null);
+      if (!el) continue;
+      await el.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
+      const b = await el.boundingBox().catch(() => null);
+      if (b && b.width >= 50 && b.height >= 20) { box = { found: `frame:${n || u.slice(0, 40)}`, left: Math.round(b.x), top: Math.round(b.y), width: Math.round(b.width), height: Math.round(b.height) }; break; }
+    }
+  }
+  if (!box) return { content: [{ type: "text", text: "IS_ERROR: Turnstile widget not found." }], isError: true };
+  // Checkbox sits ~30px from the widget's left edge, vertically centered.
+  const x = box.left + 30, y = box.top + Math.floor(box.height / 2);
+  return { content: [{ type: "text", text: JSON.stringify({ found: box.found, x, y, width: box.width, height: box.height }) }] };
+});
+
+regTool("os_click_xy", "Headed desktop: deliver a REAL OS cursor click at the given VIEWPORT x,y — a hardware-input-origin click (mozInputSource=1) that a synthetic Playwright click is not, so it passes an interactive Cloudflare Turnstile a synthetic click cannot. macOS is verified (CoreGraphics CGEvent); Windows (SendInput/mouse_event) and Linux (xdotool, X11) backends are implemented but NOT yet tested. Does ONLY the click (no locate, no page reads) — that isolation is essential: a Juggler command on the challenge tab next to the click makes Turnstile reject it, so get the coordinates in a SEPARATE prior call (turnstile_coords) and click here. On macOS, if Accessibility permission is missing this opens the permission dialog, waits briefly for a grant to auto-click, and otherwise parks the cursor on the target so a human finishes with one ordinary left-click. Windows/Linux need no such permission but require a real (non-headless, non-Wayland-for-Linux) desktop session.", {
+  x: z.number().describe("Viewport X (e.g. from turnstile_coords)"),
+  y: z.number().describe("Viewport Y (e.g. from turnstile_coords)"),
+}, async ({ x, y }) => {
+  const err = osInputError();
+  if (err) return { content: [{ type: "text", text: "IS_ERROR: " + err }], isError: true };
+  const page = getPage();
+  const vp = page.viewportSize() || { width: 1280, height: 720 };
+  const res = await osClickViewport(S.activeProfileDir || "", x, y, vp.height);
+  // humanHandoff is not a hard failure: the cursor is parked and a person can finish.
+  const prefix = res.ok ? "" : (res.humanHandoff ? "HUMAN_CLICK_NEEDED: " : "IS_ERROR: ");
+  return { content: [{ type: "text", text: prefix + res.detail }], ...(res.ok ? {} : { isError: true }) };
 });
 
 regTool("drag_and_drop", "Drag from one element to another.", {

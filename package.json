@@ -1,7 +1,7 @@
 {
   "name": "mcp-camoufox",
   "version": "0.11.1",
-  "description": "MCP server for stealth browser automation via Camoufox — 133 tools, plus a browserless TLS-impersonating HTTP path",
+  "description": "MCP server for stealth browser automation via Camoufox — 135 tools, plus a browserless TLS-impersonating HTTP path",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

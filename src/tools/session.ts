@@ -190,7 +190,7 @@ regTool("mouse_drift", "Random mouse movements over a duration — builds up mou
   return { content: [{ type: "text", text: `mouse_drift: ${points} points over ${duration_ms}ms` }] };
 });
 
-regTool("mouse_record", "Start recording mouse positions in the page (replay with mouse_replay). Re-calling replaces any previous recorder instead of leaking its listener.", {
+regTool("mouse_record", "Start recording mouse POSITIONS in the page (replay with mouse_replay). Re-calling replaces any previous recorder instead of leaking its listener. Captures mousemove clientX/Y only — NOT clicks, button presses, or dwell. Also, mousemove inside a cross-origin iframe (e.g. a Cloudflare Turnstile widget) is delivered to the iframe's own document, not the top page, so movement over such a widget is NOT recorded.", {
   duration_ms: z.number().default(5000),
   max_points: z.number().default(2000).describe("Cap on stored points."),
 }, async ({ duration_ms, max_points }) => {
@@ -218,12 +218,12 @@ regTool("mouse_record", "Start recording mouse positions in the page (replay wit
   return { content: [{ type: "text", text: `mouse_record started: ${handle} (${duration_ms}ms, max ${max_points} points). Move the mouse, then call mouse_replay.` }] };
 });
 
-regTool("mouse_replay", "Replay last recorded mouse path with original timing.", {
+regTool("mouse_replay", "Replay the last recorded mouse path with original timing. Moves ONLY — it replays positions, and does not click (follow with click/mouse_click_xy). Note: a replayed move is still a Playwright-synthesized event (mozInputSource=0, pointerType=\"\"), so replaying a human path does not give it a hardware-input origin.", {
   speed: z.number().default(1.0).describe("Replay speed multiplier (1.0=original, 2.0=2x faster)"),
 }, async ({ speed }) => {
   const page = getPage();
   const points = await page.evaluate(`(window.__mcp_mouse_rec?.points || [])`) as any[];
-  if (!points.length) return { content: [{ type: "text", text: "No recording found — call mouse_record first" }] };
+  if (!points.length) return { content: [{ type: "text", text: "IS_ERROR: No recording found — call mouse_record first, then move the mouse." }], isError: true };
   let lastT = 0;
   for (const p of points) {
     const wait = (p.t - lastT) / speed;
@@ -231,7 +231,7 @@ regTool("mouse_replay", "Replay last recorded mouse path with original timing.",
     await page.mouse.move(p.x, p.y);
     lastT = p.t;
   }
-  return { content: [{ type: "text", text: `mouse_replay: ${points.length} points` }] };
+  return { content: [{ type: "text", text: `mouse_replay: ${points.length} points moved (no click issued).` }] };
 });
 
 // ── Tools: Session Warmup & Anti-Bot Detection ─────────────────────────────
@@ -258,21 +258,30 @@ regTool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to b
   return { content: [{ type: "text", text: `session_warmup: visited ${urls.length} sites over ${duration_ms}ms` }] };
 });
 
-regTool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva).", {}, async () => {
+regTool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva). Also reports `challenged`: whether the page is CURRENTLY a block/verification interstitial rather than the real content. A vendor present with challenged=false means the page passed and the vendor's scripts are merely loaded — the vendor's presence alone is not a block.", {}, async () => {
   const page = getPage();
   const result = await page.evaluate(`(() => {
     var html = document.documentElement.outerHTML.slice(0, 50000);
+    var title = document.title;
     var hits = [];
-    if (/challenges\\.cloudflare|__cf_chl|cf-turnstile|turnstile/i.test(html) || /cloudflare/i.test(document.title)) hits.push("Cloudflare");
+    if (/challenges\\.cloudflare|__cf_chl|cf-turnstile|turnstile/i.test(html) || /cloudflare/i.test(title)) hits.push("Cloudflare");
     if (/datadome|dd-captcha|js\\.datadome\\.co/i.test(html)) hits.push("DataDome");
     if (/akamai|akam\\.net|_bm\\.|bot-detector\\.akamai/i.test(html)) hits.push("Akamai");
     if (/perimeterx|px-captcha|_pxhd/i.test(html)) hits.push("PerimeterX");
     if (/imperva|incapsula/i.test(html)) hits.push("Imperva");
     if (/recaptcha|g-recaptcha|grecaptcha/i.test(html)) hits.push("reCAPTCHA");
     if (/hcaptcha/i.test(html)) hits.push("hCaptcha");
-    return { vendors: hits, title: document.title, url: location.href };
+    // An interstitial currently BLOCKING the page — distinct from a vendor whose
+    // scripts are just loaded on an already-passed page. Title phrasing is the
+    // clearest signal; __cf_chl_ / turnstile markers back it up for Cloudflare.
+    var challenged = /just a moment|checking your browser|verifying you are human|performing security|attention required|access denied|verify you are (a )?human|one more step|please wait/i.test(title)
+      || /__cf_chl_|cpo\\.src\\s*=\\s*["']\\/cdn-cgi\\/challenge-platform|id=["']cf-challenge|px-captcha|dd-captcha|geo\\.captcha-delivery/i.test(html);
+    return { vendors: hits, challenged: challenged, title: title, url: location.href };
   })()`) as any;
-  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  const note = result.vendors.length && !result.challenged
+    ? "\n\nNote: a vendor is present but challenged=false — the page appears to be real content, not a block."
+    : (result.challenged ? "\n\nNote: challenged=true — this page is an interstitial, not the content you navigated for." : "");
+  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) + note }] };
 });
 
 // ── Tools: Assertions ──────────────────────────────────────────────────────
