@@ -345,7 +345,25 @@ These are platform truths, not preferences. Each one cost a release.
   `npx camoufox-js fetch`: that resolves to the newest camoufox-js, and 0.13 stores the browser in a layout
   0.10 cannot read, so a first launch downloaded 1.3 GB and then failed (issue #7).
 - `version.json` survives the browser being deleted, and camoufox-js trusts it. `ensureCamoufoxBinary` checks
-  the executable too and says how to reinstall. It does not download again unasked.
+  the executable, and a missing one is downloaded like a first install. Refusing with a command to paste
+  was tried in 0.13.0 and left the developer asking why it would not just download.
+- The download runs in the background (`spawn`), never `execFileSync`. Blocking took about five minutes in
+  which the server answered nothing, not even `server_status`, and a client with a 60s tool timeout gave up
+  while the download went on. `browser_launch` waits `DOWNLOAD_WAIT_MS` (40s), then answers with the parsed
+  progress and asks to be called again; it checks before creating any profile folder, so those calls leave
+  nothing behind. A failed download says why and the next launch retries. `stopDownload` runs on exit.
+- `MCP_CAMOUFOX_FETCH_COMMAND` (a JSON argv) and `MCP_CAMOUFOX_DOWNLOAD_WAIT_MS` exist for the tests, which
+  stand a short script in for the 1.3 GB fetch. Nothing else should set them.
+- Every launch passes its own fingerprint (`tempIdentity` or `profileIdentity`) through `withRealInnerSize`.
+  fingerprint-generator 2.1.82 left `screen.innerWidth/innerHeight` at 0, which camoufox-js skips; 2.1.90,
+  what a fresh install resolves, sets them to the window's OUTER size. Camoufox then reported innerHeight 800
+  in a page laid out in 720: no browser chrome, and an innerHeight that disagrees with
+  `documentElement.clientHeight`. It shipped in 0.13.0 because the repo's lockfile still had 2.1.82: the
+  same lesson as the playwright-core pin. `npm update` the transitive generator packages before a release,
+  and run `smoke:install`, which uses what a user gets. `fingerprint_audit` flags the mismatch.
+- `normalizeUrl` (in `gotoReady` and the HTTP tools) turns a bare `example.com` into `https://example.com`,
+  and `localhost` or an IP address into `http://`. A new user's first `browser_launch(url="example.com")`
+  launched the browser and then failed with Playwright's "Invalid url".
 - Playwright starts a headed Firefox with `-foreground`, which takes keyboard focus from whatever the developer
   is typing in. `browser_launch` drops it with `ignoreDefaultArgs`.
 - `page.waitForURL` waits for the load event by default, and `waitForLoadState` for a lifecycle event, so both

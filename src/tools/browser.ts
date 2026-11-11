@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync } from "fs";
 import { join } from "path";
-import { profileIdentity, type IdentityLaunch } from "../identity.js";
+import { profileIdentity, tempIdentity, type IdentityLaunch } from "../identity.js";
 import { S, PROFILE_DIR, SCREENSHOT_DIR, getPage, ensureDirs,
          consoleMessages, networkRequests, storageSnapshots, interceptLog, dialogLog } from "../state.js";
 import { ACTION_TIMEOUT, safeName, ERROR_HOOK_JS, refLocator,
@@ -144,6 +144,9 @@ regTool(
     S.launchInFlight = new Promise<void>(res => { releaseLaunch = res; });
     try {
     ensureDirs();
+    // Before any folder is made: a launch that ends on "still downloading" must leave
+    // nothing behind, and an agent calls it again a minute later.
+    await ensureCamoufoxBinary();
     const w = width > 0 ? width : 1280;
     const h = height > 0 ? height : 800;
 
@@ -158,7 +161,6 @@ regTool(
       isTemp = true;
     }
 
-    await ensureCamoufoxBinary();
     // The selector engine behind refs has to exist before the context does.
     await refEngineReady();
     const { Camoufox } = await loadCamoufox();
@@ -169,16 +171,24 @@ regTool(
     // machine every session. A temp profile stays random. See identity.ts.
     let identity: IdentityLaunch | null = null;
     let identityNote = "Identity: random, as for every temp profile.";
+    const want = {
+      os: fpOs,
+      window: no_viewport ? null : [w, h] as [number, number],
+      screen: no_viewport ? null : { minWidth: w, minHeight: h + 60 },
+    };
     if (!isTemp) {
       try {
-        identity = await profileIdentity(profileDir, {
-          os: fpOs,
-          window: no_viewport ? null : [w, h],
-          screen: no_viewport ? null : { minWidth: w, minHeight: h + 60 },
-        });
+        identity = await profileIdentity(profileDir, want);
         identityNote = identity.note;
       } catch (e: any) {
         identityNote = `⚠ Identity: this profile's device could not be kept (${String(e?.message || e).slice(0, 160)}), so this launch has a random one, as a temp profile does.`;
+      }
+    }
+    if (!identity) {
+      // Drawn here rather than by camoufox-js, so the inner size is the real viewport's.
+      try { identity = await tempIdentity(want); }
+      catch (e: any) {
+        identityNote += `\n⚠ The fingerprint was left to camoufox-js (${String(e?.message || e).slice(0, 120)}), and with fingerprint-generator 2.1.90 or newer it reports the window's outer size as innerWidth/innerHeight. Run fingerprint_audit.`;
       }
     }
     const launchWith = (screen: { minWidth: number; minHeight: number } | null) => Camoufox({

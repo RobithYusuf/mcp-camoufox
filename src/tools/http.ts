@@ -8,7 +8,7 @@ import { S, getPage } from "../state.js";
 import { PKG_VERSION, ACTION_TIMEOUT, jsStr, safeName, writeSecretFile, expandHome, resolveOutPath,
          ERROR_HOOK_JS, totpFromSecret, clickWithFallback, clickNote, fillLocator, refLocator,
          scopeRoot, describeMatches, candidateList, SNAPSHOT_JS, formatSnapshot, snapshotPage,
-         trackPage, inflightOf, type ClickMode, gotoReady, settle } from "../helpers.js";
+         trackPage, inflightOf, type ClickMode, gotoReady, settle, normalizeUrl } from "../helpers.js";
 import { regTool } from "../server.js";
 import { maskUrl, maskHeaderValue, maskBody, maskedValue } from "../redact.js";
 
@@ -202,6 +202,7 @@ regTool("http_request",
     reveal_values: z.boolean().default(false).describe("Show Set-Cookie and tokens in the body and URLs. Masked by default."),
   },
   async ({ url, method, body, headers_json, impersonate, use_browser_cookies, proxy, timeout_ms, max_chars, reveal_values }) => {
+    url = normalizeUrl(url);
     let headers: Record<string, string> = {};
     if (headers_json) {
       try { headers = JSON.parse(headers_json); }
@@ -350,6 +351,7 @@ regTool("scrape_markdown",
     proxy: z.string().default(""),
   },
   async ({ url, use_browser, impersonate, max_chars, proxy }) => {
+    url = normalizeUrl(url);
     if (use_browser) {
       const page = getPage();
       await gotoReady(page, url, "domcontentloaded", 45000);
@@ -377,6 +379,7 @@ regTool("smart_fetch",
     proxy: z.string().default(""),
   },
   async ({ url, force_browser, impersonate, max_chars, proxy }) => {
+    url = normalizeUrl(url);
     let httpNote = "";
     if (!force_browser) {
       const r = await impitFetch({ url, impersonate, proxy: proxy || undefined });

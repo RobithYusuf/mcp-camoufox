@@ -11,6 +11,7 @@ import { PKG_VERSION, ACTION_TIMEOUT, jsStr, resolveOutPath, writeSecretFile, SE
          isSecretLocator, refLocator, observeClick, pointerMove, pointerClick, viewportOf, waitForUrl, urlMatches, evalMain } from "../helpers.js";
 import { isSecretName, maskUrl, maskHeaders, maskBody, maskedValue } from "../redact.js";
 import { regTool } from "../server.js";
+import { downloadState } from "../install.js";
 import { osClickViewport, osInputError } from "../os-input.js";
 
 // ── Tools: Element Inspection ──────────────────────────────────────────────
@@ -544,6 +545,12 @@ regTool("server_status", "Health check — verify server, browser status, active
   // nothing removes them on its own. They can hold logins, so the count is worth seeing.
   let oldTemp = 0;
   try { oldTemp = readdirSync(PROFILE_PARENT).filter(n => /^profile-fresh-\d/.test(n)).length; } catch {}
+  // The first-run browser download, while it runs and after it ends.
+  const dl = downloadState();
+  const download = dl ? {
+    state: dl.state, stage: dl.stage, percent: dl.percent, progress: dl.progress, eta: dl.eta,
+    seconds: Math.round(((dl.finishedAt || Date.now()) - dl.startedAt) / 1000), ...(dl.error ? { error: dl.error } : {}),
+  } : null;
   return { content: [{ type: "text", text: JSON.stringify({
     browser_up: S.browserUp,
     active_tabs: S.pages.length,
@@ -555,6 +562,7 @@ regTool("server_status", "Health check — verify server, browser status, active
     screenshot_dir: SCREENSHOT_DIR,
     ...(S.lastExitNote ? { last_exit: S.lastExitNote } : {}),
     ...(oldTemp ? { old_temp_profiles: oldTemp } : {}),
+    ...(download ? { camoufox_download: download } : {}),
   }, null, 2) }] };
 });
 
@@ -701,6 +709,9 @@ regTool("fingerprint_audit",
       out.colorDepth = s.colorDepth;
       out.pixelRatio = window.devicePixelRatio;
       out.inner = window.innerWidth + "x" + window.innerHeight;
+      // Only in standards mode is documentElement.clientHeight the viewport. In quirks mode
+      // (no doctype) it is the content's height: 68px on a short test page.
+      out.layout = document.compatMode === "CSS1Compat" && document.documentElement ? document.documentElement.clientWidth + "x" + document.documentElement.clientHeight : "";
       out.outer = window.outerWidth + "x" + window.outerHeight;
       out.hasChromeObject = typeof window.chrome !== "undefined";
       try { var dtf = Intl.DateTimeFormat().resolvedOptions(); out.timezone = dtf.timeZone; out.locale = dtf.locale; } catch (e) { out.timezone = "?"; out.locale = "?"; }
@@ -740,6 +751,13 @@ regTool("fingerprint_audit",
     const [ow, oh] = String(f.outer || "0x0").split("x").map(Number);
     if (ow - iw > 40) {
       flags.push(`outerWidth ${ow} but innerWidth ${iw} — ${ow - iw}px of horizontal browser chrome, which Firefox does not have. The window and viewport were sized independently.`);
+    }
+    // innerHeight is what the page is told; documentElement.clientHeight is what it lays
+    // out in. They differ only by a horizontal scrollbar. A spoofed innerHeight that does
+    // not match the layout is visible to any page that reads both.
+    const [, lh] = String(f.layout || "0x0").split("x").map(Number);
+    if (lh && (ih - lh > 30 || lh - ih > 1)) {
+      flags.push(`innerHeight ${ih} but the page lays out in ${lh}px (documentElement.clientHeight). The reported viewport is not the real one, and a page that compares the two can see it.`);
     }
     if (oh - ih > 200 || oh - ih < 0) {
       flags.push(`outerHeight ${oh} vs innerHeight ${ih} — a ${oh - ih}px vertical gap is not plausible browser chrome.`);

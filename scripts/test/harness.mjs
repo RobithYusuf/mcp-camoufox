@@ -51,8 +51,13 @@ export async function startServer(distPath = DIST, { home: givenHome = null } = 
     }
   });
   let id = 0;
+  // A call that never answers fails after RPC_TIMEOUT_MS instead of hanging the suite, so
+  // a hang shows up as one failed check with a name.
+  const RPC_TIMEOUT_MS = Number(process.env.MCPC_RPC_TIMEOUT_MS) || 180000;
   const rpc = (method, params) => new Promise(res => {
-    const i = ++id; pending.set(i, res);
+    const i = ++id;
+    const timer = setTimeout(() => { if (pending.delete(i)) res({ error: { message: `no answer to ${method} ${params?.name || ""} within ${RPC_TIMEOUT_MS / 1000}s` } }); }, RPC_TIMEOUT_MS);
+    pending.set(i, m => { clearTimeout(timer); res(m); });
     proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: i, method, params }) + "\n");
   });
   const call = async (name, args = {}) => {
@@ -129,12 +134,15 @@ export function runner(suiteName) {
     // state, so skipping earlier ones can make a later one pass or fail for the
     // wrong reason. test.mjs prints a banner whenever it is set.
     if (ONLY && !name.toLowerCase().includes(ONLY)) return;
+    // MCPC_TRACE=1 names each check as it starts, so a hang shows where it is.
+    if (process.env.MCPC_TRACE) console.error(`[trace ${new Date().toISOString().slice(11, 19)}] ${suiteName}: ${name}`);
     try {
       const [ok, detail] = await fn();
       results.push({ name, ok, detail: String(detail ?? "").replace(/\s+/g, " ").slice(0, 140) });
     } catch (e) {
       results.push({ name, ok: false, detail: "THREW: " + String(e?.message || e).replace(/\s+/g, " ").slice(0, 140) });
     }
+    if (process.env.MCPC_TRACE) { const r = results.at(-1); console.error(`${r.ok ? "PASS" : "FAIL"}  ${r.name.padEnd(52)} ${r.detail}`); }
   };
   const report = () => {
     const pass = results.filter(r => r.ok).length;

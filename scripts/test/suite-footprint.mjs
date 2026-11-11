@@ -4,7 +4,7 @@
 // detector would wrap and counts calls that did not come from its own scripts, so "the
 // page cannot see it" is read from the page, not assumed.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
 import { pathToFileURL } from "url";
 import { startServer, fixtureServer, refOf, runner, until, camoufoxCache, ROOT, DIST } from "./harness.mjs";
@@ -470,6 +470,22 @@ export default async function run() {
       const flagged = /window\.Notification is missing/.test(audit);
       return [t === "function" && /Notification present/.test(audit) && !flagged, `typeof=${t} auditLine=${/Notification present/.test(audit)} flagged=${flagged}`];
     });
+    // fingerprint-generator 2.1.90, which every fresh install resolves, fills in the
+    // window's inner size as its outer size, and Camoufox spoofed innerHeight to it: 800
+    // in a page laid out in 720. The repo's older lockfile hid it from every test here.
+    await check("the page's inner size is the real viewport, temp and persistent profile alike", async () => {
+      const read = async () => JSON.parse(await iso("JSON.stringify([innerWidth, innerHeight, outerWidth, outerHeight, document.documentElement.clientHeight])"));
+      const seen = [];
+      for (const fresh of [true, false]) {
+        await c("browser_close");
+        await c("browser_launch", { ...LAUNCH, fresh_profile: fresh, url: fx.url + "/static" });
+        seen.push(await read());
+      }
+      await c("browser_close");
+      await c("browser_launch", { ...LAUNCH, url: fx.url + "/" });
+      const ok = seen.every(g => g[0] === 1280 && g[1] === 720 && g[2] === 1280 && g[3] === 800 && g[4] === 720);
+      return [ok, seen.map(g => `inner ${g[0]}x${g[1]} outer ${g[2]}x${g[3]} layout ${g[4]}`).join(" | ")];
+    });
     if (hostOs !== "windows") {
       await check("claiming another OS is allowed, and the reply says what leaks", async () => {
         await c("browser_close");
@@ -635,20 +651,91 @@ export default async function run() {
       const expected = join(ROOT, "node_modules", "camoufox-js", "dist", "__main__.js");
       return [command === process.execPath && args[0] === expected && existsSync(args[0]) && args[1] === "fetch", `${command === process.execPath ? "node" : command} ${args.join(" ").replace(ROOT, ".")}`];
     });
-    // Deleting the browser to free disk space leaves version.json behind, and the
-    // launch then died on "ENOENT ... properties.json".
-    await check("a deleted browser is reported plainly, not as ENOENT", async () => {
+    // ── A new user's first launch ────────────────────────────────────────────
+    // The download ran with execFileSync inside browser_launch: about five minutes in which
+    // the server answered nothing, and a client with a 60s timeout gave up. It now runs in
+    // the background and browser_launch reports its progress. A stand-in replaces the
+    // 1.3 GB fetch: it prints camoufox-js's progress line, then links the real browser in
+    // (or fails, when told to).
+    const realCache = camoufoxCache(homedir());
+    const fakeFetch = join(mkdtempSync(join(tmpdir(), "mcp-camoufox-fakefetch-")), "fetch.mjs");
+    writeFileSync(fakeFetch, `
+      import { mkdirSync, symlinkSync, copyFileSync, appendFileSync } from "fs"; import { join } from "path";
+      const [mode, realCache, cache, ms] = process.argv.slice(2);
+      mkdirSync(join(cache, ".."), { recursive: true });
+      appendFileSync(cache + ".runs", "x");
+      process.stdout.write("Downloading Camoufox... [\\u2588\\u2588\\u2591\\u2591] 40% | ETA: 3s | 520 MB/1.3 GB\\r");
+      await new Promise(r => setTimeout(r, Number(ms)));
+      if (mode === "fail") { console.error("Error installing Camoufox: network unreachable"); process.exit(1); }
+      mkdirSync(cache, { recursive: true });
+      symlinkSync(join(realCache, "Camoufox.app"), join(cache, "Camoufox.app"));
+      copyFileSync(join(realCache, "version.json"), join(cache, "version.json"));
+      process.stdout.write("Downloading Camoufox... [\\u2588\\u2588\\u2588\\u2588] 100% | ETA: 0s | 1.3 GB/1.3 GB\\n");
+    `);
+    const withFetch = async (mode, ms, home, fn) => {
+      process.env.MCP_CAMOUFOX_FETCH_COMMAND = JSON.stringify([process.execPath, fakeFetch, mode, realCache, camoufoxCache(home), String(ms)]);
+      process.env.MCP_CAMOUFOX_DOWNLOAD_WAIT_MS = "600";
+      const srv = await startServer(DIST, { home });
+      delete process.env.MCP_CAMOUFOX_FETCH_COMMAND; delete process.env.MCP_CAMOUFOX_DOWNLOAD_WAIT_MS;
+      try { return await fn(srv); }
+      finally { try { await srv.call("browser_close"); } catch {} srv.kill(); try { rmSync(home, { recursive: true, force: true }); } catch {} }
+    };
+    const timedOn = async (srv, name, args) => { const t = Date.now(); const text = await srv.call(name, args); return { text, ms: Date.now() - t }; };
+
+    await check("a first launch downloads in the background and says how far it got", async () => {
+      return withFetch("ok", 2500, mkdtempSync(join(tmpdir(), "mcp-camoufox-newuser-")), async srv => {
+        const first = await timedOn(srv, "browser_launch", { ...LAUNCH, url: "about:blank" });
+        const status = JSON.parse(await srv.call("server_status"));
+        const answered = /being downloaded now: Downloading Camoufox 40% \(520 MB\/1\.3 GB\)/.test(first.text) && /Call browser_launch again/.test(first.text);
+        // The server keeps answering while it downloads, and the next launch picks it up.
+        const second = await until(async () => { const r = await timedOn(srv, "browser_launch", { ...LAUNCH, url: fx.url + "/static" }); return /Browser launched/.test(r.text) ? r : null; }, 20000, 300);
+        return [first.text.startsWith("IS_ERROR") && answered && first.ms < 3000 && status.camoufox_download?.percent === 40 && !!second,
+          `first ${first.ms}ms: ${first.text.slice(10, 120)} | status ${JSON.stringify(status.camoufox_download || null).slice(0, 80)} | then ${second ? "launched" : "never launched"}`];
+      });
+    });
+    // Deleting the browser to free disk space leaves version.json behind. The launch died
+    // on "ENOENT ... properties.json", then refused with a command to paste. It downloads
+    // again now, like a first install.
+    await check("a deleted browser is downloaded again, not reported as ENOENT", async () => {
       const home = mkdtempSync(join(tmpdir(), "mcp-camoufox-nobrowser-"));
       mkdirSync(camoufoxCache(home), { recursive: true });
       writeFileSync(join(camoufoxCache(home), "version.json"), JSON.stringify({ version: "158.0.1", release: "beta.41" }));
-      const bare = await startServer(DIST, { home });
-      try {
-        const started = Date.now();
-        const text = await bare.call("browser_launch", { ...LAUNCH, url: "about:blank" });
-        const ms = Date.now() - started;
-        return [text.startsWith("IS_ERROR") && /Camoufox is not installed/.test(text) && /camoufox-js@[\d.]+ fetch/.test(text) && !/ENOENT/.test(text) && ms < 5000, `${ms}ms ${text.slice(0, 110)}`];
-      } finally { bare.kill(); try { rmSync(home, { recursive: true, force: true }); } catch {} }
+      return withFetch("ok", 1500, home, async srv => {
+        const first = await srv.call("browser_launch", { ...LAUNCH, url: "about:blank" });
+        const later = await until(async () => { const r = await srv.call("browser_launch", { ...LAUNCH, url: "about:blank" }); return /Browser launched/.test(r) ? r : null; }, 20000, 300);
+        return [/being downloaded now/.test(first) && !/ENOENT/.test(first) && !!later, `${first.slice(10, 110)} | ${later ? "launched" : "never launched"}`];
+      });
     });
+    await check("a failed download says why and retries on the next launch", async () => {
+      const home = mkdtempSync(join(tmpdir(), "mcp-camoufox-faildl-"));
+      const runs = () => { try { return readFileSync(camoufoxCache(home) + ".runs", "utf8").length; } catch { return 0; } };
+      return withFetch("fail", 100, home, async srv => {
+        const first = await srv.call("browser_launch", { ...LAUNCH, url: "about:blank" });
+        const status = JSON.parse(await srv.call("server_status"));
+        const afterFirst = runs();
+        const again = await srv.call("browser_launch", { ...LAUNCH, url: "about:blank" });
+        const afterSecond = runs();
+        return [/could not be downloaded: the download exited with code 1/.test(first) && /network unreachable/.test(first) && status.camoufox_download?.state === "failed"
+          && /could not be downloaded/.test(again) && /camoufox-js@[\d.]+ fetch/.test(again) && afterFirst === 1 && afterSecond === 2,
+          `${first.slice(10, 110)} | status ${status.camoufox_download?.state} | download runs ${afterFirst} then ${afterSecond}`];
+      });
+    });
+
+    // ── What a new user types ────────────────────────────────────────────────
+    await check("a bare address is navigated to, not refused as an invalid URL", async () => {
+      const mod = await import(pathToFileURL(join(ROOT, "dist", "helpers.js")).href);
+      const cases = { "example.com": "https://example.com", "localhost:3000/x": "http://localhost:3000/x", "about:blank": "about:blank", "https://a.io": "https://a.io", "data:text/html,x": "data:text/html,x" };
+      const unit = Object.entries(cases).every(([k, v]) => mod.normalizeUrl(k) === v);
+      const bare = fx.url.replace(/^http:\/\//, "");
+      await c("browser_close");
+      const launched = await c("browser_launch", { ...LAUNCH, url: bare + "/static" });
+      const atLaunch = await iso("location.href");
+      const r = await c("navigate", { url: bare + "/" });
+      const at = await iso("location.href");
+      return [unit && !launched.startsWith("IS_ERROR") && atLaunch === fx.url + "/static" && !r.startsWith("IS_ERROR") && at === fx.url + "/",
+        `launch ${bare}/static -> ${atLaunch}; navigate ${bare}/ -> ${at} | unit=${unit}`];
+    });
+
   } finally {
     try { if (S) await S.call("browser_close"); } catch {}
     if (fx) fx.close(); if (fx2) fx2.close(); if (S) S.kill();

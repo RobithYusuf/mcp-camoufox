@@ -27,7 +27,7 @@ Use the browser when a page needs JavaScript, a login or a person looking at it.
 
 ## Install
 
-You need Node.js 18 or newer. The Camoufox browser downloads itself on first launch. That is a download of about 1.3 GB that takes a few minutes and uses about 2.4 GB of disk (measured on macOS arm64 with Camoufox 158).
+You need Node.js 18 or newer. The Camoufox browser downloads itself the first time `browser_launch` is called: about 1.3 GB, usually 2 to 5 minutes, about 2.4 GB on disk (measured on macOS arm64 with Camoufox 158). The download runs in the background. `browser_launch` answers within a minute with how far it got and asks to be called again, and `server_status` shows the progress. Tools that need no browser, such as `scrape_markdown` and `http_request`, work meanwhile. A browser deleted to free disk space is downloaded again the same way.
 
 Add the server to your client.
 
@@ -487,7 +487,8 @@ A fixed viewport does not follow the OS window. Call `set_viewport_size` after r
 | "A copy of Camoufox is already open" | Another browser is using the default profile. Close it, or launch with `fresh_profile=true`. |
 | A click reports no page change | The page may react later, so try `wait_for_change`. `assert_clickable` shows whether something covers the element. |
 | A ref stopped working | Refs belong to one snapshot. Call `browser_snapshot` again. |
-| "Camoufox is not installed" | The browser binary is gone, for example deleted to free disk space. Run the command the message gives. It downloads more than 1 GB. |
+| "Camoufox … is being downloaded now" | The first launch, or the browser was deleted. Wait a minute and call `browser_launch` again. `server_status` shows the progress. |
+| "Camoufox could not be downloaded" | The message says why. `browser_launch` retries; the command it names shows the full output in a terminal. |
 | `evaluate` returns `undefined` for a page variable | You passed `world="isolated"`, which shares only the DOM. The default `world="main"` reaches the page's variables. |
 | The first launch after an install fails with "Version information not found" | You are on 0.12.0 or older, which fetched the browser with a newer camoufox-js than it could read. Upgrade. |
 | `browser_launch` fails with `setDefaultViewport ... isMobile` | You are on a version before 0.9.3. Upgrade. |

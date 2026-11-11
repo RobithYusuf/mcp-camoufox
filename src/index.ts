@@ -19,6 +19,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { server } from "./server.js";
 import { shutdownBrowser, warmBrowserModules } from "./tools/browser.js";
+import { stopDownload } from "./install.js";
 
 // Each tool module registers itself on import. Import order only affects the
 // order tools appear in tools/list, never their behaviour.
@@ -51,6 +52,7 @@ function exitCleanly() {
   exiting = true;
   // Never let a wedged browser keep the process alive.
   setTimeout(() => process.exit(0), 20000).unref();
+  stopDownload();
   shutdownBrowser().catch(() => {}).finally(() => process.exit(0));
 }
 process.on("SIGINT", exitCleanly);

@@ -66,6 +66,20 @@ export function fitWindow(fingerprint: any, outerWidth: number, outerHeight: num
   return fp;
 }
 
+/** A fingerprint that leaves window.innerWidth and innerHeight to the real viewport.
+ *
+ *  fingerprint-generator 2.1.82 left them at 0, and camoufox-js skips a 0, so the page saw
+ *  the real 1280x720 viewport inside a 1280x800 window. 2.1.90, which every fresh install
+ *  resolves, fills them in as the window's OUTER size. Camoufox then spoofed innerHeight
+ *  to 800 while the page laid out in 720: a window with no browser chrome, and an
+ *  innerHeight that disagrees with documentElement.clientHeight, which any page can
+ *  compare. Measured on the published 0.13.0 from npx; the repo's older lockfile hid it. */
+export function withRealInnerSize(fingerprint: any): any {
+  const fp = JSON.parse(JSON.stringify(fingerprint));
+  if (fp?.screen) { fp.screen.innerWidth = 0; fp.screen.innerHeight = 0; }
+  return fp;
+}
+
 const NO_SCREEN = /No headers based on this input|relax or change some of the requirements/i;
 
 // Internals of the camoufox-js this package pins (^0.10.2). A version that moved them fails
@@ -142,6 +156,19 @@ export async function profileIdentity(
       note = `Identity: new device for this profile (${reason}). Later launches reuse it.`;
     }
   }
-  const fingerprint = want.window ? fitWindow(id.fingerprint, want.window[0], want.window[1]) : id.fingerprint;
+  const fingerprint = withRealInnerSize(want.window ? fitWindow(id.fingerprint, want.window[0], want.window[1]) : id.fingerprint);
   return { options: { fingerprint, os: id.os, webgl_config: id.webgl }, note };
+}
+
+/** A new random device for one launch of a temp profile, built the same way as a
+ *  persistent profile's so it goes through withRealInnerSize too. Left to camoufox-js, a
+ *  temp profile got the generator's inner size. Nothing is stored. */
+export async function tempIdentity(
+  want: { os: Os | undefined; window: [number, number] | null; screen: { minWidth: number; minHeight: number } | null },
+): Promise<IdentityLaunch> {
+  let drawn = await drawIdentity(want.os, want.screen);
+  if (!drawn) drawn = await drawIdentity(want.os, null);
+  if (!drawn) throw new Error("could not draw a fingerprint");
+  const fingerprint = withRealInnerSize(want.window ? fitWindow(drawn.fingerprint, want.window[0], want.window[1]) : drawn.fingerprint);
+  return { options: { fingerprint, os: drawn.os, webgl_config: drawn.webgl }, note: "Identity: random, as for every temp profile." };
 }

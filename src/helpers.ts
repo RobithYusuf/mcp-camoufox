@@ -863,9 +863,26 @@ export async function settle(page: Page, capMs: number, quietMs = 200): Promise<
 export const SETTLED_QUIET_MS = 30;
 
 /** goto + waitReady. Every navigation in this server goes through here. */
+/** What a person means by a bare address. "example.com" failed with Playwright's
+ *  "Invalid url" after a launch that otherwise worked, the first thing a new user tried.
+ *  A host gets https://, localhost and an IP address http://. Anything with a scheme,
+ *  about:, data: and the like is left alone. */
+export function normalizeUrl(raw: string): string {
+  const url = String(raw ?? "").trim();
+  if (!url) return url;
+  const host = url.match(/^([^/?#]+)/)?.[1] || "";
+  const local = /^(localhost|127(?:\.\d{1,3}){3}|\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3})(:\d+)?$/i.test(host);
+  if (local) return "http://" + url;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url;
+  if (url.startsWith("//")) return "https:" + url;
+  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?$/i.test(host)) return "https://" + url;
+  return url;
+}
+
 export async function gotoReady(
-  page: Page, url: string, waitUntil: WaitUntil = "domcontentloaded", timeout = 30000,
+  page: Page, rawUrl: string, waitUntil: WaitUntil = "domcontentloaded", timeout = 30000,
 ): Promise<void> {
+  const url = normalizeUrl(rawUrl);
   // Roughly one navigation in thirty, Camoufox never settles the commit promise
   // even though the navigation itself went through. Give commit the full budget
   // — a second goto issued while the first is still in flight makes BOTH fail,
