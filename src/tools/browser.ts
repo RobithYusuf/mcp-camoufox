@@ -2,54 +2,43 @@
 //
 // Registered by importing this module — see src/index.ts.
 import { z } from "zod";
-import { Camoufox } from "camoufox-js";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync } from "fs";
 import { join } from "path";
+import { profileIdentity, type IdentityLaunch } from "../identity.js";
 import { S, PROFILE_DIR, SCREENSHOT_DIR, getPage, ensureDirs,
          consoleMessages, networkRequests, storageSnapshots, interceptLog, dialogLog } from "../state.js";
 import { ACTION_TIMEOUT, safeName, ERROR_HOOK_JS, refLocator,
-         snapshotPage,
-         trackPage, gotoReady, waitReady, settle, historyStep } from "../helpers.js";
+         snapshotPage, refEngineReady,
+         trackPage, gotoReady, waitReady, settle, historyStep, detectEvalWorld } from "../helpers.js";
 import { stopBrowser, removeTempProfile, tempProfilePath, sweepAbandonedTempProfiles } from "../lifecycle.js";
 import { regTool } from "../server.js";
+import { ensureCamoufoxBinary } from "../install.js";
 
 // ── Tools: Browser Lifecycle ───────────────────────────────────────────────
 
-async function ensureCamoufoxBinary() {
-  const { execSync } = await import("child_process");
-  const { existsSync } = await import("fs");
-  const { join: pathJoin } = await import("path");
-  const os = await import("os");
+// camoufox-js (and the playwright-core it pulls in) is loaded on first use, not at
+// startup: the two imports were about 190ms of the server's 270ms initialize, paid
+// even by a session that only uses the HTTP tools. warmBrowserModules loads them in
+// the background once the client is connected, so browser_launch does not pay it either.
+let camoufoxMod: Promise<typeof import("camoufox-js")> | null = null;
+function loadCamoufox(): Promise<typeof import("camoufox-js")> {
+  if (!camoufoxMod) camoufoxMod = import("camoufox-js").catch((e) => { camoufoxMod = null; throw e; });
+  return camoufoxMod;
+}
+export function warmBrowserModules(): Promise<unknown> {
+  return Promise.all([refEngineReady(), loadCamoufox()]);
+}
 
-  const homeDir = os.homedir();
-  const platform = os.platform();
-  let cacheDir: string;
-  if (platform === "darwin") {
-    cacheDir = pathJoin(homeDir, "Library", "Caches", "camoufox");
-  } else if (platform === "win32") {
-    cacheDir = pathJoin(process.env.LOCALAPPDATA || pathJoin(homeDir, "AppData", "Local"), "camoufox");
-  } else {
-    cacheDir = pathJoin(process.env.XDG_CACHE_HOME || pathJoin(homeDir, ".cache"), "camoufox");
-  }
-  const versionFile = pathJoin(cacheDir, "version.json");
-  if (existsSync(versionFile)) return;
-
-  console.error("\n" + "=".repeat(60));
-  console.error("[mcp-camoufox] First-time setup: downloading Camoufox (~500MB)");
-  console.error("[mcp-camoufox] Please wait 2-5 minutes...");
-  console.error("=".repeat(60) + "\n");
-  const cmd = platform === "win32" ? "npx.cmd" : "npx";
-  // CRITICAL: redirect child stdout → parent stderr.
-  // stdio:'inherit' would pollute MCP JSON-RPC stdout channel with download
-  // progress text, causing client parse errors like:
-  //   "invalid character 'C' looking for beginning of value"
-  // (issue #1: 'C' = first byte of "Camoufox..." progress message).
-  execSync(`${cmd} camoufox-js fetch`, {
-    stdio: ["ignore", 2, 2], timeout: 900000,
-    env: { ...process.env, npm_config_yes: "true" },
-  });
-  console.error("\n[mcp-camoufox] Download complete.\n");
+/** The fingerprint OS for this launch. "auto" is the machine's own OS. Camoufox can claim
+ *  another one, but speechSynthesis keeps listing the host's voices (measured on macOS:
+ *  a Windows user agent with `urn:moz-tts:osx:` voices), and loading the other OS's
+ *  bundled fonts adds about four seconds and 450 MB to every launch. Left to itself
+ *  Camoufox picks Windows for two launches in three. */
+export function fingerprintOs(asked: string, platform: string = process.platform): "windows" | "macos" | "linux" | undefined {
+  if (asked === "windows" || asked === "macos" || asked === "linux") return asked;
+  if (asked === "random") return undefined;
+  return platform === "darwin" ? "macos" : platform === "win32" ? "windows" : platform === "linux" ? "linux" : undefined;
 }
 
 // Forget the browser. Everything a session holds lives here, so close, recover and an
@@ -61,6 +50,7 @@ export function resetBrowserState(): void {
   S.browserUp = false;
   S.activeProfileDir = null;
   S.activeProfileIsTemp = false;
+  S.evalIsolated = false;
   consoleMessages.length = 0;
   networkRequests.length = 0;
   S.networkSeq = 0;
@@ -103,29 +93,31 @@ export async function shutdownBrowser(): Promise<void> {
 
 regTool(
   "browser_launch",
-  "Launch Camoufox stealth browser and navigate to URL. Browser persists between calls. " +
-    "By default cookies/localStorage persist in ~/.camoufox-mcp/profile. " +
-    "Set fresh_profile=true to start with a clean temp profile (auto-cleaned on browser_close) — " +
-    "useful when switching between accounts on the same domain.",
+  "Launch the Camoufox stealth browser and open url. It stays running between calls. Cookies and " +
+  "storage persist in ~/.camoufox-mcp/profile unless fresh_profile=true; that profile also keeps one device " +
+  "(screen, GPU, cores) across launches, redrawn only for another os or a window its screen cannot hold. " +
+  "While a browser runs, the options are ignored: browser_close first.",
   {
     url: z.string().default("about:blank").describe("URL to navigate to"),
     headless: z.boolean().default(true).describe("Run without visible window"),
     humanize: z.boolean().default(false).describe("Human-like mouse movements"),
     geoip: z.boolean().default(true).describe("Auto-detect timezone from IP"),
     locale: z.string().default("en-US").describe("Browser locale"),
-    width: z.number().default(0).describe("WINDOW width (0 = default 1280). The viewport matches this width and is 80px shorter than the window height (browser chrome) — use set_viewport_size to set a viewport independently of the window."),
-    height: z.number().default(0).describe("WINDOW height (0 = default 800). See width."),
+    width: z.number().default(0).describe("WINDOW width (0 = 1280). The viewport has this width and is 80px shorter than the window; " +
+      "set_viewport_size changes the viewport alone."),
+    height: z.number().default(0).describe("WINDOW height (0 = 800). See width."),
     no_viewport: z.boolean().default(false).describe(
-      "Let the content area follow the real OS window instead of a fixed viewport (Playwright viewport:null). " +
-      "WARNING: this drops the window-size cap, so the viewport can end up LARGER than the spoofed screen — " +
-      "a window wider than its own screen is an easy anti-bot tell. Prefer set_viewport_size unless you need a full-window canvas."),
+      "Content follows the real OS window instead of a fixed viewport. WARNING: the viewport can then " +
+      "exceed the spoofed screen, an anti-bot tell. Prefer set_viewport_size."),
     fresh_profile: z.boolean().default(false).describe(
-      "Start with a clean temp profile (no carry-over cookies/cache). " +
-      "Temp dir is removed when browser_close is called. " +
-      "Use when switching between accounts on the same domain to avoid login session collisions."
+      "Clean temp profile, removed at browser_close. Keeps two accounts on one site apart."
     ),
+    os: z.enum(["auto", "windows", "macos", "linux", "random"]).default("auto").describe(
+      "Fingerprint OS. auto = this machine's: fastest, and the only one whose speech voices match. Another " +
+      "OS starts ~4s slower and its voices still name the host OS. random = Camoufox picks."),
+    ublock: z.boolean().default(true).describe("Load the bundled uBlock Origin. false saves ~350 MB, and pages load their ads and trackers."),
   },
-  async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile, no_viewport }) => {
+  async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile, no_viewport, os, ublock }) => {
     // Wait out a launch already in progress, then fall through to the
     // already-running path rather than building a second context.
     if (S.launchInFlight) { try { await S.launchInFlight; } catch {} }
@@ -167,14 +159,40 @@ regTool(
     }
 
     await ensureCamoufoxBinary();
+    // The selector engine behind refs has to exist before the context does.
+    await refEngineReady();
+    const { Camoufox } = await loadCamoufox();
 
-    let ctx: BrowserContext;
-    try {
-      ctx = await Camoufox({
+    const fpOs = fingerprintOs(os);
+    // A persistent profile keeps one device (screen, colour depth, GPU, cores)
+    // across launches; drawing a new one each time showed a site the same login on a new
+    // machine every session. A temp profile stays random. See identity.ts.
+    let identity: IdentityLaunch | null = null;
+    let identityNote = "Identity: random, as for every temp profile.";
+    if (!isTemp) {
+      try {
+        identity = await profileIdentity(profileDir, {
+          os: fpOs,
+          window: no_viewport ? null : [w, h],
+          screen: no_viewport ? null : { minWidth: w, minHeight: h + 60 },
+        });
+        identityNote = identity.note;
+      } catch (e: any) {
+        identityNote = `⚠ Identity: this profile's device could not be kept (${String(e?.message || e).slice(0, 160)}), so this launch has a random one, as a temp profile does.`;
+      }
+    }
+    const launchWith = (screen: { minWidth: number; minHeight: number } | null) => Camoufox({
         headless,
         humanize,
         geoip,
         locale,
+        ...(fpOs ? { os: fpOs } : {}),
+        ...(identity ? identity.options : {}),
+        // Allows the "mw:" prefix that evalMain uses for the caller's own JavaScript.
+        // Nothing runs in the page's world unless a tool is asked to.
+        main_world_eval: true,
+        ...(ublock ? {} : { exclude_addons: ["UBO"] }),
+        ...(screen ? { screen } : {}),
         user_data_dir: profileDir,
         disable_coop: true,
         // no_viewport: let the content follow the real window. We also drop the
@@ -197,8 +215,11 @@ regTool(
         // own handlers would race it and could exit first.
         handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
         firefox_user_prefs: {
+          // Deny notification requests without a prompt, the same thing Firefox's own
+          // "block new requests" setting stores. The API itself stays: turning it off
+          // with dom.webnotifications.enabled removed window.Notification, which no real
+          // Firefox lacks and which broke half of bot.sannysoft.com's own checks.
           "permissions.default.desktop-notification": 2,
-          "dom.webnotifications.enabled": false,
           "browser.translations.automaticallyPopup": false,
           // camoufox.cfg sets this to 0, which turns history off: goBack answers null
           // and history.back() does nothing, even over a pushState entry. 50 is stock
@@ -210,7 +231,22 @@ regTool(
           // this a paste-only framework field can never be filled.
           "dom.events.testing.asyncClipboard": true,
         },
-      } as any) as BrowserContext;
+      } as any) as Promise<BrowserContext>;
+
+    let ctx: BrowserContext;
+    try {
+      // Ask for a fingerprint whose screen holds the window. Left alone, about one launch
+      // in eleven drew a screen smaller than 1280x800 (measured over 300 fingerprints),
+      // and a window larger than its own display cannot be fixed after launch. The 60px
+      // is room for a menu bar or taskbar. A size no real screen has makes the generator
+      // refuse, so that request falls back to an unconstrained fingerprint and the
+      // viewport fit below.
+      try {
+        ctx = await launchWith(no_viewport ? null : { minWidth: w, minHeight: h + 60 });
+      } catch (e: any) {
+        if (no_viewport || !/No headers based on this input|relax or change some of the requirements/i.test(String(e?.message || e))) throw e;
+        ctx = await launchWith(null);
+      }
     } catch (e) {
       // Leave nothing behind from a launch that failed, unless a process somehow
       // still holds the folder.
@@ -249,6 +285,9 @@ regTool(
     trackPage(page);
     S.activePage = S.pages.indexOf(page);
     if (S.activePage < 0) S.activePage = 0;
+    // Which world does this build evaluate in? Only an isolated one has wrappedJSObject.
+    let world = await detectEvalWorld(page);
+    S.evalIsolated = world ?? false;
 
     // Camoufox picks the spoofed screen itself, and it is often smaller than the
     // size a caller asks for — a 1400-wide launch landed on a spoofed 1366x768
@@ -277,6 +316,8 @@ regTool(
       try {
         await gotoReady(page, url, "domcontentloaded", 30000);
         await settle(page, 1500);
+        // Asked again on a real document when the blank tab could not answer.
+        if (world === null) { world = await detectEvalWorld(page); S.evalIsolated = world ?? false; }
       } catch (e: any) {
         // Worth a distinct reply: the launch itself worked and the browser is running,
         // so the caller should navigate again rather than launch again.
@@ -290,8 +331,15 @@ regTool(
     let geom = "";
     try {
       const g: any = await page.evaluate(
-        `(() => ({ iw: innerWidth, ih: innerHeight, ow: outerWidth, oh: outerHeight, sw: screen.width, sh: screen.height }))()`);
-      geom = `\nViewport: ${g.iw}x${g.ih}  Window: ${g.ow}x${g.oh}  Screen: ${g.sw}x${g.sh}`;
+        `(() => ({ iw: innerWidth, ih: innerHeight, ow: outerWidth, oh: outerHeight, sw: screen.width, sh: screen.height, ua: navigator.userAgent }))()`);
+      // Read from the page, not from the option: this is what a site sees.
+      const claimed = /Windows/.test(g.ua) ? "windows" : /Macintosh|Mac OS X/.test(g.ua) ? "macos" : /Linux|X11/.test(g.ua) ? "linux" : "unknown";
+      const host = fingerprintOs("auto");
+      geom = `\nFingerprint OS: ${claimed}${host && claimed === host ? " (this machine's own)" : ""}`;
+      if (host && claimed !== host && claimed !== "unknown") {
+        geom += `\n⚠ The fingerprint claims ${claimed} on a ${host} machine. speechSynthesis still lists ${host}'s voices, and their voiceURI names the real OS, so a site that compares them to the user agent can tell. os="auto" avoids this. fingerprint_audit shows what the page sees.`;
+      }
+      geom += `\nViewport: ${g.iw}x${g.ih}  Window: ${g.ow}x${g.oh}  Screen: ${g.sw}x${g.sh}`;
       if (g.iw > g.sw || g.ih > g.sh) {
         geom += `\n⚠ Viewport is larger than the spoofed screen — a window bigger than its own display is an anti-bot tell. Shrink it with set_viewport_size, or relaunch without no_viewport.`;
       }
@@ -301,7 +349,10 @@ regTool(
         + ` so you get empty space instead. Call set_viewport_size(w,h) after resizing, or relaunch with`
         + ` no_viewport=true to let the content track the window live.)`;
     } catch {}
-    return { content: [{ type: "text", text: `Browser launched${profileNote}. URL: ${page.url()}\nTitle: ${title}${geom}` }] };
+    const worldNote = world === null
+      ? "\n⚠ Could not tell which JavaScript world evaluate runs in on this Camoufox build, so evaluate assumes the page's own. If page variables read as undefined, pass world=\"isolated\" to compare, or browser_close and launch again."
+      : "";
+    return { content: [{ type: "text", text: `Browser launched${profileNote}. URL: ${page.url()}\nTitle: ${title}\n${identityNote}${geom}${worldNote}` }] };
     } finally {
       releaseLaunch();
       S.launchInFlight = null;
@@ -311,8 +362,8 @@ regTool(
 
 regTool(
   "browser_close",
-  "Close the browser. Cookies are preserved in the persistent profile (~/.camoufox-mcp/profile). " +
-    "If the launch used fresh_profile=true, the temp profile is removed.",
+  "Close the browser. The persistent profile (~/.camoufox-mcp/profile) is kept; a fresh_profile temp " +
+  "profile is removed.",
   {},
   async () => {
     if (!S.browserContext) {
@@ -346,9 +397,8 @@ regTool(
 
 regTool(
   "reset_profile",
-  "Delete the persistent profile (~/.camoufox-mcp/profile) entirely. " +
-    "Use to start fresh — cookies, localStorage, history all wiped. " +
-    "Browser must be closed first (call browser_close before this).",
+  "DELETES the persistent profile (~/.camoufox-mcp/profile): every saved login, cookie, localStorage " +
+  "entry, history and its stored device. Only on an explicit request. Call browser_close first.",
   {},
   async () => {
     if (S.browserUp) {
@@ -419,31 +469,33 @@ regTool("reload", "Reload the current page.", {}, async () => {
 
 regTool(
   "browser_snapshot",
-  "Get visible interactive elements with ref IDs. Use refs with click/fill. Always call after navigation. " +
-    'On large pages (Outlook, dashboards) the response can be truncated — narrow with roles=["button","textbox"] ' +
-    "or paginate with offset/limit. Refs stay stable regardless of filters (every visible element is still numbered).",
+  "Visible interactive elements with ref IDs for click/fill. Call after every navigation: a ref from an " +
+  "earlier snapshot names nothing. Fields show label=\"…\"; iframe elements get refs like f1e3; open " +
+  "shadow roots are read too (closed ones cannot be). On a " +
+  "large page narrow with roles or page with offset/limit; numbering stays stable.",
   {
-    roles: z.array(z.string()).default([]).describe('Only show elements matching these tags/roles/types, e.g. ["button","link","textbox","tab"]. Empty = all.'),
-    offset: z.number().default(0).describe("Skip the first N matched elements (pagination)."),
-    limit: z.number().default(0).describe("Max elements to return (0 = no cap)."),
+    roles: z.array(z.string()).default([]).describe("Only these tags/roles/types, e.g. [\"button\",\"link\",\"textbox\"]. Empty = all."),
+    offset: z.number().default(0).describe("Skip the first N matches."),
+    limit: z.number().default(0).describe("Max elements (0 = all)."),
+    frames: z.boolean().default(true).describe("Include visible iframes. false = main document only."),
   },
-  async ({ roles, offset, limit }) => {
+  async ({ roles, offset, limit, frames }) => {
     const page = getPage();
-    const text = await snapshotPage(page, { roles, offset, limit });
+    const text = await snapshotPage(page, { roles, offset, limit, frames });
     return { content: [{ type: "text", text }] };
   }
 );
 
 regTool(
   "screenshot",
-  "Screenshot the page, or a single element with ref/selector (great for documenting one modal). " +
-    "Returns the IMAGE inline — no second Read call — plus the saved path. Set return_image=false for path only.",
+  "Screenshot the page, or one element by ref/selector. Returns the image inline plus the saved path; " +
+  "return_image=false returns only the path.",
   {
     name: z.string().default("page").describe("Filename prefix"),
     full_page: z.boolean().default(false).describe("Full scrollable page (ignored when ref/selector is set)"),
-    ref: z.string().default("").describe("Snapshot ref — capture just that element."),
-    selector: z.string().default("").describe("CSS selector — capture just that element (ignored if ref is set)."),
-    return_image: z.boolean().default(true).describe("Embed the PNG in the response. false = only save to disk."),
+    ref: z.string().default("").describe("Capture only this element."),
+    selector: z.string().default("").describe("Capture only this element (ignored if ref is set)."),
+    return_image: z.boolean().default(true).describe("false = save to disk only."),
   },
   async ({ name, full_page, ref, selector, return_image }) => {
     const page = getPage();

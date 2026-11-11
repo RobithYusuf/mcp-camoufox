@@ -22,7 +22,8 @@ const READ_WEB_STORAGE = `(() => {
   return { url: location.href, origin: location.origin, local: data.local, session: data.session };
 })()`;
 
-regTool("storage_state_save", "Save cookies + localStorage to a JSON file. Reload via storage_state_load on a fresh browser to skip login/CF entirely.", {
+regTool("storage_state_save", "Save cookies and localStorage to a JSON file; storage_state_load restores the login in a fresh " +
+  "browser.", {
   path: z.string().describe("Output file path (e.g. ~/.camoufox-mcp/sessions/site.json)"),
 }, async ({ path }) => {
   const page = getPage();
@@ -34,9 +35,9 @@ regTool("storage_state_save", "Save cookies + localStorage to a JSON file. Reloa
   return { content: [{ type: "text", text: `Saved storage state: ${target} (${cookies.length} cookies, ${Object.keys((origins as any).local || {}).length} localStorage, ${Object.keys((origins as any).session || {}).length} sessionStorage)` }] };
 });
 
-regTool("storage_state_load", "Load cookies + localStorage from a JSON file (created by storage_state_save). Bypass CF/login if session is fresh.", {
+regTool("storage_state_load", "Load cookies and localStorage from a storage_state_save file.", {
   path: z.string().describe("Path to storage state JSON file"),
-  navigate_to: z.string().optional().describe("URL to navigate to after loading (recommended — localStorage requires same-origin)"),
+  navigate_to: z.string().optional().describe("URL to open after loading (recommended: localStorage is per origin)"),
 }, async ({ path, navigate_to }) => {
   const page = getPage();
   const ctx = page.context();
@@ -74,8 +75,9 @@ regTool("storage_state_load", "Load cookies + localStorage from a JSON file (cre
   return { content: [{ type: "text", text: `Loaded storage state: ${data.cookies?.length || 0} cookies${navigate_to ? `, ${lsCount} localStorage, ${ssCount} sessionStorage (after navigate)` : " (call navigate to apply localStorage)"}` }] };
 });
 
-regTool("auth_capture", "Save current session as named auth state (e.g. logged-in user). Convenience wrapper: storage_state_save to ~/.camoufox-mcp/sessions/<name>.json", {
-  name: z.string().describe("Session name (e.g. 'github-bob', 'shopify-mystore')"),
+regTool("auth_capture", "Save the current session (cookies + localStorage) to ~/.camoufox-mcp/sessions/<name>.json. Shortcut " +
+  "for storage_state_save.", {
+  name: z.string().describe("Session name, e.g. 'github-bob'"),
 }, async ({ name }) => {
   const page = getPage();
   const ctx = page.context();
@@ -121,7 +123,7 @@ regTool("cookie_import_file", "Import cookies from a JSON file (Playwright forma
 
 // ── Tools: Humanize ────────────────────────────────────────────────────────
 
-regTool("humanize_click", "Click element with humanized mouse approach (3-step Bezier-like curve before click). Use for anti-bot pages.", {
+regTool("humanize_click", "Click with a curved mouse approach before the click, for anti-bot pages.", {
   ref: z.string().optional().describe("Element ref from snapshot"),
   selector: z.string().optional().describe("CSS selector"),
 }, async ({ ref, selector }) => {
@@ -152,11 +154,11 @@ regTool("humanize_click", "Click element with humanized mouse approach (3-step B
     await pointerMove(page, tx, ty, { steps: 8 });
     await page.waitForTimeout(70 + Math.random() * 50);
     await pointerClick(page, tx, ty);
-  });
+  }, 1000, ref);
   return { content: [{ type: "text", text: `humanize_click at (${Math.round(tx)},${Math.round(ty)}).\n${outcome.note}` }] };
 });
 
-regTool("humanize_type", "Type text with Gaussian-distributed delays between keystrokes (mean ~80ms, sigma ~30ms). Mimics human typing rhythm.", {
+regTool("humanize_type", "Type with Gaussian delays between keys (mean ~80ms, sigma ~30ms).", {
   ref: z.string().optional(),
   selector: z.string().optional(),
   text: z.string().describe("Text to type"),
@@ -176,7 +178,8 @@ regTool("humanize_type", "Type text with Gaussian-distributed delays between key
   return { content: [{ type: "text", text: `humanize_type typed ${text.length} chars` }] };
 });
 
-regTool("mouse_drift", "Random mouse movements over a duration — builds up mouse history before action (CF/DataDome behavior analysis).", {
+regTool("mouse_drift", "Random mouse movement for a while, to build mouse history before an action (CF/DataDome behaviour " +
+  "scoring).", {
   duration_ms: z.number().default(2000).describe("Total drift duration"),
   points: z.number().default(5).describe("Number of random destinations"),
 }, async ({ duration_ms, points }) => {
@@ -192,7 +195,8 @@ regTool("mouse_drift", "Random mouse movements over a duration — builds up mou
   return { content: [{ type: "text", text: `mouse_drift: ${points} points over ${duration_ms}ms` }] };
 });
 
-regTool("mouse_record", "Start recording mouse POSITIONS in the page (replay with mouse_replay). Re-calling replaces any previous recorder instead of leaking its listener. Captures mousemove clientX/Y only — NOT clicks, button presses, or dwell. Also, mousemove inside a cross-origin iframe (e.g. a Cloudflare Turnstile widget) is delivered to the iframe's own document, not the top page, so movement over such a widget is NOT recorded.", {
+regTool("mouse_record", "Record mouse positions in the page for mouse_replay (replaces any earlier recorder). mousemove only: " +
+  "no clicks, and nothing inside cross-origin iframes such as a Turnstile widget.", {
   duration_ms: z.number().default(5000),
   max_points: z.number().default(2000).describe("Cap on stored points."),
 }, async ({ duration_ms, max_points }) => {
@@ -220,7 +224,8 @@ regTool("mouse_record", "Start recording mouse POSITIONS in the page (replay wit
   return { content: [{ type: "text", text: `mouse_record started: ${handle} (${duration_ms}ms, max ${max_points} points). Move the mouse, then call mouse_replay.` }] };
 });
 
-regTool("mouse_replay", "Replay the last recorded mouse path with original timing. Moves ONLY — it replays positions, and does not click (follow with click/mouse_click_xy). Note: a replayed move is still a Playwright-synthesized event (mozInputSource=0, pointerType=\"\"), so replaying a human path does not give it a hardware-input origin.", {
+regTool("mouse_replay", "Replay the recorded mouse path with its timing. Moves only, never clicks, and it is still a " +
+  "synthesized event.", {
   speed: z.number().default(1.0).describe("Replay speed multiplier (1.0=original, 2.0=2x faster)"),
 }, async ({ speed }) => {
   const page = getPage();
@@ -238,7 +243,8 @@ regTool("mouse_replay", "Replay the last recorded mouse path with original timin
 
 // ── Tools: Session Warmup & Anti-Bot Detection ─────────────────────────────
 
-regTool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to build browsing history before targeting protected site. Helps with CF/DataDome IP scoring.", {
+regTool("session_warmup", "Visit harmless public sites (Google, Wikipedia) to build history before a protected site " +
+  "(CF/DataDome IP scoring).", {
   duration_ms: z.number().default(10000).describe("Total warmup time"),
   sites: z.array(z.string()).optional().describe("URLs to visit (default: google.com, wikipedia.org)"),
 }, async ({ duration_ms, sites }) => {
@@ -265,7 +271,9 @@ regTool("session_warmup", "Visit innocuous public sites (Google, Wikipedia) to b
   };
 });
 
-regTool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva). Also reports `challenged`: whether the page is CURRENTLY a block/verification interstitial rather than the real content. A vendor present with challenged=false means the page passed and the vendor's scripts are merely loaded — the vendor's presence alone is not a block.", {}, async () => {
+regTool("detect_anti_bot", "Guess the anti-bot vendor on the page (Cloudflare, DataDome, Akamai, PerimeterX, Imperva) and " +
+  "whether the page is currently a challenge (`challenged`). A vendor with challenged=false only means " +
+  "its scripts are loaded.", {}, async () => {
   const page = getPage();
   const result = await page.evaluate(`(() => {
     var html = document.documentElement.outerHTML.slice(0, 50000);
@@ -293,7 +301,8 @@ regTool("detect_anti_bot", "Heuristic detection of anti-bot vendor on current pa
 
 // ── Tools: Assertions ──────────────────────────────────────────────────────
 
-regTool("assert_element_visible", "Assert element exists and is visible. A failed assertion is an error reply, so batches and workflows count it.", {
+regTool("assert_element_visible", "Assert an element exists and is visible. A failure is an error reply, so batches and workflows count " +
+  "it.", {
   selector: z.string(),
 }, async ({ selector }) => {
   const page = getPage();
@@ -330,7 +339,7 @@ regTool("assert_url_matches", "Assert current URL matches pattern (substring or 
 
 // ── Tools: Convenience / Workflow ──────────────────────────────────────────
 
-regTool("click_and_wait", "Click element then wait for navigation or selector. Atomic — fewer roundtrips than separate click + wait_for.", {
+regTool("click_and_wait", "Click, then wait for a selector or URL in the same call.", {
   ref: z.string().optional(),
   selector: z.string().optional(),
   wait_for_url: z.string().optional().describe("URL substring to wait for after click"),
@@ -371,7 +380,8 @@ regTool("click_and_wait", "Click element then wait for navigation or selector. A
   return { content: [{ type: "text", text: `click_and_wait: navigated and loaded. ${beforeUrl} → ${page.url()}` }] };
 });
 
-regTool("wait_for_network_idle", "Wait until there are no in-flight requests for idle_ms continuously. Requests are counted from the moment the page was opened, so one that was ALREADY in flight when you call this is not mistaken for idle.", {
+regTool("wait_for_network_idle", "Wait until no request has been in flight for idle_ms. A request already in flight when this is " +
+  "called counts.", {
   idle_ms: z.number().default(500).describe("How long the network must stay quiet before returning."),
   timeout_ms: z.number().default(30000),
 }, async ({ idle_ms, timeout_ms }) => {
@@ -395,10 +405,9 @@ regTool("wait_for_network_idle", "Wait until there are no in-flight requests for
 
 regTool(
   "describe_page",
-  "Compact LLM-friendly page summary (title, heading, key buttons, forms). Cheaper than browser_snapshot for agent context. " +
-    "Also returns `intent` — a classified hint of what kind of page this is " +
-    "(login_email, login_password, otp_input, captcha, stay_signed_in, protect_account, error_page, " +
-    "consent, two_factor, account_disabled, content, unknown) — so the agent can branch with one read.",
+  "Compact page summary (title, headings, key buttons, forms), cheaper than browser_snapshot. Includes " +
+  "`intent`: login_email, login_password, otp_input, captcha, stay_signed_in, protect_account, " +
+  "error_page, consent, two_factor, account_disabled, content or unknown.",
   {},
   async () => {
     const page = getPage();

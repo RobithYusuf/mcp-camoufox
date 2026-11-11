@@ -43,9 +43,8 @@ regTool("console_get", "Get captured console messages.", {}, async () => {
 });
 
 regTool("network_start",
-  "Start capturing network requests. With capture_bodies=true also records request/response " +
-  "headers + text bodies (json/text/xml/form only, capped at body_limit bytes) so you can inspect " +
-  "API payloads via network_get_detail — no need to pivot to evaluate()+fetch().",
+  "Start capturing requests on every tab. capture_bodies=true also keeps headers and text bodies " +
+  "(json/text/xml/form, up to body_limit bytes) for network_get_detail.",
   {
     capture_bodies: z.boolean().default(false).describe("Also capture request/response headers and text bodies."),
     body_limit: z.number().default(50000).describe("Max bytes kept per request/response body."),
@@ -100,11 +99,11 @@ regTool("network_start",
   });
 
 regTool("network_get",
-  "List captured network requests in capture order, keeping the most recent `limit` rows. Each row shows an #id usable with network_get_detail.",
+  "List captured requests, the newest `limit` rows, each with an #id for network_get_detail.",
   {
-    filter: z.string().default("").describe("Only show requests whose URL contains this substring."),
+    filter: z.string().default("").describe("Only URLs containing this."),
     limit: z.number().default(50).describe("Max rows to return."),
-    reveal_values: z.boolean().default(false).describe("Show credentials in URLs (access_token and similar). Masked by default."),
+    reveal_values: z.boolean().default(false).describe("Show credentials in URLs. Masked by default."),
   },
   async ({ filter, limit, reveal_values }) => {
     let rows = networkRequests;
@@ -120,12 +119,11 @@ regTool("network_get",
   });
 
 regTool("network_get_detail",
-  "Full request + response detail (headers and text body) for one captured request. " +
-  "Requires network_start(capture_bodies=true) BEFORE the request fired. " +
-  "Identify the request by id (from network_get) or by url substring.",
+  "Headers and text body of one captured request and its response. Needs " +
+  "network_start(capture_bodies=true) BEFORE the request fired. Pick by id or URL substring.",
   {
     id: z.number().default(-1).describe("Request #id from network_get. -1 = match by url instead."),
-    url: z.string().default("").describe("When id=-1, match the newest request whose URL contains this substring."),
+    url: z.string().default("").describe("With id=-1: the newest request whose URL contains this."),
     reveal_values: z.boolean().default(false).describe("Show Cookie, Authorization, Set-Cookie, tokens and passwords. Masked by default."),
   },
   async ({ id, url, reveal_values }) => {
@@ -153,8 +151,8 @@ regTool("network_get_detail",
 // ── Tools: PDF ─────────────────────────────────────────────────────────────
 
 regTool("save_pdf",
-  "Save page as PDF. NOTE: Playwright can only generate PDFs in headless Chromium — Camoufox is Firefox, " +
-  "so this fails by design here. Use screenshot(full_page=true) instead. Kept for API compatibility.",
+  "Always fails here: PDF output is Chromium-only and Camoufox is Firefox. Use " +
+  "screenshot(full_page=true). Kept for API compatibility.",
   {
     path: z.string().default(""),
   }, async ({ path: pdfPath }) => {
@@ -177,7 +175,8 @@ regTool("save_pdf",
 
 // ── Tools: Batch Operations ────────────────────────────────────────────────
 
-regTool("batch_actions", "Execute multiple actions in one call. Each action: {type, ref?, value?, text?, key?, timeout?}. Stops at the first failure by default, so a click meant to follow a fill does not run after that fill failed. A failed action makes the whole reply an error.", {
+regTool("batch_actions", "Run several actions in one call. Each action: {type, ref?, value?, text?, key?, timeout?}. Stops at " +
+  "the first failure by default; any failure makes the reply an error.", {
   actions: z.array(z.object({
     type: z.enum(["click", "fill", "type", "press", "select", "check", "uncheck", "wait"]),
     ref: z.string().optional(),
@@ -185,8 +184,8 @@ regTool("batch_actions", "Execute multiple actions in one call. Each action: {ty
     text: z.string().optional(),
     key: z.string().optional(),
     timeout: z.number().optional(),
-  })).describe("List of actions to execute sequentially"),
-  stop_on_error: z.boolean().default(true).describe("Stop at the first failed action. false runs the rest anyway."),
+  })).describe("Actions, run in order"),
+  stop_on_error: z.boolean().default(true).describe("false = run the rest after a failure."),
 }, async ({ actions, stop_on_error }) => {
   const page = getPage();
   const results: string[] = [];
@@ -242,7 +241,8 @@ regTool("batch_actions", "Execute multiple actions in one call. Each action: {ty
   };
 });
 
-regTool("fill_form", "Fill multiple form fields and optionally submit. If any field fails, the reply is an error naming it and nothing is submitted.", {
+regTool("fill_form", "Fill several fields, then optionally click submit_ref. If any field fails, the reply names it and " +
+  "nothing is submitted.", {
   fields: z.array(z.object({
     ref: z.string().describe("Element ref from snapshot"),
     value: z.string().describe("Value to fill"),
@@ -261,23 +261,22 @@ regTool("fill_form", "Fill multiple form fields and optionally submit. If any fi
     }
   }
   if (submit_ref) {
-    return clickReply(page, `Filled ${fields.length} fields + submitted`, () => clickWithFallback(refLocator(page, submit_ref)));
+    return clickReply(page, `Filled ${fields.length} fields + submitted`, () => clickWithFallback(refLocator(page, submit_ref)), 1000, submit_ref);
   }
   return { content: [{ type: "text", text: `Filled ${fields.length} fields. URL: ${page.url()}` }] };
 });
 
 regTool("login_classic",
-  "Composite login for classic email→password forms (Google, Microsoft, generic SSO). " +
-  "Auto-detects the email field, clicks Next/Continue on multi-step forms, fills the password, submits, " +
-  "and optionally enters a TOTP 2FA code. Collapses the usual 5–8 fill/click/snapshot calls into one. " +
-  "Heuristic — if a form is unusual, fall back to individual fill/click tools. Returns the step log + a fresh snapshot.",
+  "One-call login for classic email→password forms (Google, Microsoft, generic SSO): fills the email, " +
+  "clicks Next on multi-step forms, fills the password, submits, and enters a TOTP code if asked. " +
+  "Heuristic: for an unusual form use fill/click. Returns the step log and a snapshot.",
   {
     email: z.string().describe("Email / username to fill."),
     password: z.string().describe("Password to fill."),
-    totp_secret: z.string().default("").describe("Base32 TOTP secret — a 6-digit code is generated if a 2FA field appears."),
-    totp_code: z.string().default("").describe("Pre-computed 6-digit 2FA code (overrides totp_secret)."),
-    submit_after_email: z.boolean().default(true).describe("Click Next/Continue after the email (Google/Microsoft multi-step)."),
-    step_timeout_ms: z.number().default(8000).describe("Max wait for each step's field to appear."),
+    totp_secret: z.string().default("").describe("Base32 TOTP secret; a code is generated if a 2FA field appears."),
+    totp_code: z.string().default("").describe("6-digit 2FA code (overrides totp_secret)."),
+    submit_after_email: z.boolean().default(true).describe("Click Next/Continue after the email (multi-step forms)."),
+    step_timeout_ms: z.number().default(8000).describe("Max wait for each step's field."),
   },
   async ({ email, password, totp_secret, totp_code, submit_after_email, step_timeout_ms }) => {
     const page = getPage();
@@ -366,16 +365,15 @@ regTool("navigate_and_snapshot", "Navigate to URL then return snapshot — combi
 // every tab the site opens, and would have to be re-attached by trackPage.
 
 regTool("intercept_start",
-  "Block requests before they leave the browser. Blocking image/media/font/stylesheet typically removes most of a page's bytes — " +
-  "the single biggest speed-up for scraping — and block_urls kills trackers and ad frames. Routed on the context, so tabs opened " +
-  "later are covered too. Re-calling replaces the previous rules; intercept_stop removes them. 'document' cannot be blocked: it " +
-  "would abort the navigation itself.",
+  "Block requests before they leave the browser, on every tab including later ones. Blocking " +
+  "image/media/font/stylesheet removes most bytes when scraping; block_urls drops trackers. Re-calling " +
+  "replaces the rules; intercept_stop removes them. 'document' cannot be blocked.",
   {
     block_types: z.array(z.enum(["image", "media", "font", "stylesheet", "script", "xhr", "fetch", "websocket", "other"]))
       .default([]).describe("Resource types to abort."),
     block_urls: z.array(z.string()).default([])
-      .describe("URL patterns to abort — plain substring, or use * as a wildcard (e.g. *doubleclick.net*)."),
-    log_limit: z.number().default(300).describe("How many decisions to keep for intercept_log."),
+      .describe("URL substrings, * = wildcard (e.g. *doubleclick.net*)."),
+    log_limit: z.number().default(300).describe("Decisions kept for intercept_log."),
   },
   async ({ block_types, block_urls, log_limit }) => {
     if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -439,12 +437,12 @@ regTool("intercept_log", "Show what interception blocked and allowed.", {
 });
 
 regTool("export_curl",
-  "Rebuild a captured request as a runnable curl command, so you can replay or share an API call without re-deriving its headers. " +
-  "Needs network_start(capture_bodies=true) — headers are not recorded otherwise.",
+  "Rebuild a captured request as a runnable curl command. Needs network_start(capture_bodies=true) " +
+  "before the request; headers are not recorded otherwise.",
   {
-    url_contains: z.string().default("").describe("Pick the most recent captured request whose URL contains this."),
-    id: z.number().default(-1).describe("Or pick by the id shown in network_get."),
-    reveal_values: z.boolean().default(false).describe("Build a runnable command with the real Cookie, Authorization, tokens and passwords. By default they are placeholders."),
+    url_contains: z.string().default("").describe("Newest captured request whose URL contains this."),
+    id: z.number().default(-1).describe("Or pick by id from network_get."),
+    reveal_values: z.boolean().default(false).describe("Put the real Cookie, Authorization, tokens and passwords in the command. Placeholders by default."),
   },
   async ({ url_contains, id, reveal_values }) => {
     const pool = networkRequests.filter(e => (id >= 0 ? e.id === id : (!url_contains || e.url.includes(url_contains))));

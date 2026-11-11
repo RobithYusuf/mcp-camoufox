@@ -8,7 +8,7 @@ import { join } from "path";
 import { readdirSync } from "fs";
 import { S, PROFILE_DIR, PROFILE_PARENT, SCREENSHOT_DIR, getPage, networkRequests } from "../state.js";
 import { PKG_VERSION, ACTION_TIMEOUT, jsStr, resolveOutPath, writeSecretFile, SECRET_FIELD_FN, maskedField,
-         isSecretLocator, refLocator, observeClick, pointerMove, pointerClick, viewportOf, waitForUrl, urlMatches } from "../helpers.js";
+         isSecretLocator, refLocator, observeClick, pointerMove, pointerClick, viewportOf, waitForUrl, urlMatches, evalMain } from "../helpers.js";
 import { isSecretName, maskUrl, maskHeaders, maskBody, maskedValue } from "../redact.js";
 import { regTool } from "../server.js";
 import { osClickViewport, osInputError } from "../os-input.js";
@@ -110,7 +110,8 @@ function storageReply(all: Record<string, string>, reveal: boolean): string {
   return JSON.stringify(Object.fromEntries(Object.entries(all || {}).map(([k, v]) => [k, !reveal && isSecretName(k) ? maskedValue(v) : v])), null, 2);
 }
 
-regTool("localstorage_get", "Get all localStorage data or a specific key. Keys named like a credential (token, secret, session and so on) are masked unless reveal_values=true.", {
+regTool("localstorage_get", "Get all localStorage or one key. Credential-named keys (token, secret, session…) are masked unless " +
+  "reveal_values=true.", {
   key: z.string().default("").describe("Key to get (empty = all)"),
   reveal_values: z.boolean().default(false),
 }, async ({ key, reveal_values }) => {
@@ -137,7 +138,7 @@ regTool("localstorage_clear", "Clear all localStorage.", {}, async () => {
   return { content: [{ type: "text", text: "localStorage cleared." }] };
 });
 
-regTool("sessionstorage_get", "Get all sessionStorage data or a specific key. Keys named like a credential are masked unless reveal_values=true.", {
+regTool("sessionstorage_get", "Get all sessionStorage or one key. Credential-named keys are masked unless reveal_values=true.", {
   key: z.string().default(""),
   reveal_values: z.boolean().default(false),
 }, async ({ key, reveal_values }) => {
@@ -160,10 +161,11 @@ regTool("sessionstorage_set", "Set a sessionStorage item.", {
 
 // ── Tools: Mouse XY ────────────────────────────────────────────────────────
 
-regTool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpolated pre-movement to curve the path. Note: 'human-like' here means the path SHAPE only — the event is still Playwright-synthesized (mozInputSource=0, pointerType=\"\"), which some anti-bot checks on a hardware-input origin can tell apart from a real mouse.", {
+regTool("mouse_click_xy", "Click at viewport x,y. steps>0 curves the path first. Still a Playwright-synthesized event " +
+  "(mozInputSource=0), which some anti-bot checks can tell from a real mouse.", {
   x: z.number(), y: z.number(),
   button: z.enum(["left", "right", "middle"]).default("left"),
-  steps: z.number().default(0).describe("Interpolation steps for pre-click movement (0=instant, 15-30=human-like)"),
+  steps: z.number().default(0).describe("Pre-click path steps (0 = instant, 15-30 = human-like)"),
 }, async ({ x, y, button, steps }) => {
   const page = getPage();
   const vp = await viewportOf(page);
@@ -180,20 +182,23 @@ regTool("mouse_click_xy", "Click at exact x,y coordinates. steps>0 adds interpol
   return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) button=${button} steps=${steps}.\n${outcome.note}` }] };
 });
 
-regTool("mouse_move", "Move mouse to x,y. steps>0 interpolates the path (curved, not teleported). The move is still a Playwright-synthesized event, not a hardware-origin one.", {
+regTool("mouse_move", "Move the mouse to x,y. steps>0 interpolates the path. Still a synthesized event, not hardware input.", {
   x: z.number(), y: z.number(),
-  steps: z.number().default(0).describe("Interpolation steps (0=instant jump, 15-30=smooth)"),
+  steps: z.number().default(0).describe("Path steps (0 = jump, 15-30 = smooth)"),
 }, async ({ x, y, steps }) => {
   const page = getPage();
   await pointerMove(page, x, y, steps > 0 ? { steps } : undefined);
   return { content: [{ type: "text", text: `Mouse moved to (${x}, ${y}) steps=${steps}` }] };
 });
 
-regTool("click_turnstile", "Click a Cloudflare Interactive Turnstile checkbox. Locates the widget via in-page selectors AND the Playwright frame API (handles closed shadow roots that document.querySelector misses), polls for render, skips if already solved, then does a real-mouse click with retries + small nudge. Reports what it OBSERVED afterwards — the response token, plus the final page title/URL and whether a challenge is still showing — because a Playwright-synthesized click is often rejected by Cloudflare (the event carries mozInputSource=0 / pointerType=\"\", not a hardware pointer), so a click that lands is not the same as a challenge that passed. A widget on a Cloudflare TEST sitekey (always-pass/always-block/force-interactive) is flagged, since its outcome proves nothing about a real one. This is the Playwright-click path; on macOS a REAL OS click that passes checks a synthetic one does not is available via turnstile_coords + os_click_xy (two separate calls).", {
-  offset_x: z.number().default(30).describe("Pixels from widget left edge to the checkbox (calibrated for CF checkbox)"),
-  offset_y: z.number().optional().describe("Vertical offset from widget top (default = height/2)"),
-  wait_render_ms: z.number().default(500).describe("Wait before first detection to let widget render"),
-  max_attempts: z.number().default(3).describe("Max click attempts (small vertical nudge between tries) until token appears"),
+regTool("click_turnstile", "Click a Cloudflare interactive Turnstile checkbox with a Playwright mouse click (retries with a " +
+  "small nudge), then report what it observed: token, title/URL, and whether a challenge still shows. " +
+  "Cloudflare often rejects synthetic clicks, so a landed click is not a pass. Test sitekeys are " +
+  "flagged. For a real OS click on macOS: turnstile_coords, then os_click_xy in a separate call.", {
+  offset_x: z.number().default(30).describe("Pixels from the widget's left edge to the checkbox."),
+  offset_y: z.number().optional().describe("Pixels from the widget's top (default: half its height)."),
+  wait_render_ms: z.number().default(500).describe("Wait before the first detection."),
+  max_attempts: z.number().default(3).describe("Max click attempts, nudged between tries, until a token appears."),
 }, async ({ offset_x, offset_y, wait_render_ms, max_attempts }) => {
   const page = getPage();
   await page.waitForTimeout(wait_render_ms);
@@ -336,8 +341,10 @@ regTool("click_turnstile", "Click a Cloudflare Interactive Turnstile checkbox. L
   return { content: [{ type: "text", text: lines.join("\n") }], ...(isError ? { isError: true } : {}) };
 });
 
-regTool("turnstile_coords", "Locate a Cloudflare Turnstile checkbox and return its VIEWPORT x,y (JSON {found,x,y,width,height}) WITHOUT clicking. Pair with os_click_xy in a SEPARATE call: the frame-API locate here touches the challenge iframe, which Turnstile rejects if it happens next to the click — so locating and clicking must be different MCP calls.", {
-  wait_render_ms: z.number().default(500).describe("Wait before detection to let the widget render"),
+regTool("turnstile_coords", "Locate a Cloudflare Turnstile checkbox and return its viewport x,y as JSON {found,x,y,width,height}, " +
+  "without clicking. Click with os_click_xy in a SEPARATE call: Turnstile rejects a click made next to " +
+  "this frame access.", {
+  wait_render_ms: z.number().default(500).describe("Wait before detection"),
 }, async ({ wait_render_ms }) => {
   const page = getPage();
   await page.waitForTimeout(wait_render_ms);
@@ -373,7 +380,12 @@ regTool("turnstile_coords", "Locate a Cloudflare Turnstile checkbox and return i
   return { content: [{ type: "text", text: JSON.stringify({ found: box.found, x, y, width: box.width, height: box.height }) }] };
 });
 
-regTool("os_click_xy", "Headed desktop: deliver a REAL OS cursor click at the given VIEWPORT x,y — a hardware-input-origin click (mozInputSource=1) that a synthetic Playwright click is not, so it passes an interactive Cloudflare Turnstile a synthetic click cannot. macOS is verified (CoreGraphics CGEvent); Windows (SendInput/mouse_event) and Linux (xdotool, X11) backends are implemented but NOT yet tested. Does ONLY the click (no locate, no page reads) — that isolation is essential: a Juggler command on the challenge tab next to the click makes Turnstile reject it, so get the coordinates in a SEPARATE prior call (turnstile_coords) and click here. On macOS, if Accessibility permission is missing this opens the permission dialog, waits briefly for a grant to auto-click, and otherwise parks the cursor on the target so a human finishes with one ordinary left-click. Windows/Linux need no such permission but require a real (non-headless, non-Wayland-for-Linux) desktop session.", {
+regTool("os_click_xy", "Headed desktop only: a REAL OS cursor click at viewport x,y (mozInputSource=1), which passes an " +
+  "interactive Turnstile a synthetic click cannot. Tested on macOS; the Windows and Linux (X11) " +
+  "backends are untested. It only clicks: get the coordinates from turnstile_coords in a SEPARATE " +
+  "earlier call, because any page command next to the click makes Turnstile reject it. On macOS without " +
+  "Accessibility permission it opens the permission dialog, and otherwise parks the cursor on the " +
+  "target for a human to click.", {
   x: z.number().describe("Viewport X (e.g. from turnstile_coords)"),
   y: z.number().describe("Viewport Y (e.g. from turnstile_coords)"),
 }, async ({ x, y }) => {
@@ -407,11 +419,12 @@ regTool("list_frames", "List all frames/iframes in the page.", {}, async () => {
   return { content: [{ type: "text", text: `Frames (${frames.length}):\n${lines.join("\n")}` }] };
 });
 
-regTool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe.", {
+regTool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe. world works as in evaluate.", {
   frame_name: z.string().default("").describe("Frame name (empty = by index)"),
   frame_index: z.number().default(0).describe("Frame index from list_frames"),
   expression: z.string(),
-}, async ({ frame_name, frame_index, expression }) => {
+  world: z.enum(["main", "isolated"]).default("main").describe("main = the frame's own JavaScript world. isolated = DOM only, invisible to the frame."),
+}, async ({ frame_name, frame_index, expression, world }) => {
   const page = getPage();
   const frame = frame_name
     ? page.frames().find(f => f.name() === frame_name)
@@ -423,7 +436,7 @@ regTool("frame_evaluate", "Execute JavaScript inside a specific frame/iframe.", 
       isError: true,
     };
   }
-  const result = await frame.evaluate(expression);
+  const result = world === "isolated" ? await frame.evaluate(expression) : await evalMain(frame, expression);
   return { content: [{ type: "text", text: typeof result === "object" ? JSON.stringify(result, null, 2) : String(result) }] };
 });
 
@@ -464,10 +477,9 @@ regTool("get_viewport_size", "Get current viewport dimensions.", {}, async () =>
 });
 
 regTool("set_viewport_size",
-  "Set the viewport width and height. This is the exact control over what the page renders and what a " +
-  "screenshot captures. It does NOT resize the OS window: Camoufox reports a frozen outerWidth/outerHeight, " +
-  "so asking for a viewport larger than the launch window makes the content bigger than its own window — " +
-  "impossible geometry that a detector can read. The reply says so when that happens.",
+  "Set the viewport size (what the page renders and a screenshot captures). It does not resize the OS " +
+  "window, so a viewport larger than the launch window is impossible geometry a detector can read; the " +
+  "reply warns.",
   {
     width: z.number(), height: z.number(),
   }, async ({ width, height }) => {
@@ -500,7 +512,7 @@ regTool("set_viewport_size",
 
 // ── Tools: Accessibility ───────────────────────────────────────────────────
 
-regTool("accessibility_snapshot", "Get accessibility tree snapshot — compact view of page structure for LLM understanding.", {}, async () => {
+regTool("accessibility_snapshot", "Accessibility tree of the page: a compact view of its structure.", {}, async () => {
   const page = getPage();
   const snap = await page.evaluate(`(() => {
     function walk(el, depth) {
@@ -547,9 +559,8 @@ regTool("server_status", "Health check — verify server, browser status, active
 });
 
 regTool("get_page_errors",
-  "Get uncaught JavaScript errors + unhandled promise rejections from the current page. " +
-  "Captured by a hook installed at browser_launch, so the buffer resets on every navigation " +
-  "(read it before navigating away). Max 100 entries per page load.",
+  "Uncaught JS errors and unhandled rejections on the current page (max 100). The buffer resets on " +
+  "every navigation, so read it before navigating away.",
   {}, async () => {
   const page = getPage();
   const errors = await page.evaluate(`(() => {
@@ -563,23 +574,27 @@ regTool("get_page_errors",
   return { content: [{ type: "text", text: `Page errors (${errors.length}):\n${JSON.stringify(errors, null, 2)}` }] };
 });
 
-regTool("inject_init_script", "Inject a script that runs before every page load.", {
+regTool("inject_init_script", "Add a script that runs before every page load in the page's own JS world, so page scripts see what " +
+  "it defines.", {
   script: z.string().describe("JavaScript code to inject"),
 }, async ({ script }) => {
   if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
-  await S.browserContext.addInitScript(script);
+  // An init script runs in the isolated world unless it carries the prefix, and a
+  // global it defined there would never reach the page it was written for.
+  await S.browserContext.addInitScript(S.evalIsolated ? "mw:" + script : script);
   return { content: [{ type: "text", text: "Init script injected. Will run on every new page/navigation." }] };
 });
 
 // ── Tools: Export ──────────────────────────────────────────────────────────
 
 regTool("export_har",
-  "Export captured network traffic as a HAR 1.2 file (openable in DevTools/other HAR viewers). " +
-  "Requires network_start first; headers and bodies are only included when network_start(capture_bodies=true) was used.",
+  "Write captured traffic as a HAR 1.2 file. Needs network_start first; headers and bodies only with " +
+  "capture_bodies=true.",
   {
     path: z.string().default(""),
     limit: z.number().default(200).describe("Max (most recent) requests to include."),
-    reveal_values: z.boolean().default(false).describe("Write real Cookie, Authorization, tokens and passwords. Masked by default, because HAR files get shared. The file is mode 0600 either way."),
+    reveal_values: z.boolean().default(false).describe("Write real Cookie, Authorization, tokens and passwords (masked by default: HAR files get shared). " +
+      "The file is 0600 either way."),
   }, async ({ path: harPath, limit, reveal_values }) => {
   const page = getPage();
   if (!networkRequests.length) {
@@ -652,15 +667,24 @@ regTool("export_har",
 // ── Tool: Fingerprint audit ────────────────────────────────────────────────
 
 regTool("fingerprint_audit",
-  "Report the fingerprint a site actually sees from this browser, and flag internal contradictions — the mismatches that get an " +
-  "automated browser detected are far more revealing than any single value. Read-only: it inspects, it does not change anything.",
+  "Report the fingerprint a site sees and flag internal contradictions, the mismatches that reveal " +
+  "automation. Read-only.",
   {},
   async () => {
     const page = getPage();
     // IIFE + var: Camoufox does not reliably auto-invoke string arrow functions.
-    const raw = await page.evaluate(`(function () {
+    const raw = await page.evaluate(`(async function () {
       var out = {};
       var n = navigator, s = screen;
+      out.hasNotification = typeof Notification === "function";
+      // Voices arrive asynchronously the first time they are asked for.
+      try {
+        var voices = speechSynthesis.getVoices();
+        for (var tries = 0; !voices.length && tries < 6; tries++) { await new Promise(function (r) { setTimeout(r, 100); }); voices = speechSynthesis.getVoices(); }
+        out.voices = voices.length;
+        var uris = voices.map(function (v) { return String(v.voiceURI || ""); }).join(" ");
+        out.voiceOs = /moz-tts:osx|com\\.apple/.test(uris) ? "macos" : /moz-tts:sapi|Microsoft/.test(uris) ? "windows" : /moz-tts:speechd/.test(uris) ? "linux" : "";
+      } catch (e) { out.voices = -1; out.voiceOs = ""; }
       out.userAgent = n.userAgent;
       out.platform = n.platform;
       out.languages = (n.languages || []).join(",");
@@ -720,6 +744,14 @@ regTool("fingerprint_audit",
     if (oh - ih > 200 || oh - ih < 0) {
       flags.push(`outerHeight ${oh} vs innerHeight ${ih} — a ${oh - ih}px vertical gap is not plausible browser chrome.`);
     }
+    if (ow > sw || oh > sh) {
+      flags.push(`The window (${f.outer}) is larger than the screen (${f.screen}). No real window is, and it cannot be resized after launch: relaunch with a smaller width/height.`);
+    }
+    const uaOs = uaSaysWin ? "windows" : uaSaysMac ? "macos" : uaSaysLinux ? "linux" : "";
+    if (f.voiceOs && uaOs && f.voiceOs !== uaOs) {
+      flags.push(`The user-agent says ${uaOs}, but speechSynthesis lists ${f.voices} ${f.voiceOs} voices (their voiceURI names the OS). The voices come from the real machine: launch with os="auto" so the fingerprint claims the same OS.`);
+    }
+    if (f.hasNotification === false) flags.push("window.Notification is missing. Every desktop Firefox has it, and pages that touch it throw.");
     if (f.plugins === 0 && f.mimeTypes === 0) flags.push("navigator.plugins and mimeTypes are both empty — common in crude headless setups.");
     if (f.hardwareConcurrency === 0 || f.hardwareConcurrency === undefined) flags.push("navigator.hardwareConcurrency is missing or zero.");
 
@@ -734,6 +766,7 @@ regTool("fingerprint_audit",
       `  cores        ${f.hardwareConcurrency}      memory ${f.deviceMemory ?? "not exposed"}      touch ${f.maxTouchPoints}`,
       `  webdriver    ${f.webdriver === null ? "undefined (good)" : f.webdriver}`,
       `  plugins      ${f.plugins}   mimeTypes ${f.mimeTypes}   pdfViewer ${f.pdfViewerEnabled}`,
+      `  voices       ${f.voices}${f.voiceOs ? ` (${f.voiceOs})` : ""}   Notification ${f.hasNotification ? "present" : "MISSING"}`,
       `  webgl        ${f.webglVendor ?? "unavailable"} / ${f.webglRenderer ?? "unavailable"}`,
       ``,
       flags.length ? `⚠ ${flags.length} contradiction(s) a detector could use:` : `No internal contradictions found in the values above.`,

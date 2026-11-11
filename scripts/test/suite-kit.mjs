@@ -265,7 +265,8 @@ export default async function run() {
     await c("mouse_record", { duration_ms: 500 });
     await new Promise(r => setTimeout(r, 800));
     await c("mouse_move", { x: 200, y: 200 }); await c("mouse_move", { x: 260, y: 240 });
-    const pts = await c("evaluate", { expression: "String((window.__mcp_mouse_rec&&window.__mcp_mouse_rec.points.length)||0)" });
+    // The recorder lives in the isolated world, where the page cannot see it.
+    const pts = await c("evaluate", { world: "isolated", expression: "String((window.__mcp_mouse_rec&&window.__mcp_mouse_rec.points.length)||0)" });
     return [Number(pts) === 0, `points=${pts}`];
   });
   await check("storage_snapshot + storage_diff", async () => {

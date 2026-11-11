@@ -10,9 +10,10 @@ import { dirname, join } from "path";
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const DIST = join(ROOT, "dist", "index.js");
 
-function camoufoxCache(home) {
+/** Where camoufox-js keeps the browser under a given HOME (see its pkgman.js). */
+export function camoufoxCache(home) {
   if (platform() === "darwin") return join(home, "Library", "Caches", "camoufox");
-  if (platform() === "win32") return join(home, "AppData", "Local", "camoufox");
+  if (platform() === "win32") return join(home, "AppData", "Local", "camoufox", "camoufox", "Cache");
   return join(home, ".cache", "camoufox");
 }
 
@@ -32,8 +33,8 @@ export function sandboxHome() {
 /** Spawn the MCP server and return a client. `call` returns the flattened text
  *  of a tool result, prefixed with "IS_ERROR: " when the tool reported one, and
  *  "[IMAGE …]" when it returned image content. */
-export async function startServer(distPath = DIST) {
-  const home = sandboxHome();
+export async function startServer(distPath = DIST, { home: givenHome = null } = {}) {
+  const home = givenHome || sandboxHome();
   const proc = spawn("node", [distPath], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, HOME: home, USERPROFILE: home } });
   proc.on("exit", () => { try { rmSync(home, { recursive: true, force: true }); } catch {} });
   let buf = "", stderr = "";
@@ -64,7 +65,7 @@ export async function startServer(distPath = DIST) {
   };
   await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "suite", version: "1" } });
   proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
-  return { proc, rpc, call, stderr: () => stderr, kill: () => proc.kill() };
+  return { proc, rpc, call, home, stderr: () => stderr, kill: () => proc.kill() };
 }
 
 /** Minimal fixture server. `routes` maps a pathname to (req,res,state)=>void.

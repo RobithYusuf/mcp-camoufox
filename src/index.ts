@@ -18,7 +18,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { server } from "./server.js";
-import { shutdownBrowser } from "./tools/browser.js";
+import { shutdownBrowser, warmBrowserModules } from "./tools/browser.js";
 
 // Each tool module registers itself on import. Import order only affects the
 // order tools appear in tools/list, never their behaviour.
@@ -33,6 +33,9 @@ import "./tools/http.js";
 import "./tools/ergonomics.js";
 
 async function main() {
+  // Load the browser libraries once the handshake is over, so neither initialize nor
+  // the first browser_launch waits for them. A failure here is reported by browser_launch.
+  server.server.oninitialized = () => { setTimeout(() => { warmBrowserModules().catch(() => {}); }, 200).unref(); };
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[mcp-camoufox] Server running on stdio...");

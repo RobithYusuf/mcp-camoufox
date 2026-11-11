@@ -186,9 +186,9 @@ function htmlToMarkdown(html: string, baseUrl = "", maxChars = 20000): string {
 }
 
 regTool("http_request",
-  "HTTP request WITHOUT a browser, using a real Firefox TLS/HTTP2 fingerprint (impit). " +
-  "By default it reuses the live browser's cookies for that URL, so you can log in with the browser and then hit the site's API cheaply. " +
-  "Far faster and lighter than navigating — use it for APIs, JSON, and any page that doesn't need JS.",
+  "HTTP request without a browser, with a real Firefox TLS/HTTP2 fingerprint (impit). Reuses the live " +
+  "browser's cookies for the URL by default, so a browser login works for the site's API. Much faster " +
+  "than navigating: for APIs, JSON and pages that need no JS.",
   {
     url: z.string(),
     method: z.string().default("GET"),
@@ -199,7 +199,7 @@ regTool("http_request",
     proxy: z.string().default("").describe("Proxy URL, e.g. http://user:pass@host:port"),
     timeout_ms: z.number().default(30000),
     max_chars: z.number().default(20000).describe("Max response body characters returned."),
-    reveal_values: z.boolean().default(false).describe("Show Set-Cookie, tokens in the JSON body and tokens in URLs. Masked by default."),
+    reveal_values: z.boolean().default(false).describe("Show Set-Cookie and tokens in the body and URLs. Masked by default."),
   },
   async ({ url, method, body, headers_json, impersonate, use_browser_cookies, proxy, timeout_ms, max_chars, reveal_values }) => {
     let headers: Record<string, string> = {};
@@ -228,7 +228,8 @@ regTool("http_request",
   });
 
 regTool("http_session_cookies",
-  "Show which browser cookies would be sent with an HTTP request to this URL. Use it to confirm session sharing before relying on http_request. Values are masked unless reveal_values=true.",
+  "Show which browser cookies an http_request to this URL would send. Values are masked unless " +
+  "reveal_values=true.",
   { url: z.string(), reveal_values: z.boolean().default(false) },
   async ({ url, reveal_values }) => {
     if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -240,15 +241,15 @@ regTool("http_session_cookies",
   });
 
 regTool("search",
-  "Search the web through a search API YOU control — a self-hosted SearXNG, or Brave/Tavily/Exa with a key — and get back a normalised title/url/snippet list. " +
-  "This never scrapes a SERP: that shipped in 0.9.0 and was removed in 0.9.2 because engines answer some queries with confidently wrong results. " +
-  "A real API contract does not have that failure mode. Set MCP_SEARCH_ENDPOINT (and MCP_SEARCH_API_KEY when the provider needs one) to avoid passing them every call.",
+  "Web search through an API you control (self-hosted SearXNG, or Brave/Tavily/Exa with a key), " +
+  "returning title/url/snippet. Never scrapes a results page. MCP_SEARCH_ENDPOINT and " +
+  "MCP_SEARCH_API_KEY set the defaults.",
   {
     query: z.string(),
-    endpoint: z.string().default("").describe("Search API base or full URL, e.g. http://127.0.0.1:8899 for a self-hosted SearXNG. Defaults to $MCP_SEARCH_ENDPOINT."),
+    endpoint: z.string().default("").describe("API base or full URL, e.g. http://127.0.0.1:8899 (SearXNG). Defaults to $MCP_SEARCH_ENDPOINT."),
     provider: z.enum(["auto", "searxng", "brave", "tavily", "exa"]).default("auto").describe("auto infers from the endpoint host and falls back to searxng."),
     count: z.number().default(8),
-    api_key: z.string().default("").describe("Defaults to $MCP_SEARCH_API_KEY. A self-hosted SearXNG needs none."),
+    api_key: z.string().default("").describe("Defaults to $MCP_SEARCH_API_KEY; SearXNG needs none."),
     extra_params: z.string().default("").describe('Extra query params as JSON, e.g. {"engines":"google,brave","language":"en"} (SearXNG).'),
     timeout_ms: z.number().default(20000),
   },
@@ -339,8 +340,8 @@ regTool("search",
   });
 
 regTool("scrape_markdown",
-  "Fetch a URL and return clean, LLM-ready markdown (headings, links, lists preserved; nav/footer/scripts stripped). " +
-  "Default path is browserless (impit) — fast and cheap. Set use_browser=true for JS-rendered pages (needs browser_launch).",
+  "Fetch a URL as clean markdown (nav, footer and scripts stripped). Browserless (impit) by default; " +
+  "use_browser=true renders JS pages (needs browser_launch).",
   {
     url: z.string(),
     use_browser: z.boolean().default(false).describe("Render in the stealth browser instead of a plain HTTP fetch."),
@@ -366,8 +367,8 @@ regTool("scrape_markdown",
   });
 
 regTool("smart_fetch",
-  "Dual-mode fetch: tries the browserless HTTP path first and escalates to the stealth browser ONLY when the response looks anti-bot blocked. " +
-  "This is the efficiency core — high-volume reading stays cheap, the browser fires only when it's actually needed.",
+  "Fetch over the browserless HTTP path and escalate to the stealth browser only when the response " +
+  "looks anti-bot blocked.",
   {
     url: z.string(),
     force_browser: z.boolean().default(false),

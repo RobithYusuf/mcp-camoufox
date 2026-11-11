@@ -55,7 +55,7 @@ function guarded(name: string, handler: Function) {
       // A separate content item: evaluate's own text must stay exactly its result.
       res.content.push({
         type: "text",
-        text: fresh.map(d => `⚠ A ${d.type} dialog appeared during this call: "${d.message}". It was ${d.answer}.`).join("\n"),
+        text: fresh.map(d => `⚠ ${/^[aeiou]/i.test(d.type) ? "An" : "A"} ${d.type} dialog appeared during this call: "${d.message}". It was ${d.answer}.`).join("\n"),
       });
     }
     return res;

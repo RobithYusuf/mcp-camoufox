@@ -141,14 +141,20 @@ T.browser_snapshot = {
     const t = await snap();
     return [t.includes("NoOp") && t.includes("ref=e") && !leaked(t).length, `chars=${t.length} leaked=${leaked(t).length}`];
   },
-  // An old element that is hidden keeps its old attribute, so the same ref would
-  // then name two elements and `.first()` can pick the hidden one.
+  // A ref has to name exactly one element, the one the latest snapshot listed. Refs were
+  // attributes once: a hidden element kept its old one, the same ref then named two
+  // elements and `.first()` could pick the hidden one. They live in a registry now, so
+  // the document must carry no ref attribute at all, and the ref must still work.
   fail: async () => {
+    await home();
     await snap();
     await ev(`(function () { var a = document.getElementById('noop'); a.style.display = 'none'; })()`);
     const refCounter = refOf(await snap(), "Count: 0");
-    const n = await evj(`document.querySelectorAll('[data-mcp-ref="${refCounter}"]').length`);
-    return [n === 1, `elements carrying ${refCounter}: ${n}`];
+    const attrs = await evj(`document.querySelectorAll('[data-mcp-ref]').length`);
+    const before = await ev("String(window.__n)");
+    const r = await c("click", { ref: refCounter });
+    const after = await ev("String(window.__n)");
+    return [attrs === 0 && !r.isError && Number(after) === Number(before) + 1, `ref attributes in the document: ${attrs}; ${refCounter} clicked the counter ${before} -> ${after}`];
   },
 };
 T.screenshot = {
@@ -1121,7 +1127,8 @@ T.mouse_record = {
     const r = await c("mouse_record", { duration_ms: 1500 });
     await c("mouse_move", { x: 50, y: 50, steps: 3 });
     await c("mouse_move", { x: 90, y: 70, steps: 3 });
-    const n = await ev("window.__mcp_mouse_rec.points.length");
+    // The recorder lives in the isolated world, where the page cannot see it.
+    const n = (await c("evaluate", { world: "isolated", expression: "window.__mcp_mouse_rec.points.length" })).first;
     return [Number(n) > 0 && !r.isError, `points=${n}`];
   },
   fail: async () => {

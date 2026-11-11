@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { S, PROFILE_DIR, getPage, storageSnapshots } from "../state.js";
 import { ACTION_TIMEOUT, jsStr, clickWithFallback, clickNote, fillLocator, refLocator, SECRET_FIELD_FN, maskedField,
-         isSecretLocator, hitTestAt, observeClick, pointerMove, pointerClick, scopeRoot } from "../helpers.js";
+         isSecretLocator, hitTestAt, observeClick, pointerMove, pointerClick, scopeRoot, REF_PUT_FN, REF_GET_FN } from "../helpers.js";
 import { regTool, toolRegistry } from "../server.js";
 import { stopCurrentBrowser } from "./browser.js";
 import { isSecretName, maskUrl, maskBody, maskedValue } from "../redact.js";
@@ -22,8 +22,8 @@ function targetLocator(page: Page, ref?: string, selector?: string): any | null 
 }
 
 regTool("search_page",
-  "Grep the CURRENT page's visible text and return matches with surrounding context. " +
-  "Costs nothing compared to a snapshot or a screenshot — use it first to find where a term actually appears.",
+  "Search the current page's visible text and return matches with context. Much cheaper than a snapshot " +
+  "or a screenshot.",
   {
     text: z.string().describe("Substring, or a regex source when regex=true"),
     regex: z.boolean().default(false),
@@ -57,8 +57,8 @@ regTool("search_page",
   });
 
 regTool("wait_for_change",
-  "Wait until the page actually CHANGES and report what changed (url / title / DOM size / text). " +
-  "This is the honest version of a fixed sleep after a click: it returns as soon as something happened, or tells you nothing did.",
+  "Wait until the page actually changes and report what changed (url, title, DOM size, text), or say " +
+  "that nothing did.",
   {
     timeout: z.number().default(10000),
     settle_ms: z.number().default(400).describe("Require the page to stay stable this long after the change."),
@@ -94,8 +94,8 @@ regTool("wait_for_change",
   });
 
 regTool("assert_clickable",
-  "Hit-test an element WITHOUT clicking: would a real click actually land on it? Answers \"why did my click do nothing?\" before you spend the click. " +
-  "Reports the element that would intercept the click when something covers it.",
+  "Hit-test an element without clicking: would a real click land on it? Names the element that would " +
+  "intercept the click.",
   {
     ref: z.string().default(""),
     selector: z.string().default(""),
@@ -125,7 +125,10 @@ regTool("assert_clickable",
       };
       const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
       if (cx >= 0 && cy >= 0 && cx <= innerWidth && cy <= innerHeight) {
-        const top = document.elementFromPoint(cx, cy);
+        // Asked of the element's own root: from the document, everything inside a shadow
+        // root is its host, so a free button in a web component read as covered by it.
+        const root = el.getRootNode();
+        const top = (root && root.elementFromPoint ? root : document).elementFromPoint(cx, cy);
         out.topAtCenter = desc(top);
         out.hit = !!top && (top === el || el.contains(top) || top.contains(el));
       } else {
@@ -146,7 +149,7 @@ regTool("assert_clickable",
   });
 
 regTool("scroll_to",
-  "Scroll a specific element into view (the page-level `scroll` tool only moves by pixels).",
+  "Scroll an element into view (scroll moves by pixels).",
   {
     ref: z.string().default(""),
     selector: z.string().default(""),
@@ -171,7 +174,8 @@ regTool("scroll_to",
   });
 
 regTool("click_element_offset",
-  "Click at a percentage position inside an element instead of its centre — for wide labels whose real checkbox sits at the left edge, sliders, or split buttons.",
+  "Click at a percentage position inside an element instead of its centre (a checkbox at a label's " +
+  "edge, sliders, split buttons).",
   {
     ref: z.string().default(""),
     selector: z.string().default(""),
@@ -193,12 +197,12 @@ regTool("click_element_offset",
     const outcome = await observeClick(page, async () => {
       await pointerMove(page, x + 60, y - 40, { steps: 8 });
       await pointerClick(page, x, y);
-    });
+    }, 1000, ref);
     return { content: [{ type: "text", text: `Clicked at ${x_percent}%,${y_percent}% of the element → (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}\n${outcome.note}` }] };
   });
 
 regTool("click_at_corner",
-  "Click a corner of an element — close/X buttons, delete icons and dismiss controls usually live there, not in the centre.",
+  "Click a corner of an element, where close/X and dismiss controls usually sit.",
   {
     ref: z.string().default(""),
     selector: z.string().default(""),
@@ -222,14 +226,13 @@ regTool("click_at_corner",
     const outcome = await observeClick(page, async () => {
       await pointerMove(page, x + 50, y - 30, { steps: 8 });
       await pointerClick(page, x, y);
-    });
+    }, 1000, ref);
     return { content: [{ type: "text", text: `Clicked ${corner} corner at (${Math.round(x)},${Math.round(y)}). URL: ${page.url()}\n${outcome.note}` }] };
   });
 
 regTool("paste_text",
-  "Fill a field with a REAL paste. Puts the text on the clipboard and presses Ctrl/Cmd+V so the page receives a trusted paste event " +
-  "with actual clipboardData — the only thing that works for frameworks that listen to paste alone (Svelte 5 / SolidJS runes, some Qwik forms). " +
-  "Falls back to a synthetic event and then the native value setter.",
+  "Fill a field with a real paste (clipboard + Ctrl/Cmd+V), for frameworks that only react to paste " +
+  "events. Falls back to a synthetic event, then the value setter.",
   {
     ref: z.string().default(""),
     selector: z.string().default(""),
@@ -294,8 +297,8 @@ regTool("paste_text",
   });
 
 regTool("form_introspect",
-  "Analyse a form in one call: per field the label, type, current value, required/pattern/length constraints, validation state, and the JS framework it is bound to. " +
-  "Tells you what to fill and why a submit is being rejected without guessing from a snapshot.",
+  "Analyse a form: per field the label, type, value, constraints, validation state and bound JS " +
+  "framework. Explains why a submit is rejected.",
   {
     form_selector: z.string().default("").describe("CSS selector for the form. Empty = first form, or all top-level fields if the page has none."),
   },
@@ -314,13 +317,16 @@ regTool("form_introspect",
         if (ab) { var t = document.getElementById(ab); if (t) return (t.innerText||"").trim(); }
         return el.placeholder || el.name || el.id || "";
       }
-      function framework(el) {
+      function framework(node) {
+        // Framework markers are properties the PAGE put on the element, which the
+        // isolated world does not show. wrappedJSObject is the page's view of it.
+        var el = node.wrappedJSObject || node;
         var keys = Object.keys(el);
         if (keys.some(function(k){return k.indexOf("__react") === 0;})) return "react";
         if (el.__vue__ || el.__vnode || keys.some(function(k){return k.indexOf("__vue") === 0;})) return "vue";
         if (el.__svelte_meta || keys.some(function(k){return k.indexOf("$$") === 0;})) return "svelte";
         if (keys.some(function(k){return k.indexOf("_$") === 0;})) return "solid";
-        if (el.closest("[data-qwik], [q\\\\:container]")) return "qwik";
+        if (node.closest("[data-qwik], [q\\\\:container]")) return "qwik";
         return "";
       }
       var out = [];
@@ -358,12 +364,11 @@ regTool("form_introspect",
   });
 
 regTool("smart_fill",
-  "Fill form fields by their LABEL text (fuzzy, case-insensitive) instead of refs — no snapshot needed. " +
-  "Values go through the same clearing logic as fill, so email/number fields replace rather than append.",
+  "Fill fields by LABEL text (fuzzy, case-insensitive), no snapshot needed. Replaces content like fill.",
   {
-    fields_json: z.string().describe('JSON object of {"Label": "value", …}, e.g. {"Email":"a@b.com","Password":"secret"}'),
+    fields_json: z.string().describe("JSON {\"Label\": \"value\", …}, e.g. {\"Email\":\"a@b.com\"}"),
     within: z.string().default("").describe('Scope: "@dialog", "ref:e5", or a CSS selector.'),
-    submit_label: z.string().default("").describe("If set, click the button whose text matches after filling."),
+    submit_label: z.string().default("").describe("Click the button with this text after filling."),
   },
   async ({ fields_json, within, submit_label }) => {
     const page = getPage();
@@ -375,14 +380,31 @@ regTool("smart_fill",
       return { content: [{ type: "text", text: `Invalid fields_json: ${e?.message || e}` }], isError: true };
     }
     const scopeSel = within === "@dialog" ? '[role="dialog"], dialog[open], [aria-modal="true"]'
-      : within.startsWith("ref:") ? `[data-mcp-ref="${within.slice(4)}"]` : within;
+      : within.startsWith("ref:") ? "" : within;
+    const scopeRef = within.startsWith("ref:") ? within.slice(4) : "";
+    // A scope that names nothing used to widen silently to the whole page, so a field of
+    // the same name outside the dialog was filled and reported as filled. The search runs
+    // in the main document, so a ref inside an iframe names nothing here either.
+    if (within) {
+      const inFrame = /^f\d+e\d+$/.test(scopeRef);
+      const found = !inFrame && await page.evaluate(`(() => {
+        var scopeSel = ${jsStr(scopeSel)}, scopeRef = ${jsStr(scopeRef)};
+        return !!(scopeRef ? (${REF_GET_FN})(scopeRef) : document.querySelector(scopeSel));
+      })()`);
+      if (!found) {
+        return { content: [{ type: "text", text: inFrame
+          ? `Nothing filled: within=${within} is inside an iframe, and smart_fill searches the main document only. Fill those fields with fill(ref=…) from browser_snapshot.`
+          : `Nothing filled: within=${within} names nothing on the page${scopeRef ? " (the ref may be from an older snapshot: call browser_snapshot again)" : ""}. Searching the whole page instead could fill a field of the same name somewhere else.` }], isError: true };
+      }
+    }
     const log: string[] = [];
     for (const [label, value] of Object.entries(fields)) {
       // Resolve the label to a concrete field IN THE PAGE, then tag it with a ref
       // so the fill goes through the normal locator path.
       const ref = await page.evaluate(`(() => {
-        var scopeSel = ${jsStr(scopeSel)};
-        var root = scopeSel ? (document.querySelector(scopeSel) || document) : document;
+        var scopeSel = ${jsStr(scopeSel)}, scopeRef = ${jsStr(scopeRef)};
+        var root = scopeRef ? (${REF_GET_FN})(scopeRef) : scopeSel ? document.querySelector(scopeSel) : document;
+        if (!root) return "";
         var want = ${jsStr(label)}.toLowerCase().trim();
         var fields = root.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select");
         function labelOf(el) {
@@ -402,8 +424,7 @@ regTool("smart_fill",
         var el = exact || partial;
         if (!el) return "";
         var ref = "sf" + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
-        el.setAttribute("data-mcp-ref", ref);
-        return ref;
+        return (${REF_PUT_FN})(el, ref);
       })()`) as string;
       if (!ref) { log.push(`"${label}": NO FIELD MATCHED`); continue; }
       try {
@@ -435,8 +456,8 @@ regTool("smart_fill",
 
 
 regTool("dialog_auto_handle",
-  "Install a PERSISTENT dialog handler that stays armed across every dialog and every tab (dialog_handle is one-shot). " +
-  "Reads its action at fire time, so you can change it without re-arming. Set enabled=false to remove it.",
+  "Persistent handler for every dialog on every tab (dialog_handle is one-shot). The action is read " +
+  "when a dialog fires, so it can change without re-arming. enabled=false removes it.",
   {
     action: z.enum(["accept", "dismiss"]).default("accept"),
     prompt_text: z.string().default("").describe("Text to submit for prompt() dialogs."),
@@ -452,15 +473,15 @@ regTool("dialog_auto_handle",
     return { content: [{ type: "text", text: `Persistent dialog handler armed: every dialog will be ${action}'d (${S.pages.length} tab(s), new tabs inherit it). Call with enabled=false to remove.` }] };
   });
 
-regTool("sessionstorage_clear", "Clear all sessionStorage for the current origin (parity with localstorage_clear).", {}, async () => {
+regTool("sessionstorage_clear", "Clear sessionStorage of the current origin.", {}, async () => {
   const page = getPage();
   const n = await page.evaluate(`(() => { var n = sessionStorage.length; sessionStorage.clear(); return n; })()`);
   return { content: [{ type: "text", text: `sessionStorage cleared (${n} key(s) removed).` }] };
 });
 
 regTool("wait_for_request",
-  "Block until the page ISSUES a request matching a URL substring (wait_for_response waits for the reply). " +
-  "Use it to confirm an action actually fired its API call.",
+  "Wait until the page sends a request whose URL contains a substring (wait_for_response waits for the " +
+  "reply). Confirms an action fired its API call.",
   {
     url_pattern: z.string(),
     method: z.string().default("").describe("Optional HTTP verb filter (GET/POST/…)"),
@@ -510,7 +531,7 @@ function diffMaps(before: Record<string, string>, after: Record<string, string>,
 }
 
 regTool("storage_snapshot",
-  "Capture cookies + localStorage + sessionStorage + URL into a named slot, so storage_diff can tell you exactly what an action changed.",
+  "Save cookies, localStorage, sessionStorage and URL in a named slot for storage_diff.",
   { name: z.string().default("default") },
   async ({ name }) => {
     const page = getPage();
@@ -520,8 +541,8 @@ regTool("storage_snapshot",
   });
 
 regTool("storage_diff",
-  "Compare current storage against an earlier storage_snapshot — shows exactly which cookies/localStorage/sessionStorage keys were added, removed or changed. " +
-  "The fastest way to find which key holds a session token. Cookie values and credential-named storage keys are masked unless reveal_values=true.",
+  "Compare storage with an earlier storage_snapshot: which cookies and localStorage/sessionStorage keys " +
+  "were added, removed or changed. Values are masked unless reveal_values=true.",
   { name: z.string().default("default"), reveal_values: z.boolean().default(false) },
   async ({ name, reveal_values }) => {
     const page = getPage();
@@ -545,7 +566,7 @@ regTool("storage_diff",
 // ── IndexedDB ──────────────────────────────────────────────────────────────
 
 regTool("indexeddb_list",
-  "List IndexedDB databases for the current origin. Many SPAs keep auth state and drafts here, invisible to cookie/localStorage tools.",
+  "List IndexedDB databases of the current origin, where many SPAs keep auth state and drafts.",
   {}, async () => {
     const page = getPage();
     const dbs = await page.evaluate(`(async () => {
@@ -560,7 +581,7 @@ regTool("indexeddb_list",
   });
 
 regTool("indexeddb_delete",
-  "Delete an IndexedDB database by name for the current origin (clears SPA state that survives a cookie wipe).",
+  "Delete an IndexedDB database of the current origin (SPA state that survives a cookie wipe).",
   { name: z.string() },
   async ({ name }) => {
     const page = getPage();
@@ -579,8 +600,8 @@ regTool("indexeddb_delete",
   });
 
 regTool("performance_timeline",
-  "Navigation + paint + resource timing for the current page: TTFB, DOMContentLoaded, load, FCP, LCP, and the 5 slowest resources. " +
-  "Note: Firefox does not implement layout-shift, so CLS is unavailable here.",
+  "Timing of the current page: TTFB, DOMContentLoaded, load, FCP, LCP and the 5 slowest resources. No " +
+  "CLS: Firefox lacks layout-shift.",
   {}, async () => {
     const page = getPage();
     const data = await page.evaluate(`(() => {
@@ -614,8 +635,9 @@ regTool("performance_timeline",
   });
 
 regTool("browser_recover",
-  "Escape hatch when the browser is wedged and browser_close can't complete: force-drops the connection and resets server state so browser_launch works again. " +
-  "Also reports a profile lock held by another Camoufox process, which is the usual cause of 'A copy of Camoufox is already open'.",
+  "Escape hatch when the browser is wedged and browser_close cannot finish: force-closes it and resets " +
+  "server state so browser_launch works again. Reports a profile lock held by another Camoufox ('A copy " +
+  "of Camoufox is already open').",
   {}, async () => {
     const steps: string[] = [];
     if (S.browserContext) {
@@ -638,9 +660,9 @@ regTool("browser_recover",
   });
 
 regTool("workflow_run",
-  "Run a list of tool calls in sequence — any tool this server exposes, by name — and return a per-step log. " +
-  "Resumable: a failed run tells you the index, and start_at skips the steps that already succeeded. " +
-  'Each step is {"tool":"navigate","args":{"url":"…"},"label":"optional"}.',
+  "Run tool calls in sequence, any tool by name, with a per-step log. Each step: " +
+  "{\"tool\":\"navigate\",\"args\":{\"url\":\"…\"},\"label\":\"optional\"}. A failed run names its index; start_at " +
+  "resumes there.",
   {
     steps: z.array(z.object({
       tool: z.string(),

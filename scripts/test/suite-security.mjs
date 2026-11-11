@@ -81,7 +81,9 @@ export default async function run() {
   await check("credential files are written 0600", async () => {
     const files = [];
     await c("auth_capture", { name: "suite-sec" });
-    files.push(join(homedir(), ".camoufox-mcp", "sessions", "suite-sec.json"));
+    // In the SERVER's home. This read homedir() of the test process, where a file left by
+    // a run from before the sandbox existed kept the check green without being written.
+    files.push(join(S.home, ".camoufox-mcp", "sessions", "suite-sec.json"));
     const ck = join(tmpdir(), "mcpc-sec-cookies.json");
     const st = join(tmpdir(), "mcpc-sec-state.json");
     await c("cookie_export_file", { path: ck });

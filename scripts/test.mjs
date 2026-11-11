@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Runs every suite and exits non-zero if anything failed.
+// Runs every suite and exits non-zero if anything failed. Suites: core, kit, security,
+// footprint, docs.
 //   npm test              all suites
 //   npm test -- core      just one
 //   npm test -- --parallel   all suites at once (each owns its browser + port)
@@ -10,6 +11,7 @@ const suites = [
   ["core", "./test/suite-core.mjs"],
   ["kit", "./test/suite-kit.mjs"],
   ["security", "./test/suite-security.mjs"],
+  ["footprint", "./test/suite-footprint.mjs"],
   ["docs", "./test/suite-docs.mjs"],
 ].filter(([name]) => !only.length || only.includes(name));
 

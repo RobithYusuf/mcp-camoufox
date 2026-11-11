@@ -109,9 +109,9 @@ regTool("tab_close", "Close a tab by index (-1 = active), or by url_contains.", 
 
 // ── Tools: Cookies ─────────────────────────────────────────────────────────
 
-regTool("cookie_list", "List cookies. Values are masked by default; reveal_values=true shows them.", {
+regTool("cookie_list", "List cookies. Values are masked unless reveal_values=true.", {
   domain: z.string().default(""),
-  reveal_values: z.boolean().default(false).describe("Show cookie values. A session cookie is a login, so they are masked by default."),
+  reveal_values: z.boolean().default(false).describe("Show values. A session cookie is a login."),
 }, async ({ domain, reveal_values }) => {
   if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
   let cookies = await S.browserContext.cookies();
@@ -121,14 +121,13 @@ regTool("cookie_list", "List cookies. Values are masked by default; reveal_value
 });
 
 regTool("cookie_set",
-  "Set a cookie. IMPORTANT: with expires_days=0 this creates a SESSION cookie, which Firefox keeps in memory only — " +
-  "it is gone after browser_close even though the profile itself persists. Pass expires_days (e.g. 30) to write a " +
-  "login session that survives a relaunch.",
+  "Set a cookie. expires_days=0 makes a session cookie, gone after browser_close although the profile " +
+  "persists; pass e.g. 30 to keep a login across relaunches.",
   {
     name: z.string(), value: z.string(), domain: z.string(), path: z.string().default("/"),
     expires_days: z.number().default(0).describe("Lifetime in days. 0 = session cookie (dies with the browser)."),
-    http_only: z.boolean().default(false).describe("Set the HttpOnly flag (hides it from page JS, like a real auth cookie)."),
-    secure: z.boolean().default(false).describe("Set the Secure flag (HTTPS only). Required when same_site='None'."),
+    http_only: z.boolean().default(false).describe("HttpOnly flag (hidden from page JS)."),
+    secure: z.boolean().default(false).describe("Secure flag (HTTPS only). Required with same_site='None'."),
     same_site: z.enum(["Lax", "Strict", "None"]).default("Lax"),
   },
   async ({ name, value, domain, path, expires_days, http_only, secure, same_site }) => {
@@ -146,7 +145,8 @@ regTool("cookie_set",
     return { content: [{ type: "text", text: `Cookie set: ${name}=${maskedValue(value)} domain=${domain} — ${life}` }] };
   });
 
-regTool("cookie_delete", "Delete cookies by exact name and/or domain (a domain also covers its subdomains, never a look-alike such as notexample.com). Both empty = clear all. The count is read back from the browser.", {
+regTool("cookie_delete", "Delete cookies by exact name and/or domain (a domain covers its subdomains, never a look-alike). " +
+  "Both empty = delete ALL cookies. The count is read back from the browser.", {
   name: z.string().default(""), domain: z.string().default(""),
 }, async ({ name, domain }) => {
   if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -177,7 +177,8 @@ regTool("cookie_delete", "Delete cookies by exact name and/or domain (a domain a
 
 // ── Tools: Dialog ──────────────────────────────────────────────────────────
 
-regTool("dialog_handle", "Set the answer for the next alert/confirm/prompt on ANY tab, including tabs opened later. Dialogs nobody armed are dismissed at once and named in the reply of the call they appeared in, so arm this BEFORE the action that opens one.", {
+regTool("dialog_handle", "Set the answer for the next alert/confirm/prompt on any tab. Call it BEFORE the action that opens " +
+  "the dialog: an unarmed dialog is dismissed at once and named in that call's reply.", {
   action: z.enum(["accept", "dismiss"]).default("accept"),
   prompt_text: z.string().default(""),
 }, async ({ action, prompt_text }) => {
@@ -187,7 +188,7 @@ regTool("dialog_handle", "Set the answer for the next alert/confirm/prompt on AN
   // answered. So say when this arrived too late for one that just went by.
   const last = dialogLog.at(-1);
   const missed = last && Date.now() - last.at < 10000
-    ? `\n⚠ A ${last.type} dialog ("${last.message}") already went by ${Math.round((Date.now() - last.at) / 1000)}s ago and was ${last.answer}. This applies to the next one, so repeat the action.`
+    ? `\n⚠ ${/^[aeiou]/i.test(last.type) ? "An" : "A"} ${last.type} dialog ("${last.message}") already went by ${Math.round((Date.now() - last.at) / 1000)}s ago and was ${last.answer}. This applies to the next one, so repeat the action.`
     : "";
   return { content: [{ type: "text", text: `Next dialog will be ${action}'d (any tab, including tabs opened later)${missed}` }] };
 });
@@ -205,11 +206,13 @@ regTool("upload_file", "Upload file to file input.", {
 // ── Tool: ChatGPT image generation (high-level, end-to-end) ──────────────────
 regTool(
   "chatgpt_generate_image",
-  "Generate or edit an image on chatgpt.com end-to-end and save it to disk in ONE call. Opens a fresh chat, optionally uploads reference images (e.g. a brand logo), submits the prompt, waits for the generated image to finish, then writes the result PNG to output_path. Requires an authenticated chatgpt.com session (import cookies first via cookie_import). Returns the saved path and pixel dimensions. Note: chatgpt image generation is slow (~60-120s) — set timeout_ms accordingly.",
+  "Generate or edit one image on chatgpt.com and save the PNG to output_path: new chat, optional " +
+  "reference uploads, prompt, wait, save. Needs a logged-in chatgpt.com session (cookie_import first). " +
+  "Takes ~60-120s; set timeout_ms to match.",
   {
     prompt: z.string().describe("Text prompt for image generation/editing."),
-    output_path: z.string().describe("Absolute path to write the resulting PNG."),
-    image_paths: z.array(z.string()).default([]).describe("Optional reference image file paths to upload before prompting (e.g. a logo)."),
+    output_path: z.string().describe("Absolute path for the PNG."),
+    image_paths: z.array(z.string()).default([]).describe("Reference images to upload first (optional)."),
     timeout_ms: z.number().default(240000).describe("Max ms to wait for the generated image."),
   },
   async ({ prompt, output_path, image_paths, timeout_ms }) => {
@@ -257,13 +260,16 @@ regTool(
 
 regTool(
   "chatgpt_generate_batch",
-  "Generate MANY images on chatgpt.com IN PARALLEL (one tab per job, fire-all-then-collect) and save each to disk. Submits every job first WITHOUT waiting, then waits for all generations concurrently — far faster than sequential. For a CONSISTENT feed set, pass shared_image_paths (e.g. [logo] and/or a style-reference image like a previously-generated hero) uploaded to EVERY tab, plus style_suffix (a shared style spec) appended to every prompt. Requires an authenticated chatgpt.com session (import cookies first). Returns per-job results (saved path / ok / bytes / error).",
+  "Generate several images on chatgpt.com in parallel (one tab per job) and save each to disk. " +
+  "shared_image_paths go to every tab and style_suffix is appended to every prompt, for a consistent " +
+  "set. Needs a logged-in chatgpt.com session (cookie_import first). Returns per-job path, bytes or " +
+  "error.",
   {
-    jobs: z.array(z.object({ prompt: z.string(), output_path: z.string() })).describe("Per-image jobs: each has a prompt and an output PNG path."),
-    shared_image_paths: z.array(z.string()).default([]).describe("Reference images uploaded to EVERY tab (e.g. [logoPath, styleRefPath]) — key for visual consistency."),
-    style_suffix: z.string().default("").describe("Shared style spec text appended to every prompt (exact colors, typography, layout, mood) for consistency."),
-    timeout_ms: z.number().default(300000).describe("Max ms to wait for each image to finish."),
-    stagger_ms: z.number().default(900).describe("Delay between submitting each tab (avoids UI/anti-bot races)."),
+    jobs: z.array(z.object({ prompt: z.string(), output_path: z.string() })).describe("One prompt and output PNG path per image."),
+    shared_image_paths: z.array(z.string()).default([]).describe("Reference images uploaded to every tab, e.g. [logo, style reference]."),
+    style_suffix: z.string().default("").describe("Style text appended to every prompt."),
+    timeout_ms: z.number().default(300000).describe("Max ms per image."),
+    stagger_ms: z.number().default(900).describe("Delay between submitting tabs."),
   },
   async ({ jobs, shared_image_paths, style_suffix, timeout_ms, stagger_ms }) => {
     if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");

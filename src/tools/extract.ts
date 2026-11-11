@@ -6,14 +6,15 @@ import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { S, getPage } from "../state.js";
 import { jsStr, clickWithFallback, clickNote, refLocator, SECRET_FIELD_FN, elementFn, historyStep,
-         scopeRoot, describeMatches, candidateList, snapshotPage, waitReady, settle } from "../helpers.js";
+         scopeRoot, describeMatches, candidateList, snapshotPage, waitReady, settle, REF_PUT_FN } from "../helpers.js";
 import { maskedValue } from "../redact.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Scraping / Extraction ───────────────────────────────────────────
 
-regTool("detect_content_pattern", "Auto-detect repeated content patterns (cards, listings, rows) and suggest CSS selectors. Run this BEFORE extract_structured to find the right selectors.", {
-  min_items: z.number().default(3).describe("Minimum repeated items to detect as pattern"),
+regTool("detect_content_pattern", "Find repeated content (cards, listings, rows) and suggest CSS selectors. Run it before " +
+  "extract_structured.", {
+  min_items: z.number().default(3).describe("Minimum repeats to count as a pattern"),
 }, async ({ min_items }) => {
   const page = getPage();
   const patterns = await page.evaluate(`(() => {
@@ -118,16 +119,17 @@ regTool("detect_content_pattern", "Auto-detect repeated content patterns (cards,
   return { content: [{ type: "text", text }] };
 });
 
-regTool("extract_structured", "Extract structured data from repeated elements (cards, rows, listings). Auto-deduplicates, filters empty items, extracts direct text only. Use detect_content_pattern first to find correct selectors.", {
-  container_selector: z.string().describe("CSS selector for each repeated item. Use detect_content_pattern to find this."),
+regTool("extract_structured", "Extract fields from repeated elements (cards, rows, listings), de-duplicated, empty items dropped. " +
+  "Find selectors with detect_content_pattern first.", {
+  container_selector: z.string().describe("CSS selector for each repeated item."),
   fields: z.array(z.object({
     name: z.string().describe("Field name in output"),
     selector: z.string().describe("CSS selector within each item"),
     attribute: z.string().default("").describe("Attribute to extract (empty = direct text only)"),
-  })).describe("Fields to extract from each item"),
+  })).describe("Fields to extract per item"),
   limit: z.number().default(50).describe("Max items to extract"),
-  deduplicate_by: z.string().default("").describe("Field name to deduplicate by (empty = auto)"),
-  direct_text_only: z.boolean().default(true).describe("Extract only direct text of matched element, not children text (prevents field mixing)"),
+  deduplicate_by: z.string().default("").describe("Field to de-duplicate by (empty = auto)"),
+  direct_text_only: z.boolean().default(true).describe("Only an element's own text, not its children's (keeps fields from mixing)"),
 }, async ({ container_selector, fields, limit, deduplicate_by, direct_text_only }) => {
   const page = getPage();
   const fieldsDef = JSON.stringify(fields);
@@ -253,11 +255,11 @@ regTool("extract_table", "Extract data from an HTML table as JSON array.", {
   return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 });
 
-regTool("scrape_page", "Smart page scraper — auto-detect and extract main content, links, metadata. Strips nav/footer noise.", {
+regTool("scrape_page", "Extract a page's main content, links and metadata without nav/footer noise.", {
   include_links: z.boolean().default(true),
   include_meta: z.boolean().default(true),
   max_text_length: z.number().default(8000).describe("Max text chars (truncates at paragraph boundary)"),
-  only_main_content: z.boolean().default(true).describe("Strip nav, header, footer, sidebar — extract only main content area"),
+  only_main_content: z.boolean().default(true).describe("Keep only the main content area"),
 }, async ({ include_links, include_meta, max_text_length, only_main_content }) => {
   const page = getPage();
   const data = await page.evaluate(`(() => {
@@ -342,7 +344,7 @@ regTool("scrape_page", "Smart page scraper — auto-detect and extract main cont
 
 regTool(
   "wait_and_snapshot",
-  "Wait for selector/text then return snapshot. Combines wait_for + browser_snapshot in one call.",
+  "Wait for a selector or text, then return a snapshot.",
   {
     selector: z.string().default("").describe("CSS selector to wait for"),
     text: z.string().default("").describe("Text to wait for"),
@@ -381,10 +383,10 @@ regTool("reload_and_snapshot", "Reload page + return snapshot.", {}, async () =>
 
 regTool(
   "click_and_snapshot",
-  "Click element by ref + wait + return snapshot. Perfect for buttons that trigger navigation/dialog.",
+  "Click by ref, wait, then return a snapshot.",
   {
     ref: z.string().describe("Element ref from browser_snapshot"),
-    wait_ms: z.number().default(1500).describe("Wait after click before snapshot"),
+    wait_ms: z.number().default(1500).describe("ms to wait after the click"),
   },
   async ({ ref, wait_ms }) => {
     const page = getPage();
@@ -399,7 +401,8 @@ regTool(
 
 regTool(
   "find_by_text",
-  "Find elements by visible text — returns EVERY match (total + a ref and ancestor path per candidate), so you can tell whether the one you want is really the one you'd click. Skip browser_snapshot when you know the text.",
+  "Find elements by visible text. Returns every match with a ref and ancestor path, so you can see " +
+  "which one a click would hit.",
   {
     text: z.string().describe("Visible text to search for"),
     exact: z.boolean().default(true),
@@ -427,7 +430,7 @@ regTool(
 
 regTool(
   "find_by_label",
-  "Find input element by its label text (<label>). Returns ref + how many matched.",
+  "Find an input by its <label> text. Returns a ref and the match count.",
   {
     label: z.string().describe("Label text (e.g. 'Email', 'Password')"),
     within: z.string().default("").describe('Limit the search: "@dialog", "ref:e5", or a CSS selector.'),
@@ -450,7 +453,7 @@ regTool(
     }
     const info = await loc.first().evaluate(elementFn(`
       var ref = 'l' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
-      el.setAttribute('data-mcp-ref', ref);
+      (${REF_PUT_FN})(el, ref);
       return {
         ref: ref,
         tag: el.tagName.toLowerCase(),
@@ -466,7 +469,7 @@ regTool(
 
 regTool(
   "find_by_placeholder",
-  "Find input by placeholder text. Returns ref + how many matched.",
+  "Find an input by placeholder text. Returns a ref and the match count.",
   {
     placeholder: z.string(),
     within: z.string().default("").describe('Limit the search: "@dialog", "ref:e5", or a CSS selector.'),
@@ -489,7 +492,8 @@ regTool(
     }
     const info = await loc.first().evaluate((el: any) => {
       const ref = 'p' + (Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
-      el.setAttribute('data-mcp-ref', ref);
+      const g: any = globalThis, key = Symbol.for("mcp.camoufox.refs");
+      (g[key] || (g[key] = new Map())).set(ref, new WeakRef(el));
       return {
         ref, tag: el.tagName.toLowerCase(), type: el.type || '', placeholder: el.placeholder || '',
       };
@@ -502,10 +506,11 @@ regTool(
 
 regTool(
   "cookie_export",
-  "Export all cookies as JSON string. Use with cookie_import to transfer session.",
+  "Export cookies as JSON for cookie_import.",
   {
     domain: z.string().default("").describe("Filter by domain (empty = all)"),
-    reveal_values: z.boolean().default(false).describe("Include real cookie values, which cookie_import needs. A cookie is a login, so they are masked by default. cookie_export_file writes them to a 0600 file without printing them."),
+    reveal_values: z.boolean().default(false).describe("Include real values, which cookie_import needs. They are logins, so masked by default; " +
+      "cookie_export_file writes them to a 0600 file instead."),
   },
   async ({ domain, reveal_values }) => {
     if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
@@ -518,7 +523,7 @@ regTool(
 
 regTool(
   "cookie_import",
-  "Import cookies from JSON (from cookie_export). Restores session state.",
+  "Import cookies from cookie_export JSON. A masked export is refused.",
   {
     cookies_json: z.string().describe("JSON array of cookies"),
   },

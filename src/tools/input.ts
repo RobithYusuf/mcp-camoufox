@@ -6,15 +6,16 @@ import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { getPage } from "../state.js";
 import { ACTION_TIMEOUT, clickWithFallback, clickReply, fillLocator, refLocator, SECRET_FIELD_FN, elementFn,
-         maskedField, isSecretLocator, scopeRoot, describeMatches, candidateList, navSeqOf, lastNavAt, waitReady } from "../helpers.js";
+         maskedField, isSecretLocator, evalMain, scopeRoot, describeMatches, candidateList, navSeqOf, lastNavAt, waitReady } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Element Interaction ─────────────────────────────────────────────
 
 regTool(
   "click",
-  "Click element by ref ID from browser_snapshot and report what the page did (navigated, changed, opened a tab, or nothing). " +
-    "When a covering element blocks a left click it falls back to synthetic pointer events and says so. Disabled or hidden elements are refused.",
+  "Click an element by snapshot ref and report what the page did (navigated, changed, opened a tab, or " +
+  "nothing). If something covers it, a left click falls back to synthetic pointer events and says so. " +
+  "Disabled or hidden elements are refused.",
   {
     ref: z.string().describe("Element ref (e.g. 'e5')"),
     button: z.enum(["left", "right", "middle"]).default("left"),
@@ -22,19 +23,19 @@ regTool(
   },
   async ({ ref, button, dblclick }) => {
     const page = getPage();
-    return clickReply(page, `Clicked ref=${ref}`, () => clickWithFallback(refLocator(page, ref), { button, dblclick }));
+    return clickReply(page, `Clicked ref=${ref}`, () => clickWithFallback(refLocator(page, ref), { button, dblclick }), 1000, ref);
   }
 );
 
 regTool(
   "click_text",
-  "Click element by visible text. If the text matches several elements it FAILS with a numbered candidate list instead of silently clicking the first one — " +
-    'narrow with within ("@dialog", a CSS selector, or "ref:e5") or pick one with index.',
+  "Click by visible text. Several matches are an error with a numbered candidate list, never a guess: " +
+  "narrow with within or pick with index.",
   {
     text: z.string().describe("Visible text"),
     exact: z.boolean().default(true),
-    within: z.string().default("").describe('Limit the search: "@dialog" = topmost modal, "ref:e5" = inside a snapshot ref, or any CSS selector.'),
-    index: z.number().default(-1).describe("Which match to click when several match (0-based). -1 = require a unique match."),
+    within: z.string().default("").describe("\"@dialog\" = topmost modal, \"ref:e5\" = inside that ref, or a CSS selector."),
+    index: z.number().default(-1).describe("Which match (0-based). -1 = require a unique match."),
   },
   async ({ text, exact, within, index }) => {
     const page = getPage();
@@ -60,18 +61,18 @@ regTool(
       return { content: [{ type: "text", text: `index=${index} out of range — only ${n} match(es) for text='${text}'${scope}.` }], isError: true };
     }
     const target = index >= 0 ? loc.nth(index) : loc.first();
-    return clickReply(page, `Clicked text='${text}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}`, () => clickWithFallback(target));
+    return clickReply(page, `Clicked text='${text}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}`, () => clickWithFallback(target), 1000, within);
   }
 );
 
 regTool(
   "click_role",
-  "Click element by ARIA role and name. Same ambiguity guard as click_text: several matches → candidate list, not a guess.",
+  "Click by ARIA role and name. Several matches are an error with a candidate list, as in click_text.",
   {
     role: z.string().describe("ARIA role (button, link, textbox, etc.)"),
     name: z.string().default("").describe("Accessible name"),
     within: z.string().default("").describe('Limit the search: "@dialog", "ref:e5", or a CSS selector.'),
-    index: z.number().default(-1).describe("Which match to click when several match (0-based). -1 = require a unique match."),
+    index: z.number().default(-1).describe("Which match (0-based). -1 = require a unique match."),
   },
   async ({ role, name: ariaName, within, index }) => {
     const page = getPage();
@@ -98,7 +99,7 @@ regTool(
       return { content: [{ type: "text", text: `index=${index} out of range — only ${n} match(es) for role=${role} name='${ariaName}'${scope}.` }], isError: true };
     }
     const target = index >= 0 ? loc.nth(index) : loc.first();
-    return clickReply(page, `Clicked role=${role} name='${ariaName}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}`, () => clickWithFallback(target));
+    return clickReply(page, `Clicked role=${role} name='${ariaName}'${scope}${n > 1 ? ` [index=${index} of ${n}]` : ""}`, () => clickWithFallback(target), 1000, within);
   }
 );
 
@@ -110,7 +111,7 @@ regTool("hover", "Hover over element by ref ID.", {
   return { content: [{ type: "text", text: `Hovered ref=${ref}` }] };
 });
 
-regTool("fill", "Fill input/textarea by ref ID. Always replaces existing content (email/number inputs are cleared explicitly first — Firefox's select-all is a no-op on those, which would otherwise append).", {
+regTool("fill", "Fill an input/textarea by ref, replacing its content (email and number fields too).", {
   ref: z.string().describe("Element ref"),
   value: z.string().describe("Text to fill"),
 }, async ({ ref, value }) => {
@@ -209,10 +210,9 @@ regTool("wait_for_navigation", "Wait for a navigation to happen and finish. Coun
 
 regTool(
   "wait_for_any_of",
-  "Race multiple wait conditions — returns the first that matches, so the agent can branch immediately without sequential probes. " +
-    "Each condition is {kind: 'selector'|'text'|'url_contains'|'title_contains', value: string}. " +
-    "Returns the index + kind + value of the winning condition (or 'timeout' if none matched). " +
-    "Ideal for post-login flows where the next page could be any of several (e.g. 'Stay signed in?', 'Skip for now', or the inbox directly).",
+  "Wait for the first of several conditions, each {kind: " +
+  "'selector'|'text'|'url_contains'|'title_contains', value}. Returns the winner's index, kind and " +
+  "value, or 'timeout'. For flows whose next page varies (e.g. 'Stay signed in?' or the inbox).",
   {
     conditions: z.array(z.object({
       kind: z.enum(["selector", "text", "url_contains", "title_contains"]),
@@ -272,11 +272,14 @@ regTool(
 
 // ── Tools: JavaScript ──────────────────────────────────────────────────────
 
-regTool("evaluate", "Execute JavaScript in page context.", {
+regTool("evaluate", "Run JavaScript in the page and return the result. world=\"main\" (default) reaches the page's own " +
+  "variables, and the page can observe the calls. world=\"isolated\" shares only the DOM and is invisible " +
+  "to the page.", {
   expression: z.string().describe("JS expression"),
-}, async ({ expression }) => {
+  world: z.enum(["main", "isolated"]).default("main").describe("main = the page's own JavaScript world. isolated = DOM only, invisible to the page."),
+}, async ({ expression, world }) => {
   const page = getPage();
-  const result = await page.evaluate(expression);
+  const result = world === "isolated" ? await page.evaluate(expression) : await evalMain(page, expression);
   const text = typeof result === "object" ? JSON.stringify(result, null, 2) : String(result);
   return { content: [{ type: "text", text }] };
 });

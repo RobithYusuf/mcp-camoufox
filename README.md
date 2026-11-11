@@ -27,12 +27,11 @@ Use the browser when a page needs JavaScript, a login or a person looking at it.
 
 ## Install
 
-You need Node.js 18 or newer. The Camoufox browser downloads itself on first launch, which takes a few minutes and about 700 MB of disk.
+You need Node.js 18 or newer. The Camoufox browser downloads itself on first launch. That is a download of about 1.3 GB that takes a few minutes and uses about 2.4 GB of disk (measured on macOS arm64 with Camoufox 158).
 
-Add the server to your client. Open the one you use:
+Add the server to your client.
 
-<details>
-<summary><b>Claude Code</b></summary>
+### Claude Code
 
 All projects:
 
@@ -45,7 +44,36 @@ Current project only:
 ```bash
 claude mcp add camoufox -- npx -y mcp-camoufox@latest
 ```
-</details>
+
+### Codex CLI
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.camoufox]
+command = "npx"
+args = ["-y", "mcp-camoufox@latest"]
+```
+
+### OpenCode
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "camoufox": {
+      "type": "local",
+      "command": ["npx", "-y", "mcp-camoufox@latest"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### Other clients
+
+Open the one you use:
 
 <details>
 <summary><b>Claude Desktop</b></summary>
@@ -139,18 +167,6 @@ Edit `~/.config/zed/settings.json`:
 </details>
 
 <details>
-<summary><b>Codex CLI</b></summary>
-
-Add to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.camoufox]
-command = "npx"
-args = ["-y", "mcp-camoufox@latest"]
-```
-</details>
-
-<details>
 <summary><b>Gemini CLI</b></summary>
 
 Add to `~/.gemini/settings.json`:
@@ -161,24 +177,6 @@ Add to `~/.gemini/settings.json`:
     "camoufox": {
       "command": "npx",
       "args": ["-y", "mcp-camoufox@latest"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>OpenCode</b></summary>
-
-Add to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "mcp": {
-    "camoufox": {
-      "type": "local",
-      "command": ["npx", "-y", "mcp-camoufox@latest"],
-      "enabled": true
     }
   }
 }
@@ -234,7 +232,7 @@ Add to `~/.trae/mcp.json`. Here `mcpServers` is an array:
 ```
 </details>
 
-On Windows the browser goes to `%LOCALAPPDATA%\camoufox` and the data to `%USERPROFILE%\.camoufox-mcp\`. Output paths accept `C:\path\file.json` and `C:/path/file.json`.
+On Windows the browser goes to `%LOCALAPPDATA%\camoufox\camoufox\Cache` and the data to `%USERPROFILE%\.camoufox-mcp\`. Output paths accept `C:\path\file.json` and `C:/path/file.json`.
 
 ## Usage examples
 
@@ -297,6 +295,34 @@ These come from the screenshots below, taken when each was captured. Sites and d
 | `browserscan.net/bot-detection` | WebDriver, User-Agent, CDP, Navigator | ✅ All four "Normal" |
 | `2captcha.com/demo/cloudflare-turnstile` | Turnstile widget, with Cloudflare's test key | ✅ Widget reaches "Success!" |
 | `nopecha.com/demo/cloudflare` | Full-page "Just a moment..." challenge | ⚠️ Playwright click rejected, 0 of 3. Real OS cursor click passed, 2 of 2, on macOS from one machine and IP |
+
+### Measured against Playwright MCP
+
+Both servers were driven as real MCP clients over stdio on one machine (Apple M4 Pro, macOS), headless, with a new server and browser per round. mcp-camoufox ran Camoufox 158.0.1-beta.41. The other server was Microsoft's Playwright MCP 0.0.85 with its own Firefox 159. Numbers are medians of 5 rounds for speed and 3 for actions. The machine was in use while they ran, so treat small gaps as noise.
+
+| Measure | mcp-camoufox | Playwright MCP |
+|---------|--------------|----------------|
+| Start the browser and load a first page | 1.6 to 2.1 s | 1.0 to 1.1 s |
+| Navigate again to a local page | 59 ms | 60 ms |
+| Navigate again to a Wikipedia article | 219 ms | 1,091 ms |
+| Click that changes the page | 52 ms | 551 ms |
+| Click on a disabled button | refused in 431 ms | timeout after 5,015 ms |
+| Click on a covered button | 2,574 ms, clicked through the fallback, blocker named | timeout after 5,018 ms |
+| Click that opens an `alert()` | 429 ms, reported as the dialog | 55 ms |
+| Click and fill inside a cross-origin iframe | 71 ms and 25 ms | 561 ms and 27 ms |
+| `evaluate("1+1")` | 0.6 ms | 508 ms |
+| Memory with one form page open | 1,324 MB | 1,049 MB |
+| Snapshot of a 158-element form | 1,866 tokens | 3,963 tokens |
+| Snapshot of a long Wikipedia article | 20,229 tokens, cut at 60,000 characters and says so | 235,191 tokens |
+| Tool definitions sent to the client | 14,956 tokens for 135 tools | 4,568 tokens (it has 25) |
+| DOM calls a page can observe during a click | 0 | 1 |
+| `navigator.webdriver` | false | true |
+| `browserscan.net/bot-detection` | Normal | Robot |
+| `bot.sannysoft.com` | 30 of 57 rows pass, 1 fails ("Chrome missing") | 27 of 57 pass, 4 fail |
+
+Where it loses: the browser takes half a second to a second longer to start, and nearly all of that is the Camoufox binary itself. It uses more memory unless you launch with `ublock=false` (then about 1,040 MB). Its tool list costs a client more than three times as many tokens. A click that changes nothing waits a full second before saying so, where Playwright MCP returns after half a second without saying whether anything happened.
+
+The two snapshots are not the same thing. mcp-camoufox lists interactive elements and headings. Playwright MCP returns the whole accessibility tree including text. Token counts use the `o200k_base` tokenizer as an estimate.
 
 ### Cloudflare Turnstile
 
@@ -436,6 +462,8 @@ Session cookies die with the browser even in the persistent profile. Use `cookie
 
 Camoufox picks a spoofed screen per profile, and it can be smaller than the size you ask for. `browser_launch` then shrinks the viewport to fit and says so, because a viewport larger than its own screen is something a detector can read. `fingerprint_audit` prints what a page sees and flags contradictions. It checks consistency only. It cannot tell you whether a particular site will accept you.
 
+The persistent profile keeps the same screen, GPU and core count across launches, where before ten launches of one profile showed ten different devices with the same logins; the canvas noise still changes per launch, and `fresh_profile=true` draws a new device every time.
+
 A fixed viewport does not follow the OS window. Call `set_viewport_size` after resizing, or launch with `no_viewport=true`.
 </details>
 
@@ -443,7 +471,8 @@ A fixed viewport does not follow the OS window. Call `set_viewport_size` after r
 
 - `save_pdf` cannot work here: Playwright generates PDFs only on Chromium. Use `screenshot(full_page=true)`.
 - Firefox has no CDP, so there are no performance traces, coverage, heap snapshots or CPU and network throttling.
-- `browser_snapshot` does not look inside iframes or shadow DOM. Use `list_frames` and `frame_evaluate`.
+- `browser_snapshot` lists elements inside visible iframes (refs like `f1e3`, up to 8 frames and 60 elements per frame) and inside open shadow roots (up to 1,000 roots, 8 levels deep), but cannot read a closed shadow root.
+- A fingerprint that claims another operating system than the machine's own starts about 4 seconds slower and still lists the machine's speech voices. `os="auto"` is the default for that reason. This was measured on macOS only.
 - CLS is unavailable, because Firefox does not implement `layout-shift`.
 - Camoufox occasionally never commits a navigation. A 30-second timeout from `navigate` is usually this, and a retry works. `tab_new` retries by itself.
 - No CAPTCHA solving. Use `headless=false` and solve it yourself.
@@ -458,6 +487,9 @@ A fixed viewport does not follow the OS window. Call `set_viewport_size` after r
 | "A copy of Camoufox is already open" | Another browser is using the default profile. Close it, or launch with `fresh_profile=true`. |
 | A click reports no page change | The page may react later, so try `wait_for_change`. `assert_clickable` shows whether something covers the element. |
 | A ref stopped working | Refs belong to one snapshot. Call `browser_snapshot` again. |
+| "Camoufox is not installed" | The browser binary is gone, for example deleted to free disk space. Run the command the message gives. It downloads more than 1 GB. |
+| `evaluate` returns `undefined` for a page variable | You passed `world="isolated"`, which shares only the DOM. The default `world="main"` reaches the page's variables. |
+| The first launch after an install fails with "Version information not found" | You are on 0.12.0 or older, which fetched the browser with a newer camoufox-js than it could read. Upgrade. |
 | `browser_launch` fails with `setDefaultViewport ... isMobile` | You are on a version before 0.9.3. Upgrade. |
 | A tool says it did not finish | The page may be wedged. `tab_new` opens a fresh tab; `browser_recover` resets the session. |
 | I cannot see the browser window | `headless=true` is the default and opens none. With `headless=false` the window opens behind your current app so it does not take your keyboard. Switch to it from the Dock or task bar. |
@@ -474,7 +506,9 @@ mcp-camoufox (Node.js) ---- impit (Firefox TLS) ---> HTTP requests with no brows
 Camoufox (patched Firefox)
 ```
 
-`browser_snapshot` tags elements with `data-mcp-ref` attributes and returns a short list of them, so an agent can act by ref instead of reading the whole page. A page's own scripts can see those attributes.
+`browser_snapshot` returns a short list of the elements on the page, each with a ref, so an agent can act by ref instead of reading the whole page. The refs are kept in a registry in Camoufox's isolated JavaScript world. Nothing is written into the document, so a page's own scripts cannot find them.
+
+The server's own reads (snapshot, click checks, change detection) also run in that isolated world. A test page that wraps `querySelector`, `getBoundingClientRect` and similar functions counted zero calls from a snapshot, a click, a fill and a hover. `evaluate` is the exception, because it runs your code: by default it runs beside the page's scripts so it can reach their variables, and the page can observe what that code calls. Pass `world="isolated"` when you only need the DOM.
 
 ## Related
 

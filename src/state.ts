@@ -33,6 +33,10 @@ export const S = {
   stopping: false,
   // Why the last browser went away when no tool asked it to.
   lastExitNote: "",
+  // True when this Camoufox runs page.evaluate in an isolated world (it does since
+  // 2026: the DOM is shared, the page's own JavaScript variables are not). Detected at
+  // launch, because an older build still evaluates in the page's world.
+  evalIsolated: false,
   // console/network capture handlers, so they can be detached again
   consoleHandler: null as ((msg: any) => void) | null,
   networkHandler: null as ((res: any) => void) | null,
@@ -66,7 +70,7 @@ export function getPage(): Page {
 
 // Every dialog the server has answered, newest last. A reply can then say a dialog
 // appeared, which a page cannot be asked about afterwards.
-export interface DialogEntry { seq: number; at: number; type: string; message: string; answer: string; }
+export interface DialogEntry { seq: number; at: number; type: string; message: string; answer: string; page?: unknown; }
 export const dialogLog: DialogEntry[] = [];
 
 // Buffers the capture tools share.
