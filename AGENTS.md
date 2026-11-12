@@ -226,6 +226,15 @@ npx -y mcp-camoufox → Node → camoufox-js → Playwright (Juggler) → Camouf
 - Do NOT use `settle` after a click or a form submit. It measures network quiet, and right after a
   click the request often has not left yet — it would return before the thing it is meant to wait for
   even starts. The fixed sleeps in `fill_form` and `login_classic` are deliberate for that reason.
+- `tab_new` opens a tab in the active page's window, not through `context.newPage()`. Juggler's only way to make
+  a page, `Browser.newPage`, always opens a new window (`Services.ww.openWindow` in TargetRegistry.js), so
+  every tab was a window of its own. A tab opened from a page lands in that page's window and Juggler
+  attaches it like a site popup. `openTabBeside` calls `window.open("about:blank", "_blank",
+  "noopener,noreferrer")` from the isolated world: the page's own wrapper of window.open is not called, and the
+  new tab has no opener and no Referer. It was not popup-blocked without a user gesture. `new_window=true` keeps
+  the old way, and a failure falls back to it and says so.
+- `press_key` is watched with `observeClick` (400ms). "Pressed: Enter" alone left a search that had already
+  gone to the results page looking like nothing happened, and the next `get_text` read the old page.
 - `tab_new` calls `trackPage` and sets the active page **before** navigating. The tab exists the moment
   `newPage()` returns, so tracking it only after a successful `goto` left a dead tab nobody could
   select or close.

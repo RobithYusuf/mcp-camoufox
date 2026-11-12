@@ -67,7 +67,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 | Tool        | Description                                                                |
 | ----------- | -------------------------------------------------------------------------- |
 | `type_text` | Type char by char. Options: `delay`. For OTP, masked inputs, date pickers. |
-| `press_key` | Key or combo: `Enter`, `Escape`, `Tab`, `Control+a`, `Meta+c`              |
+| `press_key` | Key or combo: `Enter`, `Escape`, `Tab`, `Control+a`, `Meta+c`. Says when the page navigated (Enter in a search box), changed, or opened a tab or dialog; a key with no visible effect answers just "Pressed". |
 
 
 ### Mouse XY (6)
@@ -103,7 +103,7 @@ Anything that adds, removes or changes a tool must update this file in the same 
 | Tool         | Description                                                                                                                                                             |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tab_list`   | List all tabs. Pages the site opens itself (`window.open` / `target=_blank`, e.g. OAuth popups) are auto-tracked and appear here too.                                   |
-| `tab_new`    | Open new tab                                                                                                                                                            |
+| `tab_new`    | Open a tab beside the active one, in the same window. `new_window=true` opens a window of its own. Juggler can only open windows, so the tab is opened from the active page (`window.open` with noopener and noreferrer, from the isolated world, so the page sees no call); if that fails it opens a window and says so. |
 | `tab_select` | Switch tab by `index` or `url_contains` (first tab whose URL matches)                                                                                                   |
 | `tab_close`  | Close tab by `index` (-1 = active) or `url_contains`. The active tab is tracked by identity, so closing a lower-indexed tab never silently switches you to another one. |
 

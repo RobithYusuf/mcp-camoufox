@@ -6,7 +6,7 @@ import type { BrowserContext, Page, Dialog } from "playwright-core";
 import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { getPage } from "../state.js";
 import { ACTION_TIMEOUT, clickWithFallback, clickReply, fillLocator, refLocator, SECRET_FIELD_FN, elementFn,
-         maskedField, isSecretLocator, evalMain, scopeRoot, describeMatches, candidateList, navSeqOf, lastNavAt, waitReady } from "../helpers.js";
+         maskedField, isSecretLocator, evalMain, scopeRoot, describeMatches, candidateList, navSeqOf, lastNavAt, waitReady , observeClick } from "../helpers.js";
 import { regTool } from "../server.js";
 
 // ── Tools: Element Interaction ─────────────────────────────────────────────
@@ -164,13 +164,15 @@ regTool("type_text", "Type text char by char via keyboard.", {
   return { content: [{ type: "text", text: `Typed: ${focus.secret ? maskedField(text.length) : `'${text.slice(0, 50)}'`}${note}` }] };
 });
 
-regTool("press_key", "Press key or combo (Enter, Escape, Control+a, etc.).", {
+regTool("press_key", "Press key or combo (Enter, Escape, Control+a, etc.). Says when the page navigated, changed or opened a tab or dialog.", {
   key: z.string().describe("Key name"),
 }, async ({ key }) => {
   const page = getPage();
-  await page.keyboard.press(key);
-  await page.waitForTimeout(300);
-  return { content: [{ type: "text", text: `Pressed: ${key}` }] };
+  // Watched like a click. "Pressed: Enter" alone left a search that had already gone to
+  // the results page looking like nothing happened, and the next get_text read the old
+  // page. A key with no visible effect is normal, so it gets no warning.
+  const outcome = await observeClick(page, async () => { await page.keyboard.press(key); }, 400);
+  return { content: [{ type: "text", text: `Pressed: ${key}${outcome.changed ? `\n${outcome.note}` : ""}` }] };
 });
 
 // ── Tools: Wait ────────────────────────────────────────────────────────────

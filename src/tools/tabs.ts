@@ -24,17 +24,48 @@ regTool("tab_list", "List all open tabs.", {}, async () => {
   return { content: [{ type: "text", text: `Tabs (${S.pages.length}):\n${lines.join("\n")}` }] };
 });
 
-regTool("tab_new", "Open new tab.", {
+/** Open a tab in the active page's window. Juggler has one way to make a page,
+ *  Browser.newPage, and it always opens a new WINDOW (Services.ww.openWindow), so every
+ *  tab_new used to be its own window. A tab opened from inside a page lands in that
+ *  page's window and is attached like any site popup. window.open is called from the
+ *  isolated world, through its own view of window, so a page that wraps window.open sees
+ *  nothing; noopener and noreferrer leave the new tab with no opener and no Referer, as a
+ *  tab a person opens has. Null when no tab appeared, and the caller opens a window. */
+async function openTabBeside(ctx: BrowserContext, opener: Page | null): Promise<Page | null> {
+  if (!opener || opener.isClosed()) return null;
+  const appeared = new Promise<Page | null>(resolve => {
+    const timer = setTimeout(() => { ctx.off("page", on); resolve(null); }, 5000);
+    const on = (p: Page) => { clearTimeout(timer); ctx.off("page", on); resolve(p); };
+    ctx.on("page", on);
+  });
+  try {
+    await opener.evaluate(`(function () { window.open("about:blank", "_blank", "noopener,noreferrer"); return 1; })()`);
+  } catch { return null; }
+  return appeared;
+}
+
+regTool("tab_new", "Open a new tab, in the same window as the active tab. new_window=true opens it in a window of its own.", {
   url: z.string().default("about:blank"),
-}, async ({ url }) => {
+  new_window: z.boolean().default(false).describe("Open a separate window instead of a tab beside the active one."),
+}, async ({ url, new_window }) => {
   if (!S.browserContext) throw new Error("Browser not running. Call browser_launch first.");
-  const page = await S.browserContext.newPage();
-  // Track BEFORE navigating. newPage() also fires the context "page" event, so
+  const ctx = S.browserContext;
+  const active = S.pages[S.activePage] || null;
+  let where = "in a window of its own";
+  let page = new_window ? null : await openTabBeside(ctx, active);
+  let note = "";
+  if (page) where = "beside the active tab, in the same window";
+  else {
+    if (!new_window) note = active ? "\n(A tab could not be opened from the active page, so this is a separate window.)" : "";
+    page = await ctx.newPage();
+  }
+  // Track BEFORE navigating. A new page also fires the context "page" event, so
   // trackPage may already have added it (it is idempotent) — but if the goto
   // below throws, the tab still exists in the browser, and doing this afterwards
   // left it unreachable: not active, and not returned to the caller.
   trackPage(page);
   S.activePage = S.pages.indexOf(page);
+  try { await page.bringToFront(); } catch {}
   if (url && url !== "about:blank") {
     try {
       await gotoReady(page, url, "domcontentloaded", 30000);
@@ -46,14 +77,14 @@ regTool("tab_new", "Open new tab.", {
       // do this safely: it owns the page it just created.
       if (!/Timeout\s+\d+ms exceeded/i.test(String((err as any)?.message || err))) throw err;
       try { await page.close(); } catch {}
-      const retry = await S.browserContext.newPage();
+      const retry = (!new_window && await openTabBeside(ctx, S.pages[S.activePage] || active)) || await ctx.newPage();
       trackPage(retry);
       S.activePage = S.pages.indexOf(retry);
       await gotoReady(retry, url, "domcontentloaded", 30000);
       return { content: [{ type: "text", text: `New tab [${S.activePage}]. URL: ${retry.url()}\n(The first attempt never committed — Camoufox does this to roughly one new tab in fifteen — so the tab was replaced.)` }] };
     }
   }
-  return { content: [{ type: "text", text: `New tab [${S.activePage}]. URL: ${page.url()}` }] };
+  return { content: [{ type: "text", text: `New tab [${S.activePage}], ${where}. URL: ${page.url()}${note}` }] };
 });
 
 regTool("tab_select", "Switch to a tab by index, or by url_contains (first tab whose URL contains the substring).", {

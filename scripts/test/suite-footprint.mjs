@@ -136,6 +136,7 @@ export default async function run() {
       "/form": (_q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end(SLOW_FORM); },
       "/submit": (q, r) => { if (q.method === "POST") posts++; q.resume(); setTimeout(() => { r.writeHead(200, { "content-type": "text/html" }); r.end("<!doctype html><title>Submitted</title><p>done</p>"); }, 2500); },
       "/other": (_q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<!doctype html><title>Other</title><script>setInterval(function () { alert('from the other tab'); }, 150)</script>"); },
+      "/searchform": (_q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<!doctype html><title>Search</title><script>window.__opens = 0; var o = window.open; window.open = function () { window.__opens++; return o.apply(this, arguments); };</script><form action='/static'><input id='q' name='q'></form>"); },
       "/static": (_q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<!doctype html><title>Static</title><p>static</p>"); },
       "/components": (_q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end(COMPONENTS); },
       "/init": (_q, r) => { r.writeHead(200, { "content-type": "text/html" }); r.end("<!doctype html><title>x</title><script>document.title = 'init=' + String(window.__fromInit)</script>"); },
@@ -733,6 +734,35 @@ export default async function run() {
           && /could not be downloaded/.test(again) && /camoufox-js@[\d.]+ fetch/.test(again) && afterFirst === 1 && afterSecond === 2,
           `${first.slice(10, 110)} | status ${status.camoufox_download?.state} | download runs ${afterFirst} then ${afterSecond}`];
       });
+    });
+
+    // ── Tabs and keys ────────────────────────────────────────────────────────
+    // Juggler's only way to make a page opens a new WINDOW, so every tab_new was a window
+    // of its own. A tab is now opened from the active page, in its window. Same-window was
+    // checked by hand in a headed window (one window, two tabs in its tab strip); this
+    // checks what a page and the agent see.
+    await check("tab_new opens a tab beside the active one, unseen by the page, with new_window as the other choice", async () => {
+      await c("browser_close");
+      await c("browser_launch", { ...LAUNCH, url: fx.url + "/searchform" });
+      const beside = await c("tab_new", { url: fx.url + "/static" });
+      const inNew = JSON.parse(await iso("JSON.stringify([location.pathname, window.opener === null, document.referrer])"));
+      await c("tab_select", { index: 0 });
+      const opens = await c("evaluate", { expression: "window.__opens" });
+      const separate = await c("tab_new", { url: fx.url + "/static", new_window: true });
+      const tabs = await c("tab_list");
+      for (let i = 2; i > 0; i--) await c("tab_close", { index: i });
+      return [/beside the active tab, in the same window/.test(beside) && inNew[0] === "/static" && inNew[1] && inNew[2] === "" && opens === "0" && /in a window of its own/.test(separate) && /Tabs \(3\)/.test(tabs),
+        `${beside.split("\n")[0]} | opener null=${inNew[1]} referrer="${inNew[2]}" page saw window.open ${opens}x | ${separate.split("\n")[0]}`];
+    });
+    await check("press_key says when Enter took the page somewhere, and stays quiet otherwise", async () => {
+      await c("navigate", { url: fx.url + "/searchform" });
+      const snap = await c("browser_snapshot");
+      await c("fill", { ref: refOf(snap, "[input]"), value: "kucing" });
+      const enter = await c("press_key", { key: "Enter" });
+      const t = Date.now();
+      const esc = await c("press_key", { key: "Escape" });
+      const escMs = Date.now() - t;
+      return [/Page navigated to .*\/static\?q=kucing/.test(enter) && esc === "Pressed: Escape" && escMs < 1200, `${enter.replace(/\n/g, " | ")} || ${esc} in ${escMs}ms`];
     });
 
     // ── What a new user types ────────────────────────────────────────────────
