@@ -473,6 +473,20 @@ export default async function run() {
     // fingerprint-generator 2.1.90, which every fresh install resolves, fills in the
     // window's inner size as its outer size, and Camoufox spoofed innerHeight to it: 800
     // in a page laid out in 720. The repo's older lockfile hid it from every test here.
+    // A headed window can be dragged onto any display and as large as it is, while the
+    // fingerprint's screen is fixed: on a spoofed 1512x982 screen a window dragged out to a
+    // 2560x1440 monitor gave a page 2560x1325. A headed launch now asks for a screen that
+    // holds the largest display. The headed half is checked by hand (it opens a window);
+    // this checks the parts that decide it.
+    await check("a headed launch asks for a screen that holds every display", async () => {
+      const mod = await import(pathToFileURL(join(ROOT, "dist", "display.js")).href);
+      const parsed = mod.parseDisplays(JSON.stringify([{ width: 1800, height: 1169, availWidth: 1800, availHeight: 1130 }, { width: 2560, height: 1440, availWidth: 2560, availHeight: 1378 }]));
+      const hold = mod.screenToHold(parsed);
+      const none = mod.screenToHold(mod.parseDisplays("not json"));
+      const real = await mod.displays();
+      return [hold?.width === 2560 && hold?.height === 1440 && none === null && (real === null || real.every(d => d.width > 0 && d.height > 0)),
+        `hold ${JSON.stringify(hold)} | this machine ${JSON.stringify(mod.screenToHold(real))}`];
+    });
     await check("the page's inner size is the real viewport, temp and persistent profile alike", async () => {
       const read = async () => JSON.parse(await iso("JSON.stringify([innerWidth, innerHeight, outerWidth, outerHeight, document.documentElement.clientHeight])"));
       const seen = [];

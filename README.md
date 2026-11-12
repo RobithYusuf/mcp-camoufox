@@ -460,11 +460,11 @@ Session cookies die with the browser even in the persistent profile. Use `cookie
 <details>
 <summary><b>Fingerprint and viewport</b></summary>
 
-Camoufox picks a spoofed screen per profile, and it can be smaller than the size you ask for. `browser_launch` then shrinks the viewport to fit and says so, because a viewport larger than its own screen is something a detector can read. `fingerprint_audit` prints what a page sees and flags contradictions. It checks consistency only. It cannot tell you whether a particular site will accept you.
+`browser_launch` asks for a spoofed screen that holds the window, and with `headless=false` one that holds your largest display too. If no fingerprint has a screen that large, it shrinks the viewport to fit and says so, because a viewport larger than its own screen is something a detector can read. `fingerprint_audit` prints what a page sees and flags contradictions. It checks consistency only. It cannot tell you whether a particular site will accept you.
 
 The persistent profile keeps the same screen, GPU and core count across launches, where before ten launches of one profile showed ten different devices with the same logins; the canvas noise still changes per launch, and `fresh_profile=true` draws a new device every time.
 
-A fixed viewport does not follow the OS window. Call `set_viewport_size` after resizing, or launch with `no_viewport=true`.
+With `headless=false` the page follows the window as you resize it, and the screen the page sees is as large as your largest display, so resizing does not create a fingerprint mismatch. Headless uses a fixed viewport; change it with `set_viewport_size`.
 </details>
 
 ## Limits

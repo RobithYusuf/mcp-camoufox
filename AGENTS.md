@@ -361,6 +361,13 @@ These are platform truths, not preferences. Each one cost a release.
   `documentElement.clientHeight`. It shipped in 0.13.0 because the repo's lockfile still had 2.1.82: the
   same lesson as the playwright-core pin. `npm update` the transitive generator packages before a release,
   and run `smoke:install`, which uses what a user gets. `fingerprint_audit` flags the mismatch.
+- A headed launch follows the window by default (`no_viewport` defaults to `!headless`). A fixed viewport in
+  a window a person resizes left empty space instead of reflowing. Following the window was safe only once
+  the fingerprint's screen could hold it: `display.ts` reads every display (AppKit through `osascript` on
+  macOS, about 0.1s and no prompt; PowerShell on Windows and xrandr on Linux, both untested) and the
+  launch asks for a screen at least as large as the largest one. Measured before: a 1512x982 spoofed screen
+  and a window dragged to a 2560x1440 monitor gave a 2560x1325 page, flagged twice by fingerprint_audit;
+  after, a 2560x1440 screen and an audit with no contradiction. Headless keeps the fixed viewport.
 - `normalizeUrl` (in `gotoReady` and the HTTP tools) turns a bare `example.com` into `https://example.com`,
   and `localhost` or an IP address into `http://`. A new user's first `browser_launch(url="example.com")`
   launched the browser and then failed with Playwright's "Invalid url".

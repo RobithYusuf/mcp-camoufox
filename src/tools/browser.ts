@@ -14,6 +14,7 @@ import { ACTION_TIMEOUT, safeName, ERROR_HOOK_JS, refLocator,
 import { stopBrowser, removeTempProfile, tempProfilePath, sweepAbandonedTempProfiles } from "../lifecycle.js";
 import { regTool } from "../server.js";
 import { ensureCamoufoxBinary } from "../install.js";
+import { displays, screenToHold } from "../display.js";
 
 // ── Tools: Browser Lifecycle ───────────────────────────────────────────────
 
@@ -106,9 +107,9 @@ regTool(
     width: z.number().default(0).describe("WINDOW width (0 = 1280). The viewport has this width and is 80px shorter than the window; " +
       "set_viewport_size changes the viewport alone."),
     height: z.number().default(0).describe("WINDOW height (0 = 800). See width."),
-    no_viewport: z.boolean().default(false).describe(
-      "Content follows the real OS window instead of a fixed viewport. WARNING: the viewport can then " +
-      "exceed the spoofed screen, an anti-bot tell. Prefer set_viewport_size."),
+    no_viewport: z.boolean().optional().describe(
+      "Page follows the OS window as it is resized. Default: on with headless=false, off headless (fixed viewport). " +
+      "A headed launch draws a screen at least as large as this machine's largest display, so a dragged window never exceeds it."),
     fresh_profile: z.boolean().default(false).describe(
       "Clean temp profile, removed at browser_close. Keeps two accounts on one site apart."
     ),
@@ -117,7 +118,10 @@ regTool(
       "OS starts ~4s slower and its voices still name the host OS. random = Camoufox picks."),
     ublock: z.boolean().default(true).describe("Load the bundled uBlock Origin. false saves ~350 MB, and pages load their ads and trackers."),
   },
-  async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile, no_viewport, os, ublock }) => {
+  async ({ url, headless, humanize, geoip, locale, width, height, fresh_profile, no_viewport: noViewportArg, os, ublock }) => {
+    // A headed window is something a person resizes, and a fixed viewport then left empty
+    // space instead of reflowing. Headless has no window to follow.
+    const no_viewport = noViewportArg ?? !headless;
     // Wait out a launch already in progress, then fall through to the
     // already-running path rather than building a second context.
     if (S.launchInFlight) { try { await S.launchInFlight; } catch {} }
@@ -171,10 +175,14 @@ regTool(
     // machine every session. A temp profile stays random. See identity.ts.
     let identity: IdentityLaunch | null = null;
     let identityNote = "Identity: random, as for every temp profile.";
+    // The fingerprint's screen holds the window (60px for a menu bar or taskbar). Headed, it
+    // also holds the largest display here: the window can be dragged onto any of them and
+    // as large as it is, and the screen a page is told about cannot change after launch.
+    const hold = headless ? null : screenToHold(await displays());
     const want = {
       os: fpOs,
-      window: no_viewport ? null : [w, h] as [number, number],
-      screen: no_viewport ? null : { minWidth: w, minHeight: h + 60 },
+      window: [w, h] as [number, number],
+      screen: { minWidth: Math.max(w, hold?.width ?? 0), minHeight: Math.max(h + 60, hold?.height ?? 0) },
     };
     if (!isTemp) {
       try {
@@ -205,9 +213,8 @@ regTool(
         ...(screen ? { screen } : {}),
         user_data_dir: profileDir,
         disable_coop: true,
-        // no_viewport: let the content follow the real window. We also drop the
-        // fixed `window` size then — pinning both is what produced a 1280x749
-        // content area that still didn't fill the frame.
+        // no_viewport: the content follows the real window, which still opens at the
+        // requested size so it starts inside the screen the fingerprint claims.
         // Size the viewport WITH the window. Passing `window` alone left Playwright's
         // default 1280x720 viewport in place, so browser_launch(width=1400) produced
         // outerWidth 1400 with innerWidth 1280 — 120px of horizontal chrome, which no
@@ -215,7 +222,7 @@ regTool(
         // the measured vertical chrome, so the default 1280x800 window keeps giving
         // exactly the 1280x720 viewport it always did.
         ...(no_viewport
-          ? { viewport: null }
+          ? { viewport: null, window: [w, h] as [number, number] }
           : { window: [w, h] as [number, number], viewport: { width: w, height: Math.max(200, h - 80) } }),
         i_know_what_im_doing: true,
         // Playwright starts a headed Firefox with -foreground, which pulls the window
@@ -252,9 +259,9 @@ regTool(
       // refuse, so that request falls back to an unconstrained fingerprint and the
       // viewport fit below.
       try {
-        ctx = await launchWith(no_viewport ? null : { minWidth: w, minHeight: h + 60 });
+        ctx = await launchWith(want.screen);
       } catch (e: any) {
-        if (no_viewport || !/No headers based on this input|relax or change some of the requirements/i.test(String(e?.message || e))) throw e;
+        if (!/No headers based on this input|relax or change some of the requirements/i.test(String(e?.message || e))) throw e;
         ctx = await launchWith(null);
       }
     } catch (e) {
@@ -354,10 +361,13 @@ regTool(
         geom += `\n⚠ Viewport is larger than the spoofed screen — a window bigger than its own display is an anti-bot tell. Shrink it with set_viewport_size, or relaunch without no_viewport.`;
       }
       geom += clampNote;
-      geom += `\n(Viewport is shorter than the window by the 80px of browser chrome.`
-        + ` Dragging the window bigger will NOT reflow the page — a fixed viewport never follows the OS window,`
-        + ` so you get empty space instead. Call set_viewport_size(w,h) after resizing, or relaunch with`
-        + ` no_viewport=true to let the content track the window live.)`;
+      if (hold && (g.sw < hold.width || g.sh < hold.height)) {
+        geom += `\n⚠ The largest display here is ${hold.width}x${hold.height}, and no fingerprint screen that size was available, so the screen is ${g.sw}x${g.sh}. Dragging the window larger than that is visible to a page.`;
+      }
+      geom += no_viewport
+        ? `\n(The page follows the window: resize it freely${hold ? `; the screen covers every display here (largest ${hold.width}x${hold.height})` : ""}.)`
+        : `\n(Fixed viewport, 80px shorter than the window for the browser chrome. Resizing the window does not reflow the page:`
+          + ` call set_viewport_size(w,h), or launch with no_viewport=true so the page follows the window.)`;
     } catch {}
     const worldNote = world === null
       ? "\n⚠ Could not tell which JavaScript world evaluate runs in on this Camoufox build, so evaluate assumes the page's own. If page variables read as undefined, pass world=\"isolated\" to compare, or browser_close and launch again."

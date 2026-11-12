@@ -1,6 +1,6 @@
 {
   "name": "mcp-camoufox",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "description": "MCP server for browser automation with Camoufox: 135 tools, plus an HTTP path with a Firefox TLS fingerprint",
   "type": "module",
   "main": "dist/index.js",
